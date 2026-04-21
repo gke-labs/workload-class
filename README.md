@@ -15,7 +15,6 @@ We follow [Google's Open Source Community Guidelines](https://opensource.google.
 This is not an officially supported Google product.
 
 This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.
-=======
 # GKE Workload Class Controller
 
 This project implements the GKE Workload Class feature. It allows platform engineers and workload owners to collaborate on managing workload disruptions during maintenance.
