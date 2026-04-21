@@ -1,0 +1,20 @@
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: critical-batch
+spec:
+  podSelector:
+    matchLabels:
+      role: batch-processor
+  allowedDisruptionWindows:
+    - dayOfWeek: Saturday
+      startTime: "22:00"
+      endTime: "23:59"
+    - dayOfWeek: Sunday
+      startTime: "00:00"
+      endTime: "04:00"
+  minInitialRunDurationDays: 2
+  maxNonDisruptionDurationDays: 14
+  allowedDisruptionsOutsideOfWindow:
+    - VPA
+    - ClusterAutoscaler

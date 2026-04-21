@@ -1,0 +1,219 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
+)
+
+// WorkloadClassReconciler reconciles a WorkloadClass object
+type WorkloadClassReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/finalizers,verbs=update
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+
+// Reconcile is part of the main kubernetes reconciliation loop.
+func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	wc := &workloadsv1.WorkloadClass{}
+	if err := r.Get(ctx, req.NamespacedName, wc); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// 1. Fetch Guardrails and validate
+	validationCond, err := r.validateAgainstGuardrails(ctx, wc)
+	if err != nil {
+		log.Error(err, "Failed to validate against guardrails")
+		return ctrl.Result{}, err
+	}
+	meta.SetStatusCondition(&wc.Status.Conditions, validationCond)
+
+	// 2. Calculate Readiness
+	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
+	if err != nil {
+		log.Error(err, "Failed to calculate readiness")
+		return ctrl.Result{}, err
+	}
+
+	// 3. Update Status if changed
+	if wc.Status.MaintenanceReadiness != readiness {
+		wc.Status.MaintenanceReadiness = readiness
+		if readiness == workloadsv1.ReadinessReady {
+			log.Info("Workload is now READY for maintenance")
+		}
+		if err := r.Status().Update(ctx, wc); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: nextReconcile}, nil
+}
+
+func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
+	now := time.Now().UTC()
+
+	// 1. Emergency Override
+	if wc.Spec.EmergencyOverride {
+		return workloadsv1.ReadinessReady, 0, nil
+	}
+
+	// 2. Check Overdue (Maximum Protected Duration)
+	if wc.Spec.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
+		maxDuration := time.Duration(wc.Spec.MaxNonDisruptionDurationDays) * 24 * time.Hour
+		if now.Sub(wc.Status.LastDisruptionTime.Time) > maxDuration {
+			return workloadsv1.ReadinessOverdue, 0, nil
+		}
+	}
+
+	// 3. Check Temporal Windows
+	inWindow, nextWindow := utils.IsTimeInWindows(now, wc.Spec.AllowedDisruptionWindows)
+	if !inWindow {
+		return workloadsv1.ReadinessNotReady, nextWindow, nil
+	}
+
+	// 4. Check Pod Ages (Min Initial Run)
+	if wc.Spec.MinInitialRunDurationDays > 0 {
+		pods := &corev1.PodList{}
+		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+		if err != nil {
+			return workloadsv1.ReadinessNotReady, 0, err
+		}
+		if err := r.List(ctx, pods, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+			return workloadsv1.ReadinessNotReady, 0, err
+		}
+
+		minRunDuration := time.Duration(wc.Spec.MinInitialRunDurationDays) * 24 * time.Hour
+		for _, pod := range pods.Items {
+			if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
+				// Pod hasn't run long enough
+				return workloadsv1.ReadinessNotReady, minRunDuration - now.Sub(pod.CreationTimestamp.Time), nil
+			}
+		}
+	}
+
+	return workloadsv1.ReadinessReady, nextWindow, nil
+}
+
+func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context, wc *workloadsv1.WorkloadClass) (metav1.Condition, error) {
+	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
+	if err := r.List(ctx, guardrails); err != nil {
+		return metav1.Condition{}, err
+	}
+
+	if len(guardrails.Items) == 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeValidated,
+			Status:             metav1.ConditionTrue,
+			Reason:             workloadsv1.ReasonNoGuardrails,
+			Message:            "No Guardrails found to validate against",
+			LastTransitionTime: metav1.Now(),
+		}, nil
+	}
+
+	// Determine effective constraints (pick the most restrictive)
+	var maxWindowDur *int32
+	var maxWindowsWeek *int32
+	var minInitialRunLimit *int32
+	var maxNonDisruptionLimit *int32
+
+	for _, g := range guardrails.Items {
+		if g.Spec.MaxWindowDurationMinutes != nil && (maxWindowDur == nil || *g.Spec.MaxWindowDurationMinutes < *maxWindowDur) {
+			maxWindowDur = g.Spec.MaxWindowDurationMinutes
+		}
+		if g.Spec.MaxWindowsPerWeek != nil && (maxWindowsWeek == nil || *g.Spec.MaxWindowsPerWeek < *maxWindowsWeek) {
+			maxWindowsWeek = g.Spec.MaxWindowsPerWeek
+		}
+		if g.Spec.MinInitialRunDurationDaysLimit != nil && (minInitialRunLimit == nil || *g.Spec.MinInitialRunDurationDaysLimit < *minInitialRunLimit) {
+			minInitialRunLimit = g.Spec.MinInitialRunDurationDaysLimit
+		}
+		if g.Spec.MaxNonDisruptionDurationDaysLimit != nil && (maxNonDisruptionLimit == nil || *g.Spec.MaxNonDisruptionDurationDaysLimit < *maxNonDisruptionLimit) {
+			maxNonDisruptionLimit = g.Spec.MaxNonDisruptionDurationDaysLimit
+		}
+	}
+
+	var violations []string
+
+	if maxWindowDur != nil {
+		for _, w := range wc.Spec.AllowedDisruptionWindows {
+			dur := utils.CalculateWindowDuration(w)
+			if int32(dur.Minutes()) > *maxWindowDur {
+				violations = append(violations, fmt.Sprintf("window duration %v minutes exceeds guardrail limit %d", dur.Minutes(), *maxWindowDur))
+			}
+		}
+	}
+
+	if maxWindowsWeek != nil && int32(len(wc.Spec.AllowedDisruptionWindows)) > *maxWindowsWeek {
+		violations = append(violations, fmt.Sprintf("number of windows %d exceeds guardrail limit %d", len(wc.Spec.AllowedDisruptionWindows), *maxWindowsWeek))
+	}
+
+	if minInitialRunLimit != nil && wc.Spec.MinInitialRunDurationDays > *minInitialRunLimit {
+		violations = append(violations, fmt.Sprintf("minInitialRunDurationDays %d exceeds guardrail limit %d", wc.Spec.MinInitialRunDurationDays, *minInitialRunLimit))
+	}
+
+	if maxNonDisruptionLimit != nil && wc.Spec.MaxNonDisruptionDurationDays > *maxNonDisruptionLimit {
+		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.MaxNonDisruptionDurationDays, *maxNonDisruptionLimit))
+	}
+
+	if len(violations) > 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeValidated,
+			Status:             metav1.ConditionFalse,
+			Reason:             workloadsv1.ReasonValidationFailed,
+			Message:            strings.Join(violations, "; "),
+			LastTransitionTime: metav1.Now(),
+		}, nil
+	}
+
+	return metav1.Condition{
+		Type:               workloadsv1.ConditionTypeValidated,
+		Status:             metav1.ConditionTrue,
+		Reason:             workloadsv1.ReasonValidationPassed,
+		Message:            "WorkloadClass adheres to all Guardrail constraints",
+		LastTransitionTime: metav1.Now(),
+	}, nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&workloadsv1.WorkloadClass{}).
+		Owns(&workloadsv1.WorkloadClassGuardrail{}). // Re-trigger validation if guardrails change
+		Named("workloadclass").
+		Complete(r)
+}

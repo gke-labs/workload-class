@@ -1,0 +1,50 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - workloads.gke.io
+  resources:
+  - workloadclasses
+  - workloadclassguardrails
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - workloads.gke.io
+  resources:
+  - workloadclasses/finalizers
+  - workloadclassguardrails/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - workloads.gke.io
+  resources:
+  - workloadclasses/status
+  - workloadclassguardrails/status
+  verbs:
+  - get
+  - patch
+  - update

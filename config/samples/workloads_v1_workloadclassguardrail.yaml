@@ -1,0 +1,9 @@
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClassGuardrail
+metadata:
+  name: default
+spec:
+  maxWindowDurationMinutes: 480
+  maxWindowsPerWeek: 5
+  minInitialRunDurationDaysLimit: 7
+  maxNonDisruptionDurationDaysLimit: 30
