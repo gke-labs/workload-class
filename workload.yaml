@@ -1,0 +1,20 @@
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: sample-workload
+    namespace: test-workload-env
+  spec:
+    replicas: 2
+    selector:
+      matchLabels:
+        app: sample-unlabeled
+    template:
+      metadata:
+        labels:
+          app: sample-unlabeled
+      spec:
+        containers:
+        - name: nginx
+          image: nginx:latest
+  
+  

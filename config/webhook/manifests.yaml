@@ -20,6 +20,8 @@ webhooks:
     - v1
     operations:
     - CREATE
+    - DELETE
     resources:
+    - pods
     - pods/eviction
   sideEffects: None

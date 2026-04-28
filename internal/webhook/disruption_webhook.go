@@ -40,7 +40,7 @@ type DisruptionWebhook struct {
 	decoder *admission.Decoder
 }
 
-// +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods/eviction,verbs=create,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods;pods/eviction,verbs=create;delete,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
 
 // Handle handles admission requests for Pod evictions.
 func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
@@ -50,6 +50,11 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	pod := &corev1.Pod{}
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: req.Name, Namespace: req.Namespace}, pod); err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// 1.1 Verify this is an eviction, not a deletion
+	if req.SubResource != "eviction" {
+		return admission.Allowed("Not an eviction")
 	}
 
 	// 2. Find matching WorkloadClasses
@@ -81,8 +86,22 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	if bestWC == nil {
-		// No WorkloadClass matches this pod, allow eviction by default.
-		return admission.Allowed("No WorkloadClass matches this pod")
+		// 2.1 Fallback to Namespace default
+		ns := &corev1.Namespace{}
+		if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
+			if defaultClass, ok := ns.Annotations["workloads.gke.io/default-class"]; ok {
+				wc := &workloadsv1.WorkloadClass{}
+				if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
+					bestWC = wc
+					log.Info("Using default WorkloadClass from namespace", "workloadClass", bestWC.Name, "namespace", pod.Namespace)
+				}
+			}
+		}
+	}
+
+	if bestWC == nil {
+		// No WorkloadClass matches this pod or namespace, allow eviction by default.
+		return admission.Allowed("No WorkloadClass matches this pod or namespace")
 	}
 
 	log = log.WithValues("workloadClass", bestWC.Name)
