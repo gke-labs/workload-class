@@ -40,30 +40,51 @@ spec:
           spec:
             description: spec defines the desired state of WorkloadClassGuardrail
             properties:
-              maxNonDisruptionDurationDaysLimit:
-                description: MaxNonDisruptionDurationDaysLimit is the maximum value
-                  allowed for MaxNonDisruptionDurationDays in WorkloadClass.
-                format: int32
-                minimum: 1
-                type: integer
-              maxWindowDurationMinutes:
-                description: MaxWindowDurationMinutes is the maximum duration any
-                  single window defined in WorkloadClass can have.
-                format: int32
-                minimum: 1
-                type: integer
-              maxWindowsPerWeek:
-                description: MaxWindowsPerWeek is the maximum number of windows defined
-                  in WorkloadClass allowed per week.
-                format: int32
-                minimum: 1
-                type: integer
-              minInitialRunDurationDaysLimit:
-                description: MinInitialRunDurationDaysLimit is the maximum value allowed
-                  for MinInitialRunDurationDays in WorkloadClass.
-                format: int32
-                minimum: 0
-                type: integer
+              constraints:
+                description: Constraints defines the guardrails for WorkloadClasses.
+                properties:
+                  disruption:
+                    description: Disruption defines the constraints within which WorkloadClasses
+                      can set disruption policies.
+                    properties:
+                      allowedDisruptionDays:
+                        description: AllowedDisruptionDays specifies days on which
+                          disruption can happen (Monday-Sunday).
+                        items:
+                          type: string
+                        type: array
+                      emergencyOverride:
+                        description: EmergencyOverride allows bypassing all constraints
+                          immediately.
+                        type: boolean
+                      enforcedDisruptionTimeoutSeconds:
+                        description: EnforcedDisruptionTimeoutSeconds is the maximum
+                          time in seconds before a disruption is forced.
+                        format: int32
+                        maximum: 3600
+                        type: integer
+                      maxAllowedWindows:
+                        description: |-
+                          MaxAllowedWindows sets the limit of how many windows workload owners can set.
+                          This avoid complications where windows are too short or cases where there could be too many disruptions to workloads.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxNonDisruptionDurationDays:
+                        description: MaxNonDisruptionDurationDays is the limit for
+                          how long workload owners can go without having an open maintenance
+                          window.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - maxNonDisruptionDurationDays
+                    type: object
+                required:
+                - disruption
+                type: object
+            required:
+            - constraints
             type: object
           status:
             description: status defines the observed state of WorkloadClassGuardrail

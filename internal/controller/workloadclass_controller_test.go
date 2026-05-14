@@ -26,8 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"k8s.io/utils/ptr"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -54,7 +52,11 @@ var _ = Describe("WorkloadClass Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: workloadsv1.WorkloadClassSpec{
+						DisruptionPolicy: workloadsv1.DisruptionPolicy{
+							MaxNonDisruptionDurationDays: 1,
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
@@ -90,7 +92,13 @@ var _ = Describe("WorkloadClass Controller", func() {
 					Name: "test-guardrail",
 				},
 				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					MaxWindowDurationMinutes: ptr.To(int32(60)),
+					Constraints: workloadsv1.Constraints{
+						Disruption: workloadsv1.Disruption{
+							MaxAllowedWindows:            int32(2),
+							AllowedDisruptionDays:        []string{"Monday", "Tuesday"},
+							MaxNonDisruptionDurationDays: 1,
+						},
+					},
 				},
 			}
 			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
@@ -98,11 +106,13 @@ var _ = Describe("WorkloadClass Controller", func() {
 				_ = k8sClient.Delete(ctx, guardrail)
 			}()
 
-			By("updating WorkloadClass with a long window")
+			By("updating WorkloadClass with 3 windows")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			wc.Spec.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
-				{DayOfWeek: "Monday", StartTime: "10:00", EndTime: "12:00"}, // 120 mins
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "M", DaysOfWeek: []string{"Monday"}, StartTime: "10:00", EndTime: "12:00"},
+				{Name: "MT", DaysOfWeek: []string{"Monday", "Tuesday"}, StartTime: "10:00", EndTime: "12:00"},
+				{Name: "T", DaysOfWeek: []string{"Tuesday"}, StartTime: "10:00", EndTime: "12:00"},
 			}
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
@@ -127,7 +137,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "exceeds guardrail limit 60")
+							strings.Contains(cond.Message, "exceeds guardrail limit 2")
 					}
 				}
 				return false

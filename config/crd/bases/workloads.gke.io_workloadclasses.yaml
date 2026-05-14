@@ -39,69 +39,72 @@ spec:
           spec:
             description: spec defines the desired state of WorkloadClass
             properties:
-              allowedDisruptionWindows:
-                description: AllowedDisruptionWindows defines when disruptions are
-                  allowed.
-                items:
-                  description: DisruptionWindow defines a temporal window when disruptions
-                    are allowed.
-                  properties:
-                    dayOfWeek:
-                      description: DayOfWeek specifies the day of the week (Monday-Sunday).
-                      enum:
-                      - Monday
-                      - Tuesday
-                      - Wednesday
-                      - Thursday
-                      - Friday
-                      - Saturday
-                      - Sunday
+              disruptionPolicy:
+                description: DisruptionPolicy specifies the policy governing pod disruptions.
+                properties:
+                  allowedDisruptionWindows:
+                    description: AllowedDisruptionWindows defines when disruptions
+                      are allowed.
+                    items:
+                      description: DisruptionWindow defines a temporal window when
+                        disruptions are allowed.
+                      properties:
+                        daysOfWeek:
+                          description: DaysOfWeek specifies the days of the week (Monday-Sunday).
+                          items:
+                            type: string
+                          type: array
+                        endTime:
+                          description: EndTime is the end time of the window in HH:MM
+                            format (e.g. 04:00) in UTC.
+                          pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
+                          type: string
+                        name:
+                          description: Name is the name of the DisruptionWindow.
+                          type: string
+                        startTime:
+                          description: StartTime is the start time of the window in
+                            HH:MM format (e.g. 22:00) in UTC.
+                          pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
+                          type: string
+                        timeZone:
+                          description: TimeZone is the IANA Time Zone Database name
+                            (e.g., "America/Los_Angeles", "Etc/UTC"). See https://www.iana.org/time-zones.
+                          pattern: ^[A-Za-z_]+/[A-Za-z_]+$
+                          type: string
+                      type: object
+                    type: array
+                  allowedDisruptionsOutsideOfWindow:
+                    description: AllowedDisruptionsOutsideOfWindow specifies identities
+                      or components that can disrupt even outside of windows. (e.g.
+                      "VPA", "ClusterAutoscaler")
+                    items:
                       type: string
-                    endTime:
-                      description: EndTime is the end time of the window in HH:MM
-                        format (e.g. 04:00) in UTC.
-                      pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
-                      type: string
-                    startTime:
-                      description: StartTime is the start time of the window in HH:MM
-                        format (e.g. 22:00) in UTC.
-                      pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
-                      type: string
-                  required:
-                  - dayOfWeek
-                  - endTime
-                  - startTime
-                  type: object
-                type: array
-              allowedDisruptionsOutsideOfWindow:
-                description: |-
-                  AllowedDisruptionsOutsideOfWindow specifies identities or components that can disrupt even outside of windows.
-                  (e.g. "VPA", "ClusterAutoscaler")
-                items:
-                  type: string
-                type: array
-              emergencyOverride:
-                description: EmergencyOverride allows bypassing all constraints immediately.
-                type: boolean
-              enforcedDisruptionTimeoutSeconds:
-                description: EnforcedDisruptionTimeoutSeconds defines how long to
-                  wait before forcing disruption if blocked by PDBs.
-                format: int32
-                minimum: 0
-                type: integer
-              maxNonDisruptionDurationDays:
-                description: |-
-                  MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
-                  If exceeded, maintenance takes precedence over per-pod run-duration hints.
-                format: int32
-                minimum: 0
-                type: integer
-              minInitialRunDurationDays:
-                description: MinInitialRunDurationDays is the minimum duration a pod
-                  must run before it can be disrupted.
-                format: int32
-                minimum: 0
-                type: integer
+                    type: array
+                  emergencyOverride:
+                    description: EmergencyOverride allows bypassing all constraints
+                      immediately.
+                    type: boolean
+                  graceTerminationDuration:
+                    description: GraceTerminationDuration is the maximum time in seconds
+                      for a pod to terminate gracefully.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  maxNonDisruptionDurationDays:
+                    description: |-
+                      MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
+                      If exceeded, maintenance takes precedence over per-pod run-duration hints.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  minInitialRunDurationDays:
+                    description: MinInitialRunDurationDays is the minimum duration
+                      a pod must run before it can be disrupted.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
               podSelector:
                 description: PodSelector matches the pods that this class applies
                   to.
