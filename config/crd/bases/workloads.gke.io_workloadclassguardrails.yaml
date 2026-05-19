@@ -12,7 +12,7 @@ spec:
     listKind: WorkloadClassGuardrailList
     plural: workloadclassguardrails
     singular: workloadclassguardrail
-  scope: Cluster
+  scope: Namespaced
   versions:
   - name: v1
     schema:

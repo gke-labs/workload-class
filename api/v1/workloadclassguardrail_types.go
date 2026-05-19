@@ -85,7 +85,7 @@ type WorkloadClassGuardrailStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Namespaced
 
 // WorkloadClassGuardrail is the Schema for the workloadclassguardrails API
 type WorkloadClassGuardrail struct {
