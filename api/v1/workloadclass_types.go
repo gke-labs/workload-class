@@ -124,7 +124,7 @@ type WorkloadClassStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Namespaced
 
 // WorkloadClass is the Schema for the workloadclasses API
 type WorkloadClass struct {

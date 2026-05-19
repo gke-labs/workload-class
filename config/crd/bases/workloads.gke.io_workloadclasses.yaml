@@ -12,7 +12,7 @@ spec:
     listKind: WorkloadClassList
     plural: workloadclasses
     singular: workloadclass
-  scope: Cluster
+  scope: Namespaced
   versions:
   - name: v1
     schema:
