@@ -17,6 +17,7 @@ limitations under the License.
 package utils
 
 import (
+	"slices"
 	"time"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -33,7 +34,7 @@ func IsTimeInWindows(now time.Time, windows []workloadsv1.DisruptionWindow) (boo
 	minWait := 24 * 7 * time.Hour
 
 	for _, w := range windows {
-		if now.Weekday().String() == w.DayOfWeek {
+		if slices.Contains(w.DaysOfWeek, now.Weekday().String()) {
 			start, err := time.Parse("15:04", w.StartTime)
 			if err != nil {
 				continue

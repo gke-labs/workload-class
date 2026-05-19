@@ -115,12 +115,12 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 4. Emergency Override
-	if bestWC.Spec.EmergencyOverride {
+	if bestWC.Spec.DisruptionPolicy.EmergencyOverride {
 		return admission.Allowed("Emergency override active")
 	}
 
 	// 4. Identity-Based Filtering
-	for _, allowedUser := range bestWC.Spec.AllowedDisruptionsOutsideOfWindow {
+	for _, allowedUser := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
 		// Example: "VPA" maps to its service account
 		if matchesIdentity(req.UserInfo.Username, allowedUser) {
 			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", allowedUser))
@@ -129,12 +129,12 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	// 5. Temporal Enforcement
 	now := time.Now().UTC()
-	inWindow, _ := utils.IsTimeInWindows(now, bestWC.Spec.AllowedDisruptionWindows)
+	inWindow, _ := utils.IsTimeInWindows(now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 
 	// 6. Maintenance Starvation (Override on Overdue)
 	isOverdue := false
-	if bestWC.Spec.MaxNonDisruptionDurationDays > 0 && bestWC.Status.LastDisruptionTime != nil {
-		maxDuration := time.Duration(bestWC.Spec.MaxNonDisruptionDurationDays) * 24 * time.Hour
+	if bestWC.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && bestWC.Status.LastDisruptionTime != nil {
+		maxDuration := time.Duration(bestWC.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
 		if now.Sub(bestWC.Status.LastDisruptionTime.Time) > maxDuration {
 			isOverdue = true
 		}
@@ -149,11 +149,11 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 7. Pod Lifecycle Protection (Min Initial Run)
-	if bestWC.Spec.MinInitialRunDurationDays > 0 {
-		minRunDuration := time.Duration(bestWC.Spec.MinInitialRunDurationDays) * 24 * time.Hour
+	if bestWC.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
+		minRunDuration := time.Duration(bestWC.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
 		if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
 			return admission.Denied(fmt.Sprintf("Eviction blocked: pod is too new (running for %v, required %d days)",
-				now.Sub(pod.CreationTimestamp.Time).Round(time.Minute), bestWC.Spec.MinInitialRunDurationDays))
+				now.Sub(pod.CreationTimestamp.Time).Round(time.Minute), bestWC.Spec.DisruptionPolicy.MinInitialRunDurationDays))
 		}
 	}
 

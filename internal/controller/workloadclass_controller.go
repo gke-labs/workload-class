@@ -89,26 +89,26 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	now := time.Now().UTC()
 
 	// 1. Emergency Override
-	if wc.Spec.EmergencyOverride {
+	if wc.Spec.DisruptionPolicy.EmergencyOverride {
 		return workloadsv1.ReadinessReady, 0, nil
 	}
 
 	// 2. Check Overdue (Maximum Protected Duration)
-	if wc.Spec.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
-		maxDuration := time.Duration(wc.Spec.MaxNonDisruptionDurationDays) * 24 * time.Hour
+	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
+		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
 		if now.Sub(wc.Status.LastDisruptionTime.Time) > maxDuration {
 			return workloadsv1.ReadinessOverdue, 0, nil
 		}
 	}
 
 	// 3. Check Temporal Windows
-	inWindow, nextWindow := utils.IsTimeInWindows(now, wc.Spec.AllowedDisruptionWindows)
+	inWindow, nextWindow := utils.IsTimeInWindows(now, wc.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 	if !inWindow {
 		return workloadsv1.ReadinessNotReady, nextWindow, nil
 	}
 
 	// 4. Check Pod Ages (Min Initial Run)
-	if wc.Spec.MinInitialRunDurationDays > 0 {
+	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
 		pods := &corev1.PodList{}
 		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
 		if err != nil {
@@ -118,7 +118,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 			return workloadsv1.ReadinessNotReady, 0, err
 		}
 
-		minRunDuration := time.Duration(wc.Spec.MinInitialRunDurationDays) * 24 * time.Hour
+		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
 		for _, pod := range pods.Items {
 			if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
 				// Pod hasn't run long enough
@@ -147,47 +147,42 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 	}
 
 	// Determine effective constraints (pick the most restrictive)
-	var maxWindowDur *int32
-	var maxWindowsWeek *int32
-	var minInitialRunLimit *int32
-	var maxNonDisruptionLimit *int32
+	var allowedDisruptionDays []string
+	var maxAllowedWindows *int32
+	var maxNonDisruptionDurationDays *int32
+	var enforcedDisruptionTimeoutSeconds *int32
 
 	for _, g := range guardrails.Items {
-		if g.Spec.MaxWindowDurationMinutes != nil && (maxWindowDur == nil || *g.Spec.MaxWindowDurationMinutes < *maxWindowDur) {
-			maxWindowDur = g.Spec.MaxWindowDurationMinutes
+		if maxNonDisruptionDurationDays == nil || g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays < *maxNonDisruptionDurationDays {
+			maxNonDisruptionDurationDays = &g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
 		}
-		if g.Spec.MaxWindowsPerWeek != nil && (maxWindowsWeek == nil || *g.Spec.MaxWindowsPerWeek < *maxWindowsWeek) {
-			maxWindowsWeek = g.Spec.MaxWindowsPerWeek
+		if allowedDisruptionDays == nil || !isSubset(allowedDisruptionDays, g.Spec.Constraints.Disruption.AllowedDisruptionDays) {
+			allowedDisruptionDays = g.Spec.Constraints.Disruption.AllowedDisruptionDays
 		}
-		if g.Spec.MinInitialRunDurationDaysLimit != nil && (minInitialRunLimit == nil || *g.Spec.MinInitialRunDurationDaysLimit < *minInitialRunLimit) {
-			minInitialRunLimit = g.Spec.MinInitialRunDurationDaysLimit
+		if maxAllowedWindows == nil || g.Spec.Constraints.Disruption.MaxAllowedWindows < *maxAllowedWindows {
+			maxAllowedWindows = &g.Spec.Constraints.Disruption.MaxAllowedWindows
 		}
-		if g.Spec.MaxNonDisruptionDurationDaysLimit != nil && (maxNonDisruptionLimit == nil || *g.Spec.MaxNonDisruptionDurationDaysLimit < *maxNonDisruptionLimit) {
-			maxNonDisruptionLimit = g.Spec.MaxNonDisruptionDurationDaysLimit
+		if enforcedDisruptionTimeoutSeconds == nil || g.Spec.Constraints.Disruption.EnforcedDisruptionTimeoutSeconds < *enforcedDisruptionTimeoutSeconds {
+			enforcedDisruptionTimeoutSeconds = &g.Spec.Constraints.Disruption.EnforcedDisruptionTimeoutSeconds
 		}
 	}
 
 	var violations []string
-
-	if maxWindowDur != nil {
-		for _, w := range wc.Spec.AllowedDisruptionWindows {
-			dur := utils.CalculateWindowDuration(w)
-			if int32(dur.Minutes()) > *maxWindowDur {
-				violations = append(violations, fmt.Sprintf("window duration %v minutes exceeds guardrail limit %d", dur.Minutes(), *maxWindowDur))
+	if allowedDisruptionDays != nil {
+		for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
+			days := dw.DaysOfWeek
+			if !isSubset(days, allowedDisruptionDays) {
+				violations = append(violations, fmt.Sprintf("disruption window %s contains day(s) of week that are not allowed by guardrail. Found DaysOfWeek: %v, guardrail AllowedDisruptionDays: %v", dw.Name, dw.DaysOfWeek, allowedDisruptionDays))
 			}
 		}
 	}
 
-	if maxWindowsWeek != nil && int32(len(wc.Spec.AllowedDisruptionWindows)) > *maxWindowsWeek {
-		violations = append(violations, fmt.Sprintf("number of windows %d exceeds guardrail limit %d", len(wc.Spec.AllowedDisruptionWindows), *maxWindowsWeek))
+	if len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows) > int(*maxAllowedWindows) {
+		violations = append(violations, fmt.Sprintf("number of windows %v exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.AllowedDisruptionWindows, int(*maxAllowedWindows)))
 	}
 
-	if minInitialRunLimit != nil && wc.Spec.MinInitialRunDurationDays > *minInitialRunLimit {
-		violations = append(violations, fmt.Sprintf("minInitialRunDurationDays %d exceeds guardrail limit %d", wc.Spec.MinInitialRunDurationDays, *minInitialRunLimit))
-	}
-
-	if maxNonDisruptionLimit != nil && wc.Spec.MaxNonDisruptionDurationDays > *maxNonDisruptionLimit {
-		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.MaxNonDisruptionDurationDays, *maxNonDisruptionLimit))
+	if maxNonDisruptionDurationDays != nil && wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > *maxNonDisruptionDurationDays {
+		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, *maxNonDisruptionDurationDays))
 	}
 
 	if len(violations) > 0 {
@@ -216,4 +211,23 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&workloadsv1.WorkloadClassGuardrail{}). // Re-trigger validation if guardrails change
 		Named("workloadclass").
 		Complete(r)
+}
+
+func isSubset(allowedDays, guardrailAllowedDays []string) bool {
+	if len(allowedDays) == 0 {
+		return true
+	}
+
+	guardrailSet := make(map[string]struct{}, len(guardrailAllowedDays))
+	for _, d := range guardrailAllowedDays {
+		guardrailSet[d] = struct{}{}
+	}
+
+	for _, d := range allowedDays {
+		if _, found := guardrailSet[d]; !found {
+			return false
+		}
+	}
+
+	return true
 }

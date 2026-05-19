@@ -20,22 +20,58 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// DisruptionPolicy specifies the policy governing pod disruptions.
+type DisruptionPolicy struct {
+	// AllowedDisruptionWindows defines when disruptions are allowed.
+	// +optional
+	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
+
+	// AllowedDisruptionsOutsideOfWindow specifies identities or components that can disrupt even outside of windows. (e.g. "VPA", "ClusterAutoscaler")
+	// +optional
+	AllowedDisruptionsOutsideOfWindow []string `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
+
+	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
+	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays,omitempty"`
+
+	// MinInitialRunDurationDays is the minimum duration a pod must run before it can be disrupted.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MinInitialRunDurationDays int32 `json:"minInitialRunDurationDays,omitempty"`
+
+	// GraceTerminationDuration is the maximum time in seconds for a pod to terminate gracefully.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	GraceTerminationDuration int32 `json:"graceTerminationDuration,omitempty"`
+
+	// EmergencyOverride allows bypassing all constraints immediately.
+	// +optional
+	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+}
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
 type DisruptionWindow struct {
-	// DayOfWeek specifies the day of the week (Monday-Sunday).
-	// +kubebuilder:validation:Enum=Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday
-	DayOfWeek string `json:"dayOfWeek"`
+	// Name is the name of the DisruptionWindow.
+	Name string `json:"name,omitempty"`
+
+	// DaysOfWeek specifies the days of the week (Monday-Sunday).
+	DaysOfWeek []string `json:"daysOfWeek,omitempty"`
+
+	// TimeZone is the IANA Time Zone Database name (e.g., "America/Los_Angeles", "Etc/UTC"). See https://www.iana.org/time-zones.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_]+/[A-Za-z_]+$`
+	TimeZone string `json:"timeZone,omitempty"`
 
 	// StartTime is the start time of the window in HH:MM format (e.g. 22:00) in UTC.
 	// +kubebuilder:validation:Pattern=`^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$`
-	StartTime string `json:"startTime"`
+	StartTime string `json:"startTime,omitempty"`
 
 	// EndTime is the end time of the window in HH:MM format (e.g. 04:00) in UTC.
 	// +kubebuilder:validation:Pattern=`^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$`
-	EndTime string `json:"endTime"`
+	EndTime string `json:"endTime,omitempty"`
 }
 
 // WorkloadClassSpec defines the desired state of WorkloadClass
@@ -44,34 +80,9 @@ type WorkloadClassSpec struct {
 	// +optional
 	PodSelector *metav1.LabelSelector `json:"podSelector,omitempty"`
 
-	// AllowedDisruptionWindows defines when disruptions are allowed.
+	// DisruptionPolicy specifies the policy governing pod disruptions.
 	// +optional
-	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
-
-	// AllowedDisruptionsOutsideOfWindow specifies identities or components that can disrupt even outside of windows.
-	// (e.g. "VPA", "ClusterAutoscaler")
-	// +optional
-	AllowedDisruptionsOutsideOfWindow []string `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
-
-	// MinInitialRunDurationDays is the minimum duration a pod must run before it can be disrupted.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MinInitialRunDurationDays int32 `json:"minInitialRunDurationDays,omitempty"`
-
-	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
-	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays,omitempty"`
-
-	// EmergencyOverride allows bypassing all constraints immediately.
-	// +optional
-	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
-
-	// EnforcedDisruptionTimeoutSeconds defines how long to wait before forcing disruption if blocked by PDBs.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	EnforcedDisruptionTimeoutSeconds *int32 `json:"enforcedDisruptionTimeoutSeconds,omitempty"`
+	DisruptionPolicy DisruptionPolicy `json:"disruptionPolicy,omitempty"`
 }
 
 type MaintenanceReadiness string
@@ -113,7 +124,7 @@ type WorkloadClassStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Namespaced
 
 // WorkloadClass is the Schema for the workloadclasses API
 type WorkloadClass struct {

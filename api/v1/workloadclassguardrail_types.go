@@ -20,30 +20,44 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// Constraints defines the guardrails for WorkloadClasses.
+type Constraints struct {
+	// Disruption defines the constraints within which WorkloadClasses can set disruption policies.
+	Disruption Disruption `json:"disruption"`
+}
+
+// Disruption defines the constraints within which WorkloadClasses can set disruption policies.
+type Disruption struct {
+	// AllowedDisruptionDays specifies days on which disruption can happen (Monday-Sunday).
+	// +optional
+	AllowedDisruptionDays []string `json:"allowedDisruptionDays,omitempty"`
+
+	// MaxAllowedWindows sets the limit of how many windows workload owners can set.
+	// This avoid complications where windows are too short or cases where there could be too many disruptions to workloads.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxAllowedWindows int32 `json:"maxAllowedWindows,omitempty"`
+
+	// MaxNonDisruptionDurationDays is the limit for how long workload owners can go without having an open maintenance window.
+	// +kubebuilder:validation:Minimum=1
+	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays"`
+
+	// EnforcedDisruptionTimeoutSeconds is the maximum time in seconds before a disruption is forced.
+	// +optional
+	// +kubebuilder:validation:Maximum=3600
+	EnforcedDisruptionTimeoutSeconds int32 `json:"enforcedDisruptionTimeoutSeconds,omitempty"`
+
+	// EmergencyOverride allows bypassing all constraints immediately.
+	// +optional
+	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+}
 
 // WorkloadClassGuardrailSpec defines the desired state of WorkloadClassGuardrail
 type WorkloadClassGuardrailSpec struct {
-	// MaxWindowDurationMinutes is the maximum duration any single window defined in WorkloadClass can have.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxWindowDurationMinutes *int32 `json:"maxWindowDurationMinutes,omitempty"`
-
-	// MaxWindowsPerWeek is the maximum number of windows defined in WorkloadClass allowed per week.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxWindowsPerWeek *int32 `json:"maxWindowsPerWeek,omitempty"`
-
-	// MinInitialRunDurationDaysLimit is the maximum value allowed for MinInitialRunDurationDays in WorkloadClass.
-	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MinInitialRunDurationDaysLimit *int32 `json:"minInitialRunDurationDaysLimit,omitempty"`
-
-	// MaxNonDisruptionDurationDaysLimit is the maximum value allowed for MaxNonDisruptionDurationDays in WorkloadClass.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	MaxNonDisruptionDurationDaysLimit *int32 `json:"maxNonDisruptionDurationDaysLimit,omitempty"`
+	// Constraints defines the guardrails for WorkloadClasses.
+	Constraints Constraints `json:"constraints"`
 }
 
 // WorkloadClassGuardrailStatus defines the observed state of WorkloadClassGuardrail.

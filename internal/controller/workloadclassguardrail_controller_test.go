@@ -51,7 +51,13 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: workloadsv1.WorkloadClassGuardrailSpec{
+						Constraints: workloadsv1.Constraints{
+							Disruption: workloadsv1.Disruption{
+								MaxNonDisruptionDurationDays: 1,
+							},
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
