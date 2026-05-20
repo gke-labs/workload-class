@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,16 +29,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
-)
-
-const (
-	Sunday    = "Sunday"
-	Monday    = "Monday"
-	Tuesday   = "Tuesday"
-	Wednesday = "Wednesday"
-	Thursday  = "Thursday"
-	Friday    = "Friday"
-	Saturday  = "Saturday"
 )
 
 // WorkloadClassGuardrailReconciler reconciles a WorkloadClassGuardrail object
@@ -95,7 +86,16 @@ func (r *WorkloadClassGuardrailReconciler) SetupWithManager(mgr ctrl.Manager) er
 }
 
 func validateDisruptionDays(allowedDisruptionDays []string) error {
-	days := []string{Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday}
+	days := []string{
+		time.Sunday.String(),
+		time.Monday.String(),
+		time.Tuesday.String(),
+		time.Wednesday.String(),
+		time.Thursday.String(),
+		time.Friday.String(),
+		time.Saturday.String(),
+	}
+
 	if !isSubset(allowedDisruptionDays, days) {
 		return fmt.Errorf("allowedDisruptionDays contains invalid days, valid days are: %v, got %v", days, allowedDisruptionDays)
 	}
