@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -118,24 +117,4 @@ func toUniqueSet(list []string) []string {
 		result = append(result, k)
 	}
 	return result
-}
-
-func condition(violations []string) metav1.Condition {
-	if len(violations) > 0 {
-		return metav1.Condition{
-			Type:               workloadsv1.ConditionTypeValidated,
-			Status:             metav1.ConditionFalse,
-			Reason:             workloadsv1.ReasonValidationFailed,
-			Message:            strings.Join(violations, "; "),
-			LastTransitionTime: metav1.Now(),
-		}
-	}
-
-	return metav1.Condition{
-		Type:               workloadsv1.ConditionTypeValidated,
-		Status:             metav1.ConditionTrue,
-		Reason:             workloadsv1.ReasonValidationPassed,
-		Message:            "WorkloadClass adheres to all Guardrail constraints",
-		LastTransitionTime: metav1.Now(),
-	}
 }
