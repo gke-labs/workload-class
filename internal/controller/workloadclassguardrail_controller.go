@@ -18,13 +18,27 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+)
+
+const (
+	Sunday    = "Sunday"
+	Monday    = "Monday"
+	Tuesday   = "Tuesday"
+	Wednesday = "Wednesday"
+	Thursday  = "Thursday"
+	Friday    = "Friday"
+	Saturday  = "Saturday"
 )
 
 // WorkloadClassGuardrailReconciler reconciles a WorkloadClassGuardrail object
@@ -47,11 +61,34 @@ type WorkloadClassGuardrailReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
 func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	g := &workloadsv1.WorkloadClassGuardrail{}
+	if err := r.Get(ctx, req.NamespacedName, g); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	validationCondition, err := r.validate(ctx, g)
+	if err != nil {
+		log.Error(err, "Failed to validate guardrail")
+		return ctrl.Result{}, err
+	}
+	meta.SetStatusCondition(&g.Status.Conditions, validationCondition)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) (metav1.Condition, error) {
+	log := logf.FromContext(ctx)
+	var violations []string
+	allowedDisruptionDays, err := validateDisruptionDays(g.Spec.Constraints.Disruption.AllowedDisruptionDays)
+	g.Spec.Constraints.Disruption.AllowedDisruptionDays = allowedDisruptionDays
+	if err != nil {
+		log.Error(err, "validation of AllowedDisruptionDays failed")
+		violations = append(violations, err.Error())
+	}
+
+	return condition(violations), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -60,4 +97,45 @@ func (r *WorkloadClassGuardrailReconciler) SetupWithManager(mgr ctrl.Manager) er
 		For(&workloadsv1.WorkloadClassGuardrail{}).
 		Named("workloadclassguardrail").
 		Complete(r)
+}
+
+func validateDisruptionDays(allowedDisruptionDays []string) ([]string, error) {
+	days := []string{Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday}
+	if !isSubset(allowedDisruptionDays, days) {
+		return allowedDisruptionDays, fmt.Errorf("allowedDisruptionDays contains invalid days, valid days are: %v, got %v", days, allowedDisruptionDays)
+	}
+
+	return toUniqueSet(allowedDisruptionDays), nil
+}
+
+func toUniqueSet(list []string) []string {
+	uniqueSet := map[string]struct{}{}
+	for _, s := range list {
+		uniqueSet[s] = struct{}{}
+	}
+	result := []string{}
+	for k, _ := range uniqueSet {
+		result = append(result, k)
+	}
+	return result
+}
+
+func condition(violations []string) metav1.Condition {
+	if len(violations) > 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeValidated,
+			Status:             metav1.ConditionFalse,
+			Reason:             workloadsv1.ReasonValidationFailed,
+			Message:            strings.Join(violations, "; "),
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+
+	return metav1.Condition{
+		Type:               workloadsv1.ConditionTypeValidated,
+		Status:             metav1.ConditionTrue,
+		Reason:             workloadsv1.ReasonValidationPassed,
+		Message:            "WorkloadClass adheres to all Guardrail constraints",
+		LastTransitionTime: metav1.Now(),
+	}
 }
