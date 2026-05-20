@@ -96,7 +96,8 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	// 2. Check Overdue (Maximum Protected Duration)
 	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
 		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
-		if now.Sub(wc.Status.LastDisruptionTime.Time) > maxDuration {
+		diff := now.Sub(wc.Status.LastDisruptionTime.Time)
+		if diff > maxDuration {
 			return workloadsv1.ReadinessOverdue, 0, nil
 		}
 	}
@@ -147,33 +148,15 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 	}
 
 	// Determine effective constraints (pick the most restrictive)
-	var allowedDisruptionDays []string
-	var maxAllowedWindows *int32
-	var maxNonDisruptionDurationDays *int32
-	var enforcedDisruptionTimeoutSeconds *int32
-
-	for _, g := range guardrails.Items {
-		if maxNonDisruptionDurationDays == nil || g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays < *maxNonDisruptionDurationDays {
-			maxNonDisruptionDurationDays = &g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
-		}
-		if allowedDisruptionDays == nil || !isSubset(allowedDisruptionDays, g.Spec.Constraints.Disruption.AllowedDisruptionDays) {
-			allowedDisruptionDays = g.Spec.Constraints.Disruption.AllowedDisruptionDays
-		}
-		if maxAllowedWindows == nil || g.Spec.Constraints.Disruption.MaxAllowedWindows < *maxAllowedWindows {
-			maxAllowedWindows = &g.Spec.Constraints.Disruption.MaxAllowedWindows
-		}
-		if enforcedDisruptionTimeoutSeconds == nil || g.Spec.Constraints.Disruption.EnforcedDisruptionTimeoutSeconds < *enforcedDisruptionTimeoutSeconds {
-			enforcedDisruptionTimeoutSeconds = &g.Spec.Constraints.Disruption.EnforcedDisruptionTimeoutSeconds
-		}
-	}
+	allowedDisruptionDays, maxAllowedWindows, maxNonDisruptionDurationDays := guardrailDisruptionConstraints(guardrails.Items)
 
 	var violations []string
-	if allowedDisruptionDays != nil {
-		for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
-			days := dw.DaysOfWeek
-			if !isSubset(days, allowedDisruptionDays) {
-				violations = append(violations, fmt.Sprintf("disruption window %s contains day(s) of week that are not allowed by guardrail. Found DaysOfWeek: %v, guardrail AllowedDisruptionDays: %v", dw.Name, dw.DaysOfWeek, allowedDisruptionDays))
-			}
+	for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
+		if !allowedDisruptionDaysValid(dw.DaysOfWeek, allowedDisruptionDays) {
+			violations = append(violations, fmt.Sprintf("disruption window %s contains day(s) of week that are not allowed by guardrail. Found DaysOfWeek: %v, guardrail AllowedDisruptionDays: %v", dw.Name, dw.DaysOfWeek, allowedDisruptionDays))
+		}
+		if !timeZoneValid(dw.TimeZone) {
+			violations = append(violations, fmt.Sprintf("disruption window %s has invalid time zone %s", dw.Name, dw.TimeZone))
 		}
 	}
 
@@ -185,23 +168,7 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, *maxNonDisruptionDurationDays))
 	}
 
-	if len(violations) > 0 {
-		return metav1.Condition{
-			Type:               workloadsv1.ConditionTypeValidated,
-			Status:             metav1.ConditionFalse,
-			Reason:             workloadsv1.ReasonValidationFailed,
-			Message:            strings.Join(violations, "; "),
-			LastTransitionTime: metav1.Now(),
-		}, nil
-	}
-
-	return metav1.Condition{
-		Type:               workloadsv1.ConditionTypeValidated,
-		Status:             metav1.ConditionTrue,
-		Reason:             workloadsv1.ReasonValidationPassed,
-		Message:            "WorkloadClass adheres to all Guardrail constraints",
-		LastTransitionTime: metav1.Now(),
-	}, nil
+	return condition(violations), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -213,18 +180,81 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func isSubset(allowedDays, guardrailAllowedDays []string) bool {
-	if len(allowedDays) == 0 {
+func condition(violations []string) metav1.Condition {
+	if len(violations) > 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeValidated,
+			Status:             metav1.ConditionFalse,
+			Reason:             workloadsv1.ReasonValidationFailed,
+			Message:            strings.Join(violations, "; "),
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+
+	return metav1.Condition{
+		Type:               workloadsv1.ConditionTypeValidated,
+		Status:             metav1.ConditionTrue,
+		Reason:             workloadsv1.ReasonValidationPassed,
+		Message:            "WorkloadClass adheres to all Guardrail constraints",
+		LastTransitionTime: metav1.Now(),
+	}
+}
+
+func guardrailDisruptionConstraints(guardrails []workloadsv1.WorkloadClassGuardrail) ([][]string, *int32, *int32) {
+	if guardrails == nil {
+		return nil, nil, nil
+	}
+
+	// Determine effective constraints (pick the most restrictive)
+	var allowedDisruptionDays [][]string
+	var maxAllowedWindows *int32
+	var maxNonDisruptionDurationDays *int32
+
+	for _, g := range guardrails {
+		if maxNonDisruptionDurationDays == nil || g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays < *maxNonDisruptionDurationDays {
+			maxNonDisruptionDurationDays = &g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
+		}
+
+		allowedDisruptionDays = append(allowedDisruptionDays, g.Spec.Constraints.Disruption.AllowedDisruptionDays)
+
+		if maxAllowedWindows == nil || g.Spec.Constraints.Disruption.MaxAllowedWindows < *maxAllowedWindows {
+			maxAllowedWindows = &g.Spec.Constraints.Disruption.MaxAllowedWindows
+		}
+	}
+
+	return allowedDisruptionDays, maxAllowedWindows, maxNonDisruptionDurationDays
+}
+
+func allowedDisruptionDaysValid(wcAllowedDisruptionDays []string, guardrail [][]string) bool {
+	if len(guardrail) == 0 || len(wcAllowedDisruptionDays) == 0 {
 		return true
 	}
 
-	guardrailSet := make(map[string]struct{}, len(guardrailAllowedDays))
-	for _, d := range guardrailAllowedDays {
-		guardrailSet[d] = struct{}{}
+	valid := true
+	for _, days := range guardrail {
+		valid = valid && isSubset(wcAllowedDisruptionDays, days)
 	}
 
-	for _, d := range allowedDays {
-		if _, found := guardrailSet[d]; !found {
+	return valid
+}
+
+func timeZoneValid(timeZone string) bool {
+	_, err := time.LoadLocation(timeZone)
+	return err == nil
+}
+
+func isSubset(subset, superset []string) bool {
+	if len(subset) == 0 {
+		return true
+	}
+
+	supersetMap := make(map[string]struct{}, len(superset))
+	for _, d := range superset {
+		supersetMap[d] = struct{}{}
+	}
+
+	for _, d := range subset {
+		if _, found := supersetMap[d]; !found {
 			return false
 		}
 	}
