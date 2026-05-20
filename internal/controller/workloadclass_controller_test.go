@@ -35,28 +35,40 @@ import (
 
 var _ = Describe("WorkloadClass Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
-
 		ctx := context.Background()
+		const (
+			workloadClassName = "test-resource"
+			guardrailName     = "test-guardrail"
+			podName           = "silly-goose-pod"
+			defaultNamespace  = "default"
+		)
+
+		podLabels := map[string]string{
+			"duck-duck": "goose", // Match the WC PodSelector
+		}
 
 		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default",
+			Name:      workloadClassName,
+			Namespace: defaultNamespace,
 		}
-		workloadclass := &workloadsv1.WorkloadClass{}
 		typeNamespacedNamePod := types.NamespacedName{
-			Name:      "silly-goose-pod",
-			Namespace: "default",
+			Name:      podName,
+			Namespace: defaultNamespace,
+		}
+		typeNamespacedNameGuardrail := types.NamespacedName{
+			Name:      guardrailName,
+			Namespace: "", // Explicitly empty for cluster-scoped
 		}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind WorkloadClass")
+			By("Creating the custom resource for the Kind WorkloadClass")
+			workloadclass := &workloadsv1.WorkloadClass{}
 			err := k8sClient.Get(ctx, typeNamespacedName, workloadclass)
 			if err != nil && errors.IsNotFound(err) {
 				resource := &workloadsv1.WorkloadClass{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
+						Name:      workloadClassName,
+						Namespace: defaultNamespace,
 					},
 					Spec: workloadsv1.WorkloadClassSpec{
 						DisruptionPolicy: workloadsv1.DisruptionPolicy{
@@ -66,35 +78,66 @@ var _ = Describe("WorkloadClass Controller", func() {
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
+
+			By("Creating the custom resource for the Kind WorkloadClassGuardrail")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: guardrailName,
+				},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Disruption: workloadsv1.Disruption{
+							MaxAllowedWindows:            int32(2),
+							AllowedDisruptionDays:        []string{"Sunday", "Monday", "Tuesday"},
+							MaxNonDisruptionDurationDays: 3,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
+
+			By("Creating a Pod")
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      podName,
+					Namespace: defaultNamespace,
+					Labels:    podLabels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "duckling",
+							Image: "nginx:latest",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		})
 
 		AfterEach(func() {
-			resource := &workloadsv1.WorkloadClass{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
 			By("Cleanup the specific resource instance WorkloadClass")
+			resource := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 
-			pod := &corev1.Pod{}
-			err = k8sClient.Get(ctx, typeNamespacedNamePod, pod)
-			if err != nil && strings.Contains(err.Error(), "not found") {
-				// Not all test cases make a pod
-				return
-			}
-			Expect(err).NotTo(HaveOccurred())
-
 			By("Cleanup pod")
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNamePod, pod)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
 
+			By("Cleanup guardrail to be recreated for the next test")
+			gr := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, gr)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, gr)).To(Succeed())
 		})
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &WorkloadClassReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}
-
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -102,26 +145,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 		// Validate against guardrails
 		It("should fail validation if number of DisruptionWindows less than or equal to MaxAllowedWindows", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:            int32(2),
-							AllowedDisruptionDays:        []string{"Monday", "Tuesday"},
-							MaxNonDisruptionDurationDays: 1,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
-
 			By("updating WorkloadClass with 3 windows")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
@@ -159,26 +182,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return false
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should fail if DaysOfWeek is not a subset of AllowedDisruptionDays", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:            int32(2),
-							AllowedDisruptionDays:        []string{"Monday", "Tuesday"},
-							MaxNonDisruptionDurationDays: 1,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
 			By("updating WorkloadClass with DisruptionWindow outside of AllowedDisruptionDays")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
@@ -214,26 +219,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return false
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should fail if timeZone is invalid", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:            int32(2),
-							AllowedDisruptionDays:        []string{"Monday", "Tuesday"},
-							MaxNonDisruptionDurationDays: 1,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
 			By("updating WorkloadClass with DisruptionWindow outside of AllowedDisruptionDays")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
@@ -269,32 +256,15 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return false
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should fail if maxNonDisruptionDays exceeds limit", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:            int32(2),
-							AllowedDisruptionDays:        []string{"Monday", "Tuesday"},
-							MaxNonDisruptionDurationDays: 3,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
 			By("updating WorkloadClass with MaxNonDisruptionDurationDays exceeding limit")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
-				{Name: "MT", DaysOfWeek: []string{"Monday", "Tuesday"}, TimeZone: "America/Los_Angeles", StartTime: "10:00", EndTime: "12:00"},
-			}
+
 			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = guardrail.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays + 1
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
@@ -327,31 +297,11 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 		// Calculate readiness
 		It("should be ready if EmergencyOverride is set", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							AllowedDisruptionDays:            []string{"Sunday", "Monday", "Tuesday"},
-							MaxAllowedWindows:                int32(2),
-							MaxNonDisruptionDurationDays:     3,
-							EnforcedDisruptionTimeoutSeconds: 20,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
 			By("updating WorkloadClass with EmergencyOverride")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
-				{Name: "Emergency", DaysOfWeek: []string{"Wednesday"}, TimeZone: "America/Los_Angeles", StartTime: "10:00", EndTime: "12:00"},
+				{Name: "Emergency", DaysOfWeek: []string{"Friday"}, TimeZone: "America/Los_Angeles", StartTime: "10:00", EndTime: "12:00"},
 			}
 			wc.Spec.DisruptionPolicy.EmergencyOverride = true
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
@@ -393,26 +343,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessReady
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should be overdue if time since last disruption exceeds max", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:                int32(2),
-							MaxNonDisruptionDurationDays:     3,
-							EnforcedDisruptionTimeoutSeconds: 20,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
 			By("updating WorkloadClass with old last disruption")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
@@ -442,30 +374,21 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should not be ready if not within allowed disruption window", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:                int32(2),
-							MaxNonDisruptionDurationDays:     3,
-							EnforcedDisruptionTimeoutSeconds: 20,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+
+			By("creating updating the allowed disruption days in the guardrail")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+
+			guardrail.Spec.Constraints.Disruption.AllowedDisruptionDays = []string{notToday}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
 			By("updating WorkloadClass with disruption window that is not today")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+
 			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
 				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "America/Los_Angeles", StartTime: "10:00", EndTime: "12:00"},
 			}
@@ -491,45 +414,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessNotReady
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should not be ready if pods haven't run long enough", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:                int32(2),
-							MaxNonDisruptionDurationDays:     3,
-							EnforcedDisruptionTimeoutSeconds: 20,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
-			By("creating a pod")
-			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "silly-goose-pod",
-					Namespace: "default",
-					Labels: map[string]string{ // Match the WC PodSelector
-						"duck-duck": "goose",
-					},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "duckling",
-							Image: "nginx:latest",
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 			By("updating WorkloadClass with min initial run duration days and pod selector")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
@@ -539,9 +425,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			}
 			wc.Spec.DisruptionPolicy.MinInitialRunDurationDays = 4
 			wc.Spec.PodSelector = &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"duck-duck": "goose",
-				},
+				MatchLabels: podLabels,
 			}
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
@@ -565,56 +449,18 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessNotReady
 			}, "10s", "1s").Should(BeTrue())
 		})
+
 		It("should be ready with next window", func() {
-			By("creating a guardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-guardrail",
-				},
-				Spec: workloadsv1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1.Constraints{
-						Disruption: workloadsv1.Disruption{
-							MaxAllowedWindows:                int32(2),
-							MaxNonDisruptionDurationDays:     3,
-							EnforcedDisruptionTimeoutSeconds: 20,
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
-			defer func() {
-				_ = k8sClient.Delete(ctx, guardrail)
-			}()
-			By("creating a pod")
-			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "silly-goose-pod",
-					Namespace: "default",
-					Labels: map[string]string{ // Match the WC PodSelector
-						"duck-duck": "goose",
-					},
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "duckling",
-							Image: "nginx:latest",
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 			By("updating WorkloadClass with disruption window today")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+
 			today := time.Now().Weekday().String()
 			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
 				{Name: "Today", DaysOfWeek: []string{today}, TimeZone: "America/Los_Angeles", StartTime: "00:00", EndTime: "23:59"},
 			}
 			wc.Spec.PodSelector = &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"duck-duck": "goose",
-				},
+				MatchLabels: podLabels,
 			}
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
