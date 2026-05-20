@@ -47,25 +47,19 @@ type WorkloadClassGuardrailReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
 func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	g := &workloadsv1.WorkloadClassGuardrail{}
 	if err := r.Get(ctx, req.NamespacedName, g); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	validationCondition, err := r.validate(ctx, g)
-	if err != nil {
-		log.Error(err, "Failed to validate guardrail")
-		return ctrl.Result{}, err
-	}
+	validationCondition := r.validate(ctx, g)
 	meta.SetStatusCondition(&g.Status.Conditions, validationCondition)
-	err = r.Status().Update(ctx, g)
+	err := r.Status().Update(ctx, g)
 
 	return ctrl.Result{}, err
 }
 
-func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) (metav1.Condition, error) {
+func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) metav1.Condition {
 	log := logf.FromContext(ctx)
 	var violations []string
 	err := validateDisruptionDays(g.Spec.Constraints.Disruption.AllowedDisruptionDays)
@@ -74,7 +68,7 @@ func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *work
 		violations = append(violations, err.Error())
 	}
 
-	return condition(violations), nil
+	return condition(violations)
 }
 
 // SetupWithManager sets up the controller with the Manager.
