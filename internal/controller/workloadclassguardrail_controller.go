@@ -52,10 +52,6 @@ type WorkloadClassGuardrailReconciler struct {
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the WorkloadClassGuardrail object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
@@ -73,15 +69,15 @@ func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 	meta.SetStatusCondition(&g.Status.Conditions, validationCondition)
+	err = r.Status().Update(ctx, g)
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, err
 }
 
 func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) (metav1.Condition, error) {
 	log := logf.FromContext(ctx)
 	var violations []string
-	allowedDisruptionDays, err := validateDisruptionDays(g.Spec.Constraints.Disruption.AllowedDisruptionDays)
-	g.Spec.Constraints.Disruption.AllowedDisruptionDays = allowedDisruptionDays
+	err := validateDisruptionDays(g.Spec.Constraints.Disruption.AllowedDisruptionDays)
 	if err != nil {
 		log.Error(err, "validation of AllowedDisruptionDays failed")
 		violations = append(violations, err.Error())
@@ -98,23 +94,11 @@ func (r *WorkloadClassGuardrailReconciler) SetupWithManager(mgr ctrl.Manager) er
 		Complete(r)
 }
 
-func validateDisruptionDays(allowedDisruptionDays []string) ([]string, error) {
+func validateDisruptionDays(allowedDisruptionDays []string) error {
 	days := []string{Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday}
 	if !isSubset(allowedDisruptionDays, days) {
-		return allowedDisruptionDays, fmt.Errorf("allowedDisruptionDays contains invalid days, valid days are: %v, got %v", days, allowedDisruptionDays)
+		return fmt.Errorf("allowedDisruptionDays contains invalid days, valid days are: %v, got %v", days, allowedDisruptionDays)
 	}
 
-	return toUniqueSet(allowedDisruptionDays), nil
-}
-
-func toUniqueSet(list []string) []string {
-	uniqueSet := map[string]struct{}{}
-	for _, s := range list {
-		uniqueSet[s] = struct{}{}
-	}
-	result := []string{}
-	for k, _ := range uniqueSet {
-		result = append(result, k)
-	}
-	return result
+	return nil
 }
