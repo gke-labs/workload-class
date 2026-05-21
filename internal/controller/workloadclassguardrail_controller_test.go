@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -37,8 +38,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Name: resourceName, // Cluster-scoped, no namespace
 		}
 		workloadclassguardrail := &workloadsv1.WorkloadClassGuardrail{}
 
@@ -64,7 +64,6 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &workloadsv1.WorkloadClassGuardrail{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
@@ -72,7 +71,16 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 			By("Cleanup the specific resource instance WorkloadClassGuardrail")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
+
 		It("should successfully reconcile the resource", func() {
+			By("Updating the resource with valid days")
+			g := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, g)).To(Succeed())
+
+			validDays := []string{"Sunday", "Monday"}
+			g.Spec.Constraints.Disruption.AllowedDisruptionDays = validDays
+			Expect(k8sClient.Update(ctx, g)).To(Succeed())
+
 			By("Reconciling the created resource")
 			controllerReconciler := &WorkloadClassGuardrailReconciler{
 				Client: k8sClient,
@@ -83,8 +91,54 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("checking the status for validated")
+			updatedGuardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Eventually(func() bool {
+				Expect(k8sClient.Get(ctx, typeNamespacedName, updatedGuardrail)).To(Succeed())
+				for _, cond := range updatedGuardrail.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionTrue &&
+							cond.Reason == workloadsv1.ReasonValidationPassed
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should fail validation if it contains an invalid day in AllowedDisruptionDays", func() {
+			By("updating the resource with an invalid day")
+			g := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, g)).To(Succeed())
+
+			invalidDays := []string{"Christmas", "Eid", "Birthday"}
+			g.Spec.Constraints.Disruption.AllowedDisruptionDays = invalidDays
+			Expect(k8sClient.Update(ctx, g)).To(Succeed())
+
+			By("reconiling")
+			controllerReconciler := &WorkloadClassGuardrailReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("checking the status for violations")
+			updatedGuardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Eventually(func() bool {
+				Expect(k8sClient.Get(ctx, typeNamespacedName, updatedGuardrail)).To(Succeed())
+				for _, cond := range updatedGuardrail.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionFalse &&
+							cond.Reason == workloadsv1.ReasonValidationFailed &&
+							strings.Contains(cond.Message, "allowedDisruptionDays contains invalid days, valid days are")
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
 		})
 	})
 })
