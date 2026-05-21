@@ -38,8 +38,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "", // Cluster-scoped
+			Name: resourceName, // Cluster-scoped, no namespace
 		}
 		workloadclassguardrail := &workloadsv1.WorkloadClassGuardrail{}
 
