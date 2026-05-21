@@ -32,6 +32,7 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
+	"github.com/go-logr/logr"
 )
 
 // DisruptionWebhook handles Pod eviction requests.
@@ -58,45 +59,9 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 2. Find matching WorkloadClasses
-	wcs := &workloadsv1.WorkloadClassList{}
-	if err := v.Client.List(ctx, wcs); err != nil {
+	bestWC, err := v.bestMatchWorkloadClass(ctx, log, pod)
+	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	var bestWC *workloadsv1.WorkloadClass
-	maxSpecificity := -1
-
-	for _, wc := range wcs.Items {
-		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
-		if err != nil {
-			continue
-		}
-		if selector.Matches(labels.Set(pod.Labels)) {
-			spec := getSpecificity(wc.Spec.PodSelector)
-			if spec > maxSpecificity {
-				maxSpecificity = spec
-				bestWC = &wc
-			} else if spec == maxSpecificity {
-				// Stability: oldest takes precedence
-				if bestWC == nil || wc.CreationTimestamp.Before(&bestWC.CreationTimestamp) {
-					bestWC = &wc
-				}
-			}
-		}
-	}
-
-	if bestWC == nil {
-		// 2.1 Fallback to Namespace default
-		ns := &corev1.Namespace{}
-		if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
-			if defaultClass, ok := ns.Annotations["workloads.gke.io/default-class"]; ok {
-				wc := &workloadsv1.WorkloadClass{}
-				if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
-					bestWC = wc
-					log.Info("Using default WorkloadClass from namespace", "workloadClass", bestWC.Name, "namespace", pod.Namespace)
-				}
-			}
-		}
 	}
 
 	if bestWC == nil {
@@ -158,6 +123,69 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	return admission.Allowed("Eviction allowed by WorkloadClass policy")
+}
+
+func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, log logr.Logger, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := v.Client.List(ctx, wcs); err != nil {
+		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
+	}
+
+	// Keep track of all other matches to emit a warning message
+	var otherMatches []string
+	maxSpecificity := -1
+
+	for _, wc := range wcs.Items {
+		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+		if err != nil {
+			continue
+		}
+		if selector.Matches(labels.Set(pod.Labels)) {
+			updateBestMatch(wc, bestMatch, &maxSpecificity, otherMatches)
+		}
+	}
+
+	// 2.1 Fallback to Namespace default if bestMatch is nil
+	v.namespaceDefaultWorkloadClass(ctx, pod, bestMatch)
+
+	// Emit warning message for WorkloadClasses that matched, but are ignored
+	if len(otherMatches) != 0 {
+		log.Info("Multiple WorkloadClasses matched Pod %s, but were not the best match: %v", otherMatches)
+	}
+
+	return bestMatch, nil
+}
+
+func updateBestMatch(wc workloadsv1.WorkloadClass, bestMatch *workloadsv1.WorkloadClass, maxSpecificity *int, otherMatches []string) {
+	spec := getSpecificity(wc.Spec.PodSelector)
+	if spec > *maxSpecificity {
+		*maxSpecificity = spec
+		bestMatch = &wc
+	} else if spec == *maxSpecificity {
+		// Stability: oldest takes precedence
+		if bestMatch == nil {
+			bestMatch = &wc
+		} else if wc.CreationTimestamp.Before(&bestMatch.CreationTimestamp) {
+			// Keep track of all previous best matches.
+			otherMatches = append(otherMatches, fmt.Sprintf("%s/%s", bestMatch.Namespace, bestMatch.Name))
+			bestMatch = &wc
+		}
+	}
+}
+
+func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass) {
+	if bestMatch == nil {
+		const defaultClassAnnotation = "workloads.gke.io/default-class"
+		ns := &corev1.Namespace{}
+		if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
+			if defaultClass, ok := ns.Annotations[defaultClassAnnotation]; ok {
+				wc := &workloadsv1.WorkloadClass{}
+				if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
+					bestMatch = wc
+				}
+			}
+		}
+	}
 }
 
 func getSpecificity(sel *metav1.LabelSelector) int {
