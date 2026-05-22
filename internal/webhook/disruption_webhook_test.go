@@ -80,6 +80,7 @@ func TestGetSpecificity(t *testing.T) {
 }
 
 func TestUpdateBestMatch(t *testing.T) {
+	const namespace = "namespace"
 	latest := time.Now()
 	oldest := latest.AddDate(0, 0, -1)
 	wc1 := &workloadsv1.WorkloadClass{
@@ -92,7 +93,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 	}
 	wc1.Name = "wc1"
-	wc1.Namespace = "namespace"
+	wc1.Namespace = namespace
 	wc1.CreationTimestamp = metav1.Time{Time: latest}
 
 	wc2 := &workloadsv1.WorkloadClass{
@@ -106,7 +107,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 	}
 	wc2.Name = "wc2"
-	wc2.Namespace = "namespace"
+	wc2.Namespace = namespace
 	wc2.CreationTimestamp = metav1.Time{Time: latest}
 
 	wc22 := &workloadsv1.WorkloadClass{
@@ -120,7 +121,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 	}
 	wc22.Name = "wc22"
-	wc22.Namespace = "namespace"
+	wc22.Namespace = namespace
 	wc22.CreationTimestamp = metav1.Time{Time: oldest}
 
 	testCases := []struct {
@@ -203,10 +204,11 @@ func TestUpdateBestMatch(t *testing.T) {
 
 func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	const defaultClassAnnotation = "workloads.gke.io/default-class"
+	const namespace = "namespace"
 	wc := &workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "wc",
-			Namespace:         "namespace",
+			Namespace:         namespace,
 			CreationTimestamp: metav1.Time{Time: time.Now()},
 		},
 		Spec: workloadsv1.WorkloadClassSpec{
@@ -220,7 +222,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	nsDefault := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-default",
-			Namespace: "namespace",
+			Namespace: namespace,
 			Annotations: map[string]string{
 				defaultClassAnnotation: "wc",
 			},
@@ -229,14 +231,14 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	nsNoAnnotation := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-no-wc",
-			Namespace: "namespace",
+			Namespace: namespace,
 			Annotations: map[string]string{
 				"something-else": "true",
 			},
 		},
 	}
 	pod := &corev1.Pod{}
-	pod.Namespace = "namespace"
+	pod.Namespace = namespace
 
 	testCases := []struct {
 		name          string
@@ -293,10 +295,11 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 }
 
 func TestBestMatchWorkloadClass(t *testing.T) {
+	const namespace = "namespace"
 	wc := workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "wc",
-			Namespace:         "namespace",
+			Namespace:         namespace,
 			CreationTimestamp: metav1.Time{Time: time.Now()},
 		},
 		Spec: workloadsv1.WorkloadClassSpec{
@@ -310,14 +313,14 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 	nsNoAnnotation := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-no-wc",
-			Namespace: "namespace",
+			Namespace: namespace,
 			Annotations: map[string]string{
 				"something-else": "true",
 			},
 		},
 	}
 	pod := &corev1.Pod{}
-	pod.Namespace = "namespace"
+	pod.Namespace = namespace
 	pod.Labels = map[string]string{"labelA": "valueA"}
 
 	testCases := []struct {
@@ -350,7 +353,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 	ctx := t.Context()
 	req := admission.Request{}
 	req.Name = "name"
-	req.Namespace = "namespace"
+	req.Namespace = namespace
 	req.UserInfo.Username = "test-user"
 
 	for _, tc := range testCases {
