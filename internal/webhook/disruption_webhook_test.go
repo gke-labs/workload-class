@@ -26,7 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 func TestGetSpecificity(t *testing.T) {
@@ -83,11 +83,6 @@ func TestUpdateBestMatch(t *testing.T) {
 	latest := time.Now()
 	oldest := latest.AddDate(0, 0, -1)
 	wc1 := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "wc1",
-			Namespace:         "namespace",
-			CreationTimestamp: metav1.Time{Time: latest},
-		},
 		Spec: workloadsv1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -96,12 +91,11 @@ func TestUpdateBestMatch(t *testing.T) {
 			},
 		},
 	}
+	wc1.Name = "wc1"
+	wc1.Namespace = "namespace"
+	wc1.CreationTimestamp = metav1.Time{Time: latest}
+
 	wc2 := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "wc2",
-			Namespace:         "namespace",
-			CreationTimestamp: metav1.Time{Time: latest},
-		},
 		Spec: workloadsv1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -111,12 +105,11 @@ func TestUpdateBestMatch(t *testing.T) {
 			},
 		},
 	}
+	wc2.Name = "wc2"
+	wc2.Namespace = "namespace"
+	wc2.CreationTimestamp = metav1.Time{Time: latest}
+
 	wc22 := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "wc22",
-			Namespace:         "namespace",
-			CreationTimestamp: metav1.Time{Time: oldest},
-		},
 		Spec: workloadsv1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -126,6 +119,9 @@ func TestUpdateBestMatch(t *testing.T) {
 			},
 		},
 	}
+	wc22.Name = "wc22"
+	wc22.Namespace = "namespace"
+	wc22.CreationTimestamp = metav1.Time{Time: oldest}
 
 	testCases := []struct {
 		name         string
@@ -192,7 +188,7 @@ func TestUpdateBestMatch(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			gotBM, gotOtherMatches := updateBestMatch(tc.wc, tc.bm, &tc.maxSpec, tc.otherMatches)
-			if gotBM.ObjectMeta.Name != tc.wantBM.ObjectMeta.Name {
+			if gotBM.Name != tc.wantBM.Name {
 				t.Errorf("updateBestMatch() did not update the bestMatch as expected, got: %v, want: %v", tc.bm, tc.wantBM)
 			}
 			if tc.maxSpec != tc.wantMaxSpec {
@@ -297,7 +293,6 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 }
 
 func TestBestMatchWorkloadClass(t *testing.T) {
-	const defaultClassAnnotation = "workloads.gke.io/default-class"
 	wc := workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "wc",
@@ -353,14 +348,18 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 	}
 
 	ctx := t.Context()
+	req := admission.Request{}
+	req.Name = "name"
+	req.Namespace = "namespace"
+	req.UserInfo.Username = "test-user"
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			log := logf.FromContext(ctx).WithValues("name", "Name", "namespace", "namespace", "user", "test-user")
 			client := createClient(tc.getNSError, tc.getWCError, tc.listWCError, tc.getNSResult, &wc, tc.listWCResult)
 			v := &DisruptionWebhook{
 				Client: client,
 			}
-			gotBestMatch, err := v.bestMatchWorkloadClass(ctx, log, pod)
+			gotBestMatch, err := v.bestMatchWorkloadClass(ctx, req, pod)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("bestMatchWorkloadClass returned unexpected error, got: %v, wantErr: %v", err, tc.wantErr)
 			}

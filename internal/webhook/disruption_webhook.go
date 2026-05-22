@@ -32,7 +32,6 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
-	"github.com/go-logr/logr"
 )
 
 // DisruptionWebhook handles Pod eviction requests.
@@ -59,9 +58,10 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 2. Find matching WorkloadClasses
-	bestWC, err := v.bestMatchWorkloadClass(ctx, log, pod)
+	bestWC, err := v.bestMatchWorkloadClass(ctx, req, pod)
 	if err != nil {
-		return admission.Errored(http.StatusInternalServerError, err)
+		log.Error(err, "failed to get WorkloadClass for Pod", "pod", pod)
+		return admission.Allowed("Failed to get WorkloadClass matches this pod or namespace")
 	}
 
 	if bestWC == nil {
@@ -125,7 +125,16 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	return admission.Allowed("Eviction allowed by WorkloadClass policy")
 }
 
-func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, log logr.Logger, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+// bestMatchWorkloadClass finds the most suitable WorkloadClass for a given Pod.
+//
+// Selection preference is given to the WorkloadClass in the Pod's namespace
+// that has the highest number of matching labels and expressions against the Pod.
+//
+// If no WorkloadClass matches based on labels or expressions, this function
+// returns the default WorkloadClass for the Pod's namespace, if one is defined.
+// If no specific or default WorkloadClass is found, it returns nil.
+func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+	log := logf.FromContext(ctx).WithValues("name", req.Name, "namespace", req.Namespace, "user", req.UserInfo.Username)
 	wcs := &workloadsv1.WorkloadClassList{}
 	if err := v.Client.List(ctx, wcs); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
@@ -150,7 +159,7 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, log logr
 
 	// Emit warning message for WorkloadClasses that matched, but are ignored
 	if len(otherMatches) != 0 {
-		log.Info("Multiple WorkloadClasses matched Pod %s, but were not the best match: %v", otherMatches)
+		log.Info(fmt.Sprintf("Multiple WorkloadClasses matched Pod %s/%s, but were not the best match: %v", pod.Namespace, pod.Name, otherMatches))
 	}
 
 	return bestMatch, nil
