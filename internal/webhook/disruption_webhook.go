@@ -141,51 +141,35 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, log logr
 			continue
 		}
 		if selector.Matches(labels.Set(pod.Labels)) {
-			updateBestMatch(wc, bestMatch, &maxSpecificity, otherMatches)
+			bestMatch, otherMatches = updateBestMatch(&wc, bestMatch, &maxSpecificity, otherMatches)
 		}
 	}
 
 	// 2.1 Fallback to Namespace default if bestMatch is nil
-	v.namespaceDefaultWorkloadClass(ctx, pod, bestMatch)
+	bestMatch = v.namespaceDefaultWorkloadClass(ctx, pod, bestMatch)
 
 	// Emit warning message for WorkloadClasses that matched, but are ignored
 	if len(otherMatches) != 0 {
 		log.Info("Multiple WorkloadClasses matched Pod %s, but were not the best match: %v", otherMatches)
 	}
+	log.Info("bestMatch: %v", bestMatch)
 
 	return bestMatch, nil
 }
 
-func updateBestMatch(wc workloadsv1.WorkloadClass, bestMatch *workloadsv1.WorkloadClass, maxSpecificity *int, otherMatches []string) {
+func updateBestMatch(wc, bestMatch *workloadsv1.WorkloadClass, maxSpecificity *int, otherMatches []string) (*workloadsv1.WorkloadClass, []string) {
 	spec := getSpecificity(wc.Spec.PodSelector)
-	if spec > *maxSpecificity {
+	equalSpecOlderWC := spec == *maxSpecificity && wc.CreationTimestamp.Before(&bestMatch.CreationTimestamp)
+	if spec > *maxSpecificity || equalSpecOlderWC {
 		*maxSpecificity = spec
-		bestMatch = &wc
-	} else if spec == *maxSpecificity {
-		// Stability: oldest takes precedence
-		if bestMatch == nil {
-			bestMatch = &wc
-		} else if wc.CreationTimestamp.Before(&bestMatch.CreationTimestamp) {
-			// Keep track of all previous best matches.
+		if bestMatch != nil {
 			otherMatches = append(otherMatches, fmt.Sprintf("%s/%s", bestMatch.Namespace, bestMatch.Name))
-			bestMatch = &wc
 		}
+		return wc, otherMatches
 	}
-}
-
-func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass) {
-	if bestMatch == nil {
-		const defaultClassAnnotation = "workloads.gke.io/default-class"
-		ns := &corev1.Namespace{}
-		if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
-			if defaultClass, ok := ns.Annotations[defaultClassAnnotation]; ok {
-				wc := &workloadsv1.WorkloadClass{}
-				if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
-					bestMatch = wc
-				}
-			}
-		}
-	}
+	// This WC still matched the Pod, track it for logging
+	otherMatches = append(otherMatches, fmt.Sprintf("%s/%s", wc.Namespace, wc.Name))
+	return bestMatch, otherMatches
 }
 
 func getSpecificity(sel *metav1.LabelSelector) int {
@@ -193,6 +177,22 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 		return 0
 	}
 	return len(sel.MatchLabels) + len(sel.MatchExpressions)
+}
+
+func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
+	if bestMatch == nil {
+		const defaultClassAnnotation = "workloads.gke.io/default-class"
+		ns := &corev1.Namespace{}
+		if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
+			if defaultClass, ok := ns.Annotations[defaultClassAnnotation]; ok {
+				wc := &workloadsv1.WorkloadClass{}
+				if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
+					return wc
+				}
+			}
+		}
+	}
+	return bestMatch
 }
 
 func matchesIdentity(username string, allowed string) bool {
