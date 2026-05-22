@@ -152,7 +152,6 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, log logr
 	if len(otherMatches) != 0 {
 		log.Info("Multiple WorkloadClasses matched Pod %s, but were not the best match: %v", otherMatches)
 	}
-	log.Info("bestMatch: %v", bestMatch)
 
 	return bestMatch, nil
 }
