@@ -25,6 +25,7 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	admissionv1 "k8s.io/api/admission/v1"
+	v1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -494,15 +495,19 @@ func TestHandle(t *testing.T) {
 		Name:        "VPA",
 		Namespace:   namespace,
 		SubResource: eviction,
+		UserInfo: v1.UserInfo{
+			Username: "vpa-recommender",
+		},
 	}
-	evictionRequest.UserInfo.Username = "vpa-recommender"
 
 	evictionRequestNonMatchingUser := admissionv1.AdmissionRequest{
 		Name:        "something-else",
 		Namespace:   namespace,
 		SubResource: eviction,
+		UserInfo: v1.UserInfo{
+			Username: "something-else",
+		},
 	}
-	evictionRequest.UserInfo.Username = "something-else"
 
 	testCases := []struct {
 		name               string
@@ -647,12 +652,7 @@ func TestHandle(t *testing.T) {
 				Client: client,
 			}
 
-			request := admission.Request{}
-			request.Name = tc.req.Name
-			request.Namespace = tc.req.Namespace
-			request.UserInfo.Username = tc.req.UserInfo.Username
-			request.SubResource = tc.req.SubResource
-
+			request := admission.Request{AdmissionRequest: tc.req}
 			admissionResponse := v.Handle(ctx, request)
 
 			if admissionResponse.Allowed != tc.want.Allowed {
