@@ -93,6 +93,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
+	log := logf.FromContext(ctx)
 	now := time.Now().UTC()
 
 	// 1. Emergency Override
@@ -101,12 +102,9 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	// 2. Check Overdue (Maximum Protected Duration)
-	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
-		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
-		diff := now.Sub(wc.Status.LastDisruptionTime.Time)
-		if diff > maxDuration {
-			return workloadsv1.ReadinessOverdue, 0, nil
-		}
+	if overdue(wc, now) {
+		log.Info(fmt.Sprintf("Time since last disruption for WorkloadClass %s/%s exceeds MaxNonDisruptionDurationDays. WorkloadClass is overdue for maintenance", wc.Namespace, wc.Name))
+		return workloadsv1.ReadinessOverdue, 0, nil
 	}
 
 	// 3. Check Temporal Windows
@@ -136,6 +134,15 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	return workloadsv1.ReadinessReady, nextWindow, nil
+}
+
+func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
+	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
+		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
+		diff := now.Sub(wc.Status.LastDisruptionTime.Time)
+		return diff > maxDuration
+	}
+	return false
 }
 
 func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context, wc *workloadsv1.WorkloadClass) (metav1.Condition, error) {

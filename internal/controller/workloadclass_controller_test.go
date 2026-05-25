@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"strings"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -486,3 +487,73 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 	})
 })
+
+func TestOverdue(t *testing.T) {
+	wc := &workloadsv1.WorkloadClass{
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{},
+		},
+		Status: workloadsv1.WorkloadClassStatus{},
+	}
+	testCases := []struct {
+		name                     string
+		desc                     string
+		wc                       *workloadsv1.WorkloadClass
+		setLastDisruption        bool
+		setMNDDD                 bool
+		maxNonDisruptionDuration int
+		lastDisruption           time.Time
+		want                     bool
+	}{
+		{
+			name: "wc_nil",
+			desc: "WorkloadClass is nil, want false",
+			want: false,
+		},
+		{
+			name:              "fields_not_set",
+			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want false",
+			setLastDisruption: false,
+			setMNDDD:          false,
+			want:              false,
+		},
+		{
+			name:                     "diff_greater_than_max_duration",
+			desc:                     "Overdue",
+			setLastDisruption:        true,
+			setMNDDD:                 true,
+			maxNonDisruptionDuration: 10,
+			lastDisruption:           time.Now().AddDate(0, -1, 0),
+			want:                     true,
+		},
+		{
+			name:                     "diff_less_than_max_duration",
+			desc:                     "Not overdue",
+			setLastDisruption:        true,
+			setMNDDD:                 true,
+			maxNonDisruptionDuration: 10,
+			lastDisruption:           time.Now().AddDate(0, 0, -5),
+			want:                     false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			if tc.setLastDisruption {
+				wc.Status.LastDisruptionTime = &metav1.Time{Time: tc.lastDisruption}
+			}
+			if tc.setMNDDD {
+				wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = int32(tc.maxNonDisruptionDuration)
+			}
+			defer func() {
+				wc.Status.LastDisruptionTime = nil
+				wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 0
+			}()
+
+			if got := overdue(wc, now); got != tc.want {
+				t.Errorf("overdue() returned an unexpected result, got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
