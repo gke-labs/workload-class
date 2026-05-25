@@ -19,10 +19,12 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,16 +34,19 @@ import (
 func TestGetSpecificity(t *testing.T) {
 	testCases := []struct {
 		name             string
+		desc             string
 		matchLabels      map[string]string
 		matchExpressions []metav1.LabelSelectorRequirement
 		want             int
 	}{
 		{
 			name: "nil_selector",
+			desc: "LabelSelector is nil, return 0",
 			want: 0,
 		},
 		{
 			name: "nil_match_labels_not_nil_match_expressions",
+			desc: "LabelSelector only has MatchExpressions, return length of MatchExpressions",
 			matchExpressions: []metav1.LabelSelectorRequirement{
 				{Key: "k1", Operator: "op1", Values: []string{"v1"}},
 				{Key: "k2", Operator: "op2", Values: []string{"v2"}},
@@ -50,11 +55,13 @@ func TestGetSpecificity(t *testing.T) {
 		},
 		{
 			name:        "match_labels_nil_match_expressions",
+			desc:        "LabelSelector only has MatchLabels, return length of MatchLabels",
 			matchLabels: map[string]string{"k1": "v1", "k2": "v2"},
 			want:        2,
 		},
 		{
 			name:        "both_not_nil",
+			desc:        "LabelSelector has both MatchLabels and MatchSelectors, returned combined length of both",
 			matchLabels: map[string]string{"k1": "v1", "k2": "v2"},
 			matchExpressions: []metav1.LabelSelectorRequirement{
 				{Key: "k1", Operator: "op1", Values: []string{"v1"}},
@@ -126,6 +133,7 @@ func TestUpdateBestMatch(t *testing.T) {
 
 	testCases := []struct {
 		name         string
+		desc         string
 		wc           *workloadsv1.WorkloadClass
 		bm           *workloadsv1.WorkloadClass
 		maxSpec      int
@@ -136,7 +144,8 @@ func TestUpdateBestMatch(t *testing.T) {
 		wantOtherMatches []string
 	}{
 		{
-			name:             "nil_best_match,_-1_specificity_update_to_new_best_match",
+			name:             "nil_best_match_update_to_new_best_match",
+			desc:             "No WC has been selected yet, update the best match",
 			wc:               wc1,
 			otherMatches:     []string{},
 			maxSpec:          -1,
@@ -146,6 +155,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_>_N_update_to_new_best_match",
+			desc:             "A match has already been selected, the current WC being processed has a higher specificity, update best match",
 			wc:               wc2,
 			bm:               wc1,
 			otherMatches:     []string{},
@@ -156,6 +166,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_==_N_wc_is_older_update_to_new_best_match",
+			desc:             "A match has already been selected, the current WC being processed has the same specificity but is older, update best match",
 			wc:               wc22,
 			bm:               wc2,
 			otherMatches:     []string{},
@@ -166,6 +177,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_==_N_wc_is_not_older_no_update",
+			desc:             "A match has already been selected, the current WC being processed has the same specificity but is newer, no update to best match",
 			wc:               wc22,
 			bm:               wc2,
 			otherMatches:     []string{},
@@ -176,6 +188,7 @@ func TestUpdateBestMatch(t *testing.T) {
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_<_N_no_update",
+			desc:             "A match has already been selected, the current WC being processed has a lower specificity, no update to best match",
 			wc:               wc1,
 			bm:               wc2,
 			otherMatches:     []string{},
@@ -242,6 +255,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 
 	testCases := []struct {
 		name          string
+		desc          string
 		bestMatch     *workloadsv1.WorkloadClass
 		getNSError    error
 		getNSResult   *corev1.Namespace
@@ -250,24 +264,29 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	}{
 		{
 			name:          "best_match_not_nil",
+			desc:          "Best match WC is not nil, do not set to namespace default",
 			bestMatch:     wc,
 			wantBestMatch: wc,
 		},
 		{
 			name:       "error_getting_namespace",
+			desc:       "Error getting namespace, expect nil best match",
 			getNSError: fmt.Errorf("error getting Namespace"),
 		},
 		{
 			name:        "no_default_class_with_namespace",
+			desc:        "Namespace does not have a default WC, expect nil best match",
 			getNSResult: nsNoAnnotation,
 		},
 		{
 			name:        "error_getting_wc",
+			desc:        "Namespace has a default WC, but error getting WC, expect nil best match",
 			getNSResult: nsDefault,
 			getWCError:  fmt.Errorf("error getting WorkloadClass"),
 		},
 		{
 			name:          "success_getting_namespace_default",
+			desc:          "Namespace has WC, success getting WC, expect updated best match",
 			getNSResult:   nsDefault,
 			wantBestMatch: wc,
 		},
@@ -276,7 +295,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := createClient(tc.getNSError, tc.getWCError, nil, tc.getNSResult, wc, nil)
+			client := createClient(tc.getNSError, tc.getWCError, nil, nil, tc.getNSResult, wc, nil, nil)
 			v := &DisruptionWebhook{
 				Client: client,
 			}
@@ -325,6 +344,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 
 	testCases := []struct {
 		name          string
+		desc          string
 		listWCError   error
 		listWCResult  *workloadsv1.WorkloadClassList
 		getNSError    error
@@ -335,12 +355,14 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 	}{
 		{
 			name:         "error_listing_wcs",
+			desc:         "Error listing WorkloadClasses, expect nil result and error",
 			listWCError:  fmt.Errorf("error listing WorkloadClasses"),
 			listWCResult: &workloadsv1.WorkloadClassList{},
 			wantErr:      true,
 		},
 		{
 			name: "success",
+			desc: "Success getting best match",
 			listWCResult: &workloadsv1.WorkloadClassList{
 				Items: []workloadsv1.WorkloadClass{wc},
 			},
@@ -358,7 +380,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := createClient(tc.getNSError, tc.getWCError, tc.listWCError, tc.getNSResult, &wc, tc.listWCResult)
+			client := createClient(tc.getNSError, tc.getWCError, tc.listWCError, nil, tc.getNSResult, &wc, tc.listWCResult, nil)
 			v := &DisruptionWebhook{
 				Client: client,
 			}
@@ -379,6 +401,270 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 				t.Errorf("bestMatchWorkloadClass() returned a different WorkloadClass than expected, got: %v, want: %v", gotBestMatch, tc.wantBestMatch)
 			}
 
+		})
+	}
+}
+
+func TestHandle(t *testing.T) {
+	const (
+		namespace = "namespace"
+		eviction  = "eviction"
+	)
+	var (
+		inWindowDay          = time.Now().Weekday().String()
+		outOfWindowDay       = time.Now().AddDate(0, 0, 1).Weekday().String()
+		podNowCreationTime   = time.Now()
+		recentLastDisruption = time.Now().AddDate(0, 0, -5)
+		labels               = map[string]string{"labelA": "valueA"}
+	)
+
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "maintenance", DaysOfWeek: []string{inWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "America/Toronto"},
+				},
+				MinInitialRunDurationDays:         2,
+				MaxNonDisruptionDurationDays:      30,
+				AllowedDisruptionsOutsideOfWindow: []string{"VPA"},
+			},
+		},
+	}
+	wcOutOfWindow := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-out-of-window",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "maintenance", DaysOfWeek: []string{outOfWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "America/Toronto"},
+				},
+			},
+		},
+	}
+	wcValFailed := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+		},
+		Status: workloadsv1.WorkloadClassStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   workloadsv1.ConditionTypeValidated,
+					Status: metav1.ConditionFalse,
+				},
+			},
+		},
+	}
+
+	nsNoAnnotation := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "namespace-no-wc",
+			Namespace: namespace,
+			Annotations: map[string]string{
+				"something-else": "true",
+			},
+		},
+	}
+
+	pod := &corev1.Pod{}
+	pod.Namespace = namespace
+	pod.Labels = labels
+
+	evictionRequest := admissionv1.AdmissionRequest{
+		Name:        "VPA",
+		Namespace:   namespace,
+		SubResource: eviction,
+	}
+	evictionRequest.UserInfo.Username = "vpa-recommender"
+
+	evictionRequestNonMatchingUser := admissionv1.AdmissionRequest{
+		Name:        "something-else",
+		Namespace:   namespace,
+		SubResource: eviction,
+	}
+	evictionRequest.UserInfo.Username = "something-else"
+
+	testCases := []struct {
+		name               string
+		desc               string
+		req                admissionv1.AdmissionRequest
+		getPodErr          error
+		listWCErr          error
+		listWCResp         *workloadsv1.WorkloadClassList
+		getWCErr           error
+		getWCResp          *workloadsv1.WorkloadClass
+		guardrailValFails  bool
+		emergencyOverride  bool
+		inWindow           bool
+		overdue            bool
+		podCreationTime    time.Time
+		lastDisruptionTime time.Time
+		want               admission.Response
+	}{
+		{
+			name:               "errorGettingPod",
+			desc:               "Error getting pod, admission Errored",
+			req:                evictionRequest,
+			getPodErr:          fmt.Errorf("error getting Pod"),
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: recentLastDisruption,
+			want:               admission.Errored(http.StatusInternalServerError, fmt.Errorf("error getting Pod")),
+		},
+		{
+			name: "notAnEviction",
+			desc: "Not an eviction, admission Allowed",
+			req: admissionv1.AdmissionRequest{
+				Name:        "VPA",
+				Namespace:   namespace,
+				SubResource: "not-an-eviction",
+			},
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: recentLastDisruption,
+			want:               admission.Allowed("Not an eviction"),
+		},
+		{
+			name:               "errorGettingBestMatchWC",
+			desc:               "Error getting best match WC, admission Allowed",
+			req:                evictionRequest,
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: recentLastDisruption,
+			listWCErr:          fmt.Errorf("error listing WorkloadClasses"),
+			want:               admission.Allowed("Failed to get WorkloadClass matches this pod or namespace"),
+		},
+		{
+			name:               "bestMatchWCIsNil",
+			desc:               "Best match WC is nil, admission Allowed",
+			req:                evictionRequest,
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: recentLastDisruption,
+			want:               admission.Allowed("No WorkloadClass matches this pod or namespace"),
+		},
+		{
+			name:               "guardrailValidationFailed",
+			desc:               "Guardrail validation failed, admission Allowed",
+			req:                evictionRequest,
+			podCreationTime:    podNowCreationTime,
+			getWCResp:          wcValFailed,
+			lastDisruptionTime: recentLastDisruption,
+			want:               admission.Allowed("WorkloadClass failed Guardrail validation"),
+		},
+		{
+			name:               "emergencyOverride",
+			desc:               "Emergency override, admission Allowed",
+			req:                evictionRequest,
+			podCreationTime:    podNowCreationTime,
+			getWCResp:          wc,
+			lastDisruptionTime: recentLastDisruption,
+			emergencyOverride:  true,
+			want:               admission.Allowed("Emergency override active"),
+		},
+		{
+			name:               "allowedUser",
+			desc:               "Allowed user, admission Allowed",
+			req:                evictionRequest,
+			getWCResp:          wc,
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: recentLastDisruption,
+			want:               admission.Allowed("Disruption allowed for authorized user: VPA"),
+		},
+		{
+			name:               "overdue",
+			desc:               "Overdue, admission Allowed",
+			req:                evictionRequestNonMatchingUser,
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: time.Now().AddDate(-1, 0, 0),
+			getWCResp:          wc,
+			want:               admission.Allowed("Workload class is overdue for maintenance, bypassing constraints"),
+		},
+		{
+			name:               "notInWindowNotOverdue",
+			desc:               "Not in window, not overdue, admission Denied",
+			req:                evictionRequestNonMatchingUser,
+			podCreationTime:    podNowCreationTime,
+			getWCResp:          wcOutOfWindow,
+			lastDisruptionTime: recentLastDisruption,
+			want:               admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcOutOfWindow.Name)),
+		},
+		{
+			name:               "podIsTooNew",
+			desc:               "Pod is too new, admission Denied",
+			req:                evictionRequestNonMatchingUser,
+			getWCResp:          wc,
+			podCreationTime:    podNowCreationTime,
+			lastDisruptionTime: recentLastDisruption,
+			want: admission.Denied(fmt.Sprintf("Eviction blocked: pod is too new (running for %v, required %d days)",
+				time.Since(podNowCreationTime).Round(time.Minute), wc.Spec.DisruptionPolicy.MinInitialRunDurationDays)),
+		},
+		{
+			name:               "inWindowNotOverduePodNotTooNew",
+			desc:               "In window, not overdue, Pod not too new, admission Allowed",
+			req:                evictionRequestNonMatchingUser,
+			lastDisruptionTime: recentLastDisruption,
+			podCreationTime:    time.Now().AddDate(0, 0, -4),
+			want:               admission.Allowed("Eviction allowed by WorkloadClass policy"),
+		},
+	}
+
+	ctx := t.Context()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod.CreationTimestamp = metav1.Time{Time: tc.podCreationTime}
+
+			if tc.getWCResp != nil {
+				tc.getWCResp.Status = workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: tc.lastDisruptionTime},
+				}
+				tc.getWCResp.Spec.DisruptionPolicy.EmergencyOverride = tc.emergencyOverride
+			}
+
+			listResp := &workloadsv1.WorkloadClassList{}
+			if tc.getWCResp != nil {
+				listResp.Items = []workloadsv1.WorkloadClass{*tc.getWCResp}
+			}
+
+			client := createClient(nil, tc.getWCErr, tc.listWCErr, tc.getPodErr, nsNoAnnotation, tc.getWCResp, listResp, pod)
+			v := &DisruptionWebhook{
+				Client: client,
+			}
+
+			request := admission.Request{}
+			request.Name = tc.req.Name
+			request.Namespace = tc.req.Namespace
+			request.UserInfo.Username = tc.req.UserInfo.Username
+			request.SubResource = tc.req.SubResource
+
+			admissionResponse := v.Handle(ctx, request)
+
+			if admissionResponse.Allowed != tc.want.Allowed {
+				t.Errorf("Handle() returned an unexpected response: got %v, want %v", admissionResponse, tc.want)
+			}
+			// Allowed admissions have no message
+			if admissionResponse.Allowed {
+				return
+			}
+			if admissionResponse.Result.Message != tc.want.Result.Message {
+				t.Errorf("Handle() returned an unexpected message: got %v, want %v", admissionResponse.Result.Message, tc.want.Result.Message)
+			}
 		})
 	}
 }
@@ -406,8 +692,11 @@ func stringSlicesEqualUnordered(s1, s2 []string) bool {
 
 type fakeClient struct {
 	client.Client
-	listError  error
-	listResult *workloadsv1.WorkloadClassList
+	getPodError  error
+	getPodResult *corev1.Pod
+
+	listWCError  error
+	listWCResult *workloadsv1.WorkloadClassList
 
 	getNamespaceError  error
 	getNamespaceResult *corev1.Namespace
@@ -416,20 +705,22 @@ type fakeClient struct {
 	getWorkloadClassResult *workloadsv1.WorkloadClass
 }
 
-func createClient(getNSErr, getWCErr, listErr error, getNSResult *corev1.Namespace, getWCResult *workloadsv1.WorkloadClass, listWCResult *workloadsv1.WorkloadClassList) fakeClient {
+func createClient(getNSErr, getWCErr, listWCErr, getPodErr error, getNSResult *corev1.Namespace, getWCResult *workloadsv1.WorkloadClass, listWCResult *workloadsv1.WorkloadClassList, getPodResult *corev1.Pod) fakeClient {
 	return fakeClient{
 		getNamespaceError:      getNSErr,
 		getNamespaceResult:     getNSResult,
 		getWorkloadClassError:  getWCErr,
+		getPodError:            getPodErr,
 		getWorkloadClassResult: getWCResult,
-		listError:              listErr,
-		listResult:             listWCResult,
+		listWCError:            listWCErr,
+		listWCResult:           listWCResult,
+		getPodResult:           getPodResult,
 	}
 }
 
 func (fc fakeClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	fc.listResult.DeepCopyInto(list.(*workloadsv1.WorkloadClassList))
-	return fc.listError
+	fc.listWCResult.DeepCopyInto(list.(*workloadsv1.WorkloadClassList))
+	return fc.listWCError
 }
 
 func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -439,14 +730,19 @@ func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 			return fc.getNamespaceError
 		}
 		fc.getNamespaceResult.DeepCopyInto(typedObj)
-		return nil
 	case *workloadsv1.WorkloadClass:
 		if fc.getWorkloadClassError != nil {
 			return fc.getWorkloadClassError
 		}
 		fc.getWorkloadClassResult.DeepCopyInto(typedObj)
-		return nil
+	case *corev1.Pod:
+		if fc.getPodError != nil {
+			return fc.getPodError
+		}
+		fc.getPodResult.DeepCopyInto(typedObj)
 	default:
 		return fmt.Errorf("unknown object type")
 	}
+
+	return nil
 }

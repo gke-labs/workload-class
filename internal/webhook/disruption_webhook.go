@@ -129,6 +129,8 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 //
 // Selection preference is given to the WorkloadClass in the Pod's namespace
 // that has the highest number of matching labels and expressions against the Pod.
+// If two or more WorkloadClasses match in specificity to the Pod, the oldest
+// WorkloadClass takes precedence.
 //
 // If no WorkloadClass matches based on labels or expressions, this function
 // returns the default WorkloadClass for the Pod's namespace, if one is defined.
