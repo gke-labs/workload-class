@@ -1,20 +1,22 @@
-  apiVersion: workloads.gke.io/v1
-  kind: WorkloadClass
-  metadata:
-    name: production-batch
-  spec:
-    # Match pods with this label
-    podSelector:
-      matchLabels:
-        workload-class: production-batch
-    # Define a specific window (Update HH:MM based on your current UTC time for testing)
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: critical-workload
+  namespace: demo
+spec:
+  podSelector:
+    matchLabels:
+      workload-class: production-batch
+  disruptionPolicy:
     allowedDisruptionWindows:
-      - dayOfWeek: Tuesday # Change to current day for "In Window" test
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Sunday
+          - Saturday
         startTime: "00:00"
-        endTime: "01:00"
-    minInitialRunDurationDays: 0 # Set to 0 for immediate testing
+        endTime: "23:59"
+        timeZone: "America/Toronto"
+    maxNonDisruptionDurationDays: 1
     allowedDisruptionsOutsideOfWindow:
       - VPA
-
-  
-  
+      - ClusterAutoscaler

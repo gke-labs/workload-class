@@ -3,9 +3,10 @@
   metadata:
     name: standard-limits
   spec:
-    maxWindowDurationMinutes: 120
-    maxWindowsPerWeek: 7
-    minInitialRunDurationDaysLimit: 5
-    maxNonDisruptionDurationDaysLimit: 30
-  
-  
+    constraints:
+      disruption:
+        allowedDisruptionDays:
+          - Saturday
+          - Sunday
+        maxAllowedWindows: 5
+        maxNonDisruptionDurationDays: 30
