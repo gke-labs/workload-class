@@ -111,7 +111,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		return workloadsv1.ReadinessNotReady, nextWindow, nil
 	}
 
-	// 4. Check Pod Ages (Min Initial Run)
+	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDuration)
 	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
 		pods := &corev1.PodList{}
 		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
@@ -123,11 +123,20 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		}
 
 		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
+		gracePeriodsPassed := true
+		maxTimeForGracePeriod := 0 * time.Second
 		for _, pod := range pods.Items {
 			if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
 				// Pod hasn't run long enough
 				return workloadsv1.ReadinessNotReady, minRunDuration - now.Sub(pod.CreationTimestamp.Time), nil
 			}
+			// Check the grace period has passed for this pod. We want all grace periods to have passed.
+			gracePeriodsPassed, maxTimeForGracePeriod = updateGraceValues(wc, &pod, now, gracePeriodsPassed, maxTimeForGracePeriod)
+		}
+
+		if !gracePeriodsPassed {
+			// Grace periods have not passed
+			return workloadsv1.ReadinessNotReady, maxTimeForGracePeriod, nil
 		}
 	}
 
@@ -143,6 +152,34 @@ func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 		return now.Sub(wc.CreationTimestamp.Time) > maxDuration
 	}
 	return true
+}
+
+func updateGraceValues(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {
+	gracePeriodPassedForPod, timeUntilGracePeriodPassed := gracePeriodPassed(wc, pod, now)
+
+	gracePeriodsPassed = gracePeriodsPassed && gracePeriodPassedForPod
+	maxDurationForGracePeriod := max(maxDuration, timeUntilGracePeriodPassed)
+
+	return gracePeriodsPassed, maxDurationForGracePeriod
+}
+
+func gracePeriodPassed(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time) (bool, time.Duration) {
+	gracePeriod := wc.Spec.DisruptionPolicy.GraceTerminationDuration
+
+	// Check if Pod's deletion timestamp is set
+	if pod.DeletionTimestamp == nil {
+		return false, time.Duration(gracePeriod) * time.Second
+	}
+
+	// Check if the WorkloadClass as a GraceTerminationDuration set
+	if gracePeriod == 0 {
+		return true, time.Duration(gracePeriod) * time.Second
+	}
+
+	// Check if the grace period has passed
+	// GraceTerminationDuration - time passed since deletion timestamp
+	diff := (time.Duration(gracePeriod) * time.Second) - now.Sub(pod.DeletionTimestamp.Time)
+	return diff <= 0, diff
 }
 
 func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context, wc *workloadsv1.WorkloadClass) (metav1.Condition, error) {
