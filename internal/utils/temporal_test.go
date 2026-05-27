@@ -82,31 +82,3 @@ func TestIsTimeInWindows(t *testing.T) {
 		})
 	}
 }
-
-func TestCalculateWindowDuration(t *testing.T) {
-	tests := []struct {
-		name    string
-		window  workloadsv1.DisruptionWindow
-		wantDur time.Duration
-	}{
-		{
-			name:    "Standard window",
-			window:  workloadsv1.DisruptionWindow{StartTime: "10:00", EndTime: "12:00"},
-			wantDur: 2 * time.Hour,
-		},
-		{
-			name:    "Wraparound window",
-			window:  workloadsv1.DisruptionWindow{StartTime: "22:00", EndTime: "04:00"},
-			wantDur: 6 * time.Hour,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := CalculateWindowDuration(tt.window)
-			if got != tt.wantDur {
-				t.Errorf("CalculateWindowDuration() = %v, want %v", got, tt.wantDur)
-			}
-		})
-	}
-}

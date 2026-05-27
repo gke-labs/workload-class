@@ -57,28 +57,16 @@ func IsTimeInWindows(ctx context.Context, nowUTC time.Time, windows []workloadsv
 	return inWindow, minWait
 }
 
-// CalculateWindowDuration calculates the duration of a window.
-func CalculateWindowDuration(w workloadsv1.DisruptionWindow) time.Duration {
-	start, err := time.Parse("15:04", w.StartTime)
-	if err != nil {
-		return 0
-	}
-	end, err := time.Parse("15:04", w.EndTime)
-	if err != nil {
-		return 0
-	}
-	if end.Before(start) {
-		// Assume wraps around midnight
-		return end.Add(24 * time.Hour).Sub(start)
-	}
-	return end.Sub(start)
-}
-
 // windowInfo calculates the DisruptionWindow's start and end times in UTC for the current day.
 // It anchors the window's time to the date in the specified TimeZone before converting back to UTC.
 // On error, it returns (nowUTC, nowUTC, err).
 func windowInfo(nowUTC time.Time, w workloadsv1.DisruptionWindow) (start, end time.Time, err error) {
-	timeZone, timeZoneErr := time.LoadLocation(w.TimeZone)
+	location := "Etc/UTC"
+	if w.TimeZone != "" {
+		location = w.TimeZone
+	}
+
+	timeZone, timeZoneErr := time.LoadLocation(location)
 	if timeZoneErr != nil {
 		err = errors.Join(err, timeZoneErr)
 	}
