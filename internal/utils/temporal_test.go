@@ -39,10 +39,26 @@ func TestIsTimeInWindows(t *testing.T) {
 			wantIn: true,
 		},
 		{
+			name: "In window same day, different time zone",
+			now:  time.Date(2026, 4, 20, 23, 0, 0, 0, time.UTC), // Monday 23:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "16:00", EndTime: "17:59", TimeZone: "America/Guatemala"},
+			},
+			wantIn: true,
+		},
+		{
 			name: "Outside window same day",
 			now:  time.Date(2026, 4, 20, 21, 0, 0, 0, time.UTC), // Monday 21:00
 			windows: []workloadsv1.DisruptionWindow{
 				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "23:59"},
+			},
+			wantIn: false,
+		},
+		{
+			name: "Outside window same day, different time zone",
+			now:  time.Date(2026, 4, 20, 21, 0, 0, 0, time.UTC), // Monday 21:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "23:59", TimeZone: "Asia/Manila"},
 			},
 			wantIn: false,
 		},
@@ -55,6 +71,14 @@ func TestIsTimeInWindows(t *testing.T) {
 			wantIn: true,
 		},
 		{
+			name: "Wraps around midnight - currently in (after start), different time zone",
+			now:  time.Date(2026, 4, 20, 15, 0, 0, 0, time.UTC), // Monday 15:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00", TimeZone: "Asia/Manila"},
+			},
+			wantIn: true,
+		},
+		{
 			name: "Wraps around midnight - currently in (before end)",
 			now:  time.Date(2026, 4, 20, 02, 0, 0, 0, time.UTC), // Monday 02:00
 			windows: []workloadsv1.DisruptionWindow{
@@ -63,10 +87,26 @@ func TestIsTimeInWindows(t *testing.T) {
 			wantIn: true,
 		},
 		{
+			name: "Wraps around midnight - currently in (before end), different time zone",
+			now:  time.Date(2026, 4, 20, 8, 0, 0, 0, time.UTC), // Monday 8:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00", TimeZone: "America/Guatemala"},
+			},
+			wantIn: true,
+		},
+		{
 			name: "Wraps around midnight - currently outside",
 			now:  time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC), // Monday 10:00
 			windows: []workloadsv1.DisruptionWindow{
 				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00"},
+			},
+			wantIn: false,
+		},
+		{
+			name: "Wraps around midnight - currently outside, different time zone",
+			now:  time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC), // Monday 10:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00", TimeZone: "America/Toronto"},
 			},
 			wantIn: false,
 		},
