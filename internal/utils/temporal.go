@@ -75,6 +75,7 @@ func windowInfo(nowUTC time.Time, w workloadsv1.DisruptionWindow) (start, end ti
 	if startErr != nil {
 		err = errors.Join(err, startErr)
 	}
+
 	end, endErr := time.Parse("15:04", w.EndTime)
 	if endErr != nil {
 		err = errors.Join(err, endErr)
@@ -84,14 +85,14 @@ func windowInfo(nowUTC time.Time, w workloadsv1.DisruptionWindow) (start, end ti
 		return nowUTC, nowUTC, err
 	}
 
-	nowTimeZone := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), nowUTC.Hour(), nowUTC.Minute(), nowUTC.Second(), nowUTC.Nanosecond(), timeZone)
-	todayStart := time.Date(nowTimeZone.Year(), nowTimeZone.Month(), nowTimeZone.Day(), start.Hour(), start.Minute(), 0, 0, timeZone)
-	todayEnd := time.Date(nowTimeZone.Year(), nowTimeZone.Month(), nowTimeZone.Day(), end.Hour(), end.Minute(), 0, 0, timeZone)
+	localTime := nowUTC.In(timeZone)
+	localStart := time.Date(localTime.Year(), localTime.Month(), localTime.Day(), start.Hour(), start.Minute(), 0, 0, timeZone)
+	localEnd := time.Date(localTime.Year(), localTime.Month(), localTime.Day(), end.Hour(), end.Minute(), 0, 0, timeZone)
 
-	todayStartUTC := todayStart.UTC()
-	todayEndUTC := todayEnd.UTC()
+	startUTC := localStart.UTC()
+	endUTC := localEnd.UTC()
 
-	return todayStartUTC, todayEndUTC, nil
+	return startUTC, endUTC, nil
 }
 
 func evaluateWindow(start, end, nowUTC time.Time) (bool, time.Duration) {
@@ -106,11 +107,10 @@ func evaluateWindow(start, end, nowUTC time.Time) (bool, time.Duration) {
 func evaluateCrossMidnightWindow(start, end, now time.Time) (bool, time.Duration) {
 	// If now is after start, or now is before end, we're in the window
 	if now.After(start) {
-		wait := end.Add(24 * time.Hour).Sub(now)
-		return true, wait
-	} else if now.Before(end) {
-		wait := end.Sub(now)
-		return true, wait
+		return true, end.Add(24 * time.Hour).Sub(now)
+	}
+	if now.Before(end) {
+		return true, end.Sub(now)
 	}
 
 	// Outside, wait for start
@@ -121,13 +121,10 @@ func evaluateSameDayWindow(start, end, now time.Time) (bool, time.Duration) {
 	minWait := 24 * 7 * time.Hour
 
 	if now.After(start) && now.Before(end) {
-		wait := end.Sub(now)
-		return true, wait
-	} else if now.Before(start) {
-		wait := start.Sub(now)
-		if wait < minWait {
-			minWait = wait
-		}
+		return true, end.Sub(now)
+	}
+	if now.Before(start) {
+		minWait = min(minWait, start.Sub(now))
 	}
 
 	return false, minWait
