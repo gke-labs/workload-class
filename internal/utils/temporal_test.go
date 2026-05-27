@@ -72,9 +72,10 @@ func TestIsTimeInWindows(t *testing.T) {
 		},
 	}
 
+	ctx := t.Context()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotIn, _ := IsTimeInWindows(tt.now, tt.windows)
+			gotIn, _ := IsTimeInWindows(ctx, tt.now, tt.windows)
 			if gotIn != tt.wantIn {
 				t.Errorf("IsTimeInWindows() gotIn = %v, want %v", gotIn, tt.wantIn)
 			}

@@ -17,16 +17,22 @@ limitations under the License.
 package utils
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"slices"
 	"time"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // IsTimeInWindows checks if the given time is within any of the defined disruption windows.
 // Returns true if in window, and the duration until the next state change (window opens or closes).
-func IsTimeInWindows(now time.Time, windows []workloadsv1.DisruptionWindow) (bool, time.Duration) {
+func IsTimeInWindows(ctx context.Context, nowUTC time.Time, windows []workloadsv1.DisruptionWindow) (bool, time.Duration) {
+	log := logf.FromContext(ctx)
 	if len(windows) == 0 {
+		log.Info("WorkoadClass does not contain AllowedDisruptionWindows")
 		return true, 0
 	}
 
@@ -34,55 +40,17 @@ func IsTimeInWindows(now time.Time, windows []workloadsv1.DisruptionWindow) (boo
 	minWait := 24 * 7 * time.Hour
 
 	for _, w := range windows {
-		if slices.Contains(w.DaysOfWeek, now.Weekday().String()) {
-			start, err := time.Parse("15:04", w.StartTime)
+		if slices.Contains(w.DaysOfWeek, nowUTC.Weekday().String()) {
+			start, end, err := windowInfo(nowUTC, w)
 			if err != nil {
-				continue
-			}
-			end, err := time.Parse("15:04", w.EndTime)
-			if err != nil {
+				log.Error(err, fmt.Sprintf("Error getting start and end times from DisruptionWindow %s", w.Name))
 				continue
 			}
 
-			todayStart := time.Date(now.Year(), now.Month(), now.Day(), start.Hour(), start.Minute(), 0, 0, time.UTC)
-			todayEnd := time.Date(now.Year(), now.Month(), now.Day(), end.Hour(), end.Minute(), 0, 0, time.UTC)
+			inCurrentWindow, waitForCurrentWindow := evaluateWindow(start, end, nowUTC)
 
-			// Handle windows that wrap around midnight (e.g. 22:00 to 04:00)
-			if todayEnd.Before(todayStart) {
-				// If now is after start, or now is before end, we're in the window
-				if now.After(todayStart) {
-					inWindow = true
-					wait := todayEnd.Add(24 * time.Hour).Sub(now)
-					if wait < minWait {
-						minWait = wait
-					}
-				} else if now.Before(todayEnd) {
-					inWindow = true
-					wait := todayEnd.Sub(now)
-					if wait < minWait {
-						minWait = wait
-					}
-				} else {
-					// Outside, wait for start
-					wait := todayStart.Sub(now)
-					if wait < minWait {
-						minWait = wait
-					}
-				}
-			} else {
-				if now.After(todayStart) && now.Before(todayEnd) {
-					inWindow = true
-					wait := todayEnd.Sub(now)
-					if wait < minWait {
-						minWait = wait
-					}
-				} else if now.Before(todayStart) {
-					wait := todayStart.Sub(now)
-					if wait < minWait {
-						minWait = wait
-					}
-				}
-			}
+			inWindow = inWindow || inCurrentWindow
+			minWait = min(minWait, waitForCurrentWindow)
 		}
 	}
 
@@ -104,4 +72,75 @@ func CalculateWindowDuration(w workloadsv1.DisruptionWindow) time.Duration {
 		return end.Add(24 * time.Hour).Sub(start)
 	}
 	return end.Sub(start)
+}
+
+// windowInfo calculates the DisruptionWindow's start and end times in UTC for the current day.
+// It anchors the window's time to the date in the specified TimeZone before converting back to UTC.
+// On error, it returns (nowUTC, nowUTC, err).
+func windowInfo(nowUTC time.Time, w workloadsv1.DisruptionWindow) (start, end time.Time, err error) {
+	timeZone, timeZoneErr := time.LoadLocation(w.TimeZone)
+	if timeZoneErr != nil {
+		err = errors.Join(err, timeZoneErr)
+	}
+
+	start, startErr := time.Parse("15:04", w.StartTime)
+	if startErr != nil {
+		err = errors.Join(err, startErr)
+	}
+	end, endErr := time.Parse("15:04", w.EndTime)
+	if endErr != nil {
+		err = errors.Join(err, endErr)
+	}
+
+	if err != nil {
+		return nowUTC, nowUTC, err
+	}
+
+	nowTimeZone := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), nowUTC.Hour(), nowUTC.Minute(), nowUTC.Second(), nowUTC.Nanosecond(), timeZone)
+	todayStart := time.Date(nowTimeZone.Year(), nowTimeZone.Month(), nowTimeZone.Day(), start.Hour(), start.Minute(), 0, 0, timeZone)
+	todayEnd := time.Date(nowTimeZone.Year(), nowTimeZone.Month(), nowTimeZone.Day(), end.Hour(), end.Minute(), 0, 0, timeZone)
+
+	todayStartUTC := todayStart.UTC()
+	todayEndUTC := todayEnd.UTC()
+
+	return todayStartUTC, todayEndUTC, nil
+}
+
+func evaluateWindow(start, end, nowUTC time.Time) (bool, time.Duration) {
+	// Handle windows that wrap around midnight (e.g. 22:00 to 04:00)
+	if end.Before(start) {
+		return evaluateCrossMidnightWindow(start, end, nowUTC)
+	}
+
+	return evaluateSameDayWindow(start, end, nowUTC)
+}
+
+func evaluateCrossMidnightWindow(start, end, now time.Time) (bool, time.Duration) {
+	// If now is after start, or now is before end, we're in the window
+	if now.After(start) {
+		wait := end.Add(24 * time.Hour).Sub(now)
+		return true, wait
+	} else if now.Before(end) {
+		wait := end.Sub(now)
+		return true, wait
+	}
+
+	// Outside, wait for start
+	return false, start.Sub(now)
+}
+
+func evaluateSameDayWindow(start, end, now time.Time) (bool, time.Duration) {
+	minWait := 24 * 7 * time.Hour
+
+	if now.After(start) && now.Before(end) {
+		wait := end.Sub(now)
+		return true, wait
+	} else if now.Before(start) {
+		wait := start.Sub(now)
+		if wait < minWait {
+			minWait = wait
+		}
+	}
+
+	return false, minWait
 }

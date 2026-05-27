@@ -106,7 +106,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	// 3. Check Temporal Windows
-	inWindow, nextWindow := utils.IsTimeInWindows(now, wc.Spec.DisruptionPolicy.AllowedDisruptionWindows)
+	inWindow, nextWindow := utils.IsTimeInWindows(ctx, now, wc.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 	if !inWindow {
 		return workloadsv1.ReadinessNotReady, nextWindow, nil
 	}

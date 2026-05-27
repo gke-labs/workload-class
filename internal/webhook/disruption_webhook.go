@@ -94,7 +94,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	// 5. Temporal Enforcement
 	now := time.Now().UTC()
-	inWindow, _ := utils.IsTimeInWindows(now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
+	inWindow, _ := utils.IsTimeInWindows(ctx, now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 
 	// 6. Maintenance Starvation (Override on Overdue)
 	if bestWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
