@@ -683,3 +683,86 @@ func TestGracePeriodPassed(t *testing.T) {
 		})
 	}
 }
+
+func TestEvaluatePodGracePeriod(t *testing.T) {
+	wc := &workloadsv1.WorkloadClass{
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			DeletionTimestamp: &metav1.Time{},
+		},
+	}
+	now := time.Now()
+
+	testCases := []struct {
+		name                     string
+		desc                     string
+		initialGracePeriodPassed bool
+		initialDuration          time.Duration
+		deletionTimestamp        time.Time
+		wcGraceDuration          int32
+		wantGracePeriodPassed    bool
+		wantDuration             time.Duration
+	}{
+		{
+			name:                     "grace_passed_want_true_0",
+			desc:                     "Pod grace period passed, expect true, 0",
+			initialGracePeriodPassed: true,
+			initialDuration:          time.Duration(0),
+			deletionTimestamp:        now.AddDate(0, 0, -1),
+			wcGraceDuration:          3600,
+			wantGracePeriodPassed:    true,
+			wantDuration:             time.Duration(0) * time.Second,
+		},
+		{
+			name:                     "grace_not_passed_want_false_N",
+			desc:                     "Pod grace period not passed, expect false, N",
+			initialGracePeriodPassed: true,
+			initialDuration:          time.Duration(0),
+			deletionTimestamp:        now.AddDate(0, 0, -1),
+			wcGraceDuration:          90000,
+			wantGracePeriodPassed:    false,
+			wantDuration:             time.Duration(3600) * time.Second,
+		},
+		{
+			name:                     "initial_values_false_N_grace_not_passed",
+			desc:                     "Initial gpp is false, Pod grace period passed, expect 0, N",
+			initialGracePeriodPassed: false,
+			initialDuration:          time.Duration(30) * time.Second,
+			deletionTimestamp:        now.AddDate(0, 0, -1),
+			wcGraceDuration:          3600,
+			wantGracePeriodPassed:    false,
+			wantDuration:             time.Duration(30) * time.Second,
+		},
+		{
+			name:                     "grace_not_passed_new_greater_duration",
+			desc:                     "Initial gpp is false, initial duration is N, Pod grace period not passed, time until grace period M > N, expect false, M",
+			initialGracePeriodPassed: false,
+			initialDuration:          time.Duration(30) * time.Second,
+			deletionTimestamp:        now.AddDate(0, 0, -1),
+			wcGraceDuration:          90000,
+			wantGracePeriodPassed:    false,
+			wantDuration:             time.Duration(3600) * time.Second,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod.DeletionTimestamp.Time = tc.deletionTimestamp
+			wc.Spec.DisruptionPolicy.GraceTerminationDuration = tc.wcGraceDuration
+
+			gotGracePeriodPassed, gotDuration := evaluatePodGracePeriod(wc, pod, now, tc.initialGracePeriodPassed, tc.initialDuration)
+
+			if gotGracePeriodPassed != tc.wantGracePeriodPassed {
+				t.Errorf("evaluatePodGracePeriod() returned an unexpected result, got: %v, want: %v", gotGracePeriodPassed, tc.wantGracePeriodPassed)
+			}
+
+			if gotDuration != tc.wantDuration {
+				t.Errorf("evaluatePodGracePeriod() returned an unexpected duration, got: %v, want: %v", gotDuration, tc.wantDuration)
+			}
+		})
+	}
+}

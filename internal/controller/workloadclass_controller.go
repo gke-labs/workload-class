@@ -138,7 +138,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		maxTimeForGracePeriod := 0 * time.Second
 		for _, pod := range pods.Items {
 			// Check the grace period has passed for this pod. We want all grace periods to have passed.
-			gracePeriodsPassed, maxTimeForGracePeriod = updateGraceValues(wc, &pod, now, gracePeriodsPassed, maxTimeForGracePeriod)
+			gracePeriodsPassed, maxTimeForGracePeriod = evaluatePodGracePeriod(wc, &pod, now, gracePeriodsPassed, maxTimeForGracePeriod)
 		}
 
 		if !gracePeriodsPassed {
@@ -161,7 +161,7 @@ func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 	return true
 }
 
-func updateGraceValues(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {
+func evaluatePodGracePeriod(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {
 	gracePeriodPassedForPod, timeUntilGracePeriodPassed := gracePeriodPassed(wc, pod, now)
 
 	gracePeriodsPassed = gracePeriodsPassed && gracePeriodPassedForPod
