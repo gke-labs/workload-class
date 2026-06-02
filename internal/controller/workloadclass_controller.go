@@ -64,6 +64,13 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	meta.SetStatusCondition(&wc.Status.Conditions, validationCond)
 
+	// 1.1 Persist the status change
+	err = r.Status().Update(ctx, wc)
+	if err != nil {
+		log.Error(err, "Failed to update Status conditions")
+		return ctrl.Result{}, err
+	}
+
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
 	if err != nil {
