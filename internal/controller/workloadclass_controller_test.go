@@ -507,15 +507,36 @@ func TestOverdue(t *testing.T) {
 	}{
 		{
 			name: "wc_nil",
-			desc: "WorkloadClass is nil, want false",
-			want: false,
+			desc: "WorkloadClass is nil, want true",
+			want: true,
 		},
 		{
 			name:              "fields_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want false",
+			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want true",
 			setLastDisruption: false,
 			setMNDDD:          false,
-			want:              false,
+			want:              true,
+		},
+		{
+			name:              "max_non_disruption_days_not_set",
+			desc:              "MaxNonDisruptionDurationDays not set but LastDisrupt ionTime is set, want true",
+			setLastDisruption: true,
+			setMNDDD:          false,
+			want:              true,
+		},
+		{
+			name:              "last_disruption_time_not_set",
+			desc:              "MaxNonDisruptionDurationDays is set but LastDisruptionTime is nil, want ",
+			setLastDisruption: true,
+			setMNDDD:          false,
+			want:              true,
+		},
+		{
+			name:              "fields_not_set",
+			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want true",
+			setLastDisruption: false,
+			setMNDDD:          false,
+			want:              true,
 		},
 		{
 			name:                     "diff_greater_than_max_duration",

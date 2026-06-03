@@ -97,15 +97,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	inWindow, _ := utils.IsTimeInWindows(now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 
 	// 6. Maintenance Starvation (Override on Overdue)
-	isOverdue := false
-	if bestWC.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && bestWC.Status.LastDisruptionTime != nil {
-		maxDuration := time.Duration(bestWC.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
-		if now.Sub(bestWC.Status.LastDisruptionTime.Time) > maxDuration {
-			isOverdue = true
-		}
-	}
-
-	if isOverdue {
+	if bestWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
 		return admission.Allowed("Workload class is overdue for maintenance, bypassing constraints")
 	}
 
