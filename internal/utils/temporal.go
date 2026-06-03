@@ -71,12 +71,16 @@ func windowInfo(nowUTC time.Time, w workloadsv1.DisruptionWindow) (start, end ti
 		err = errors.Join(err, timeZoneErr)
 	}
 
-	start, startErr := time.Parse("15:04", w.StartTime)
+	// hoursMinutesOnly is the target layout, using Go's standard reference timestamp
+	// Mon Jan 2 15:04:05 MST 2006
+	const hoursMinutesOnly = "15:04"
+
+	start, startErr := time.Parse(hoursMinutesOnly, w.StartTime)
 	if startErr != nil {
 		err = errors.Join(err, startErr)
 	}
 
-	end, endErr := time.Parse("15:04", w.EndTime)
+	end, endErr := time.Parse(hoursMinutesOnly, w.EndTime)
 	if endErr != nil {
 		err = errors.Join(err, endErr)
 	}
@@ -120,7 +124,10 @@ func evaluateCrossMidnightWindow(start, end, now time.Time) (bool, time.Duration
 func evaluateSameDayWindow(start, end, now time.Time) (bool, time.Duration) {
 	minWait := 24 * 7 * time.Hour
 
-	if now.After(start) && now.Before(end) {
+	strictlyBetween := now.After(start) && now.Before(end)
+	startEqualsEnd := start.Compare(end) == 0
+
+	if strictlyBetween || startEqualsEnd {
 		return true, end.Sub(now)
 	}
 	if now.Before(start) {

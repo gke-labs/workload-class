@@ -39,6 +39,14 @@ func TestIsTimeInWindows(t *testing.T) {
 			wantIn: true,
 		},
 		{
+			name: "In window same day, start equals end",
+			now:  time.Date(2026, 4, 20, 23, 0, 0, 0, time.UTC), // Monday 23:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "12:00", EndTime: "12:00"},
+			},
+			wantIn: true,
+		},
+		{
 			name: "In window same day, different time zone",
 			now:  time.Date(2026, 4, 20, 23, 0, 0, 0, time.UTC), // Monday 23:00
 			windows: []workloadsv1.DisruptionWindow{
