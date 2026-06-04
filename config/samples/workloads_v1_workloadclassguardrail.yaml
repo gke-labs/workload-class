@@ -8,5 +8,5 @@
         allowedDisruptionDays:
           - Saturday
           - Sunday
-        maxAllowedWindows: 5
+        maxAllowedWindows: 2
         maxNonDisruptionDurationDays: 30

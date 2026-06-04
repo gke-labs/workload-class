@@ -1,15 +1,11 @@
 //go:build e2e
-// +build e2e
 
 /*
 Copyright 2026.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,22 +17,18 @@ package e2e
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 
+	"github.com/gke-labs/workload-class/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"sigs.k8s.io/yaml"
-
-	"github.com/gke-labs/workload-class/test/utils"
 )
 
-var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
+var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 	var controllerPodName string
 	var namespace = "workload-class-system"
-
+	var metricsRoleBindingName = "workload-class-metrics-binding"
 	// Before running the tests, set up the environment by creating the namespace,
 	// enforce the restricted security policy to the namespace, installing CRDs,
 	// and deploying the controller.
@@ -93,12 +85,15 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		}
 		Eventually(verifyPodReady, 2*time.Minute, 5*time.Second).Should(Succeed())
 	})
-
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
+		By("cleaning up the clusterrolebinding")
+		cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
 		By("cleaning up the dummy pod")
-		cmd := exec.Command("kubectl", "delete", "pod", "test-pod", "-n", "sample", "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "pod", "test-pod", "-n", "sample", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -113,7 +108,6 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
 		_, _ = utils.Run(cmd)
 	})
-
 	// After each test, check for failures and collect logs, events,
 	// and pod descriptions for debugging.
 	AfterEach(func() {
@@ -127,7 +121,6 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			} else {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
 			}
-
 			By("Fetching Kubernetes events")
 			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
 			eventsOutput, err := utils.Run(cmd)
@@ -136,7 +129,6 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			} else {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
 			}
-
 			By("Fetching controller manager pod description")
 			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
 			podDescription, err := utils.Run(cmd)
@@ -146,34 +138,16 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 				fmt.Println("Failed to describe controller pod")
 			}
 		}
-
 		// Reset the WorkloadClass so the next test may make its own modifications
 		By("Resetting the WorkloadClass")
 		cmd := exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
 		_, _ = utils.Run(cmd)
-
-		// If test-pod was evicted, recreate it
-		By("Ensuring dummy pod exists")
-		cmd = exec.Command("kubectl", "delete", "pod", "test-pod", "-n", "sample", "--force", "--grace-period=0", "--ignore-not-found")
-		_, _ = utils.Run(cmd)
-
-		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_pod.yaml")
-		_, _ = utils.Run(cmd)
-
-		verifyPodReady := func(g Gomega) {
-			cmd := exec.Command("kubectl", "get", "pod", "test-pod", "-n", "sample", "-o", "jsonpath={.status.phase}")
-			out, err := utils.Run(cmd)
-			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(out).To(Equal("Running"))
-		}
-		Eventually(verifyPodReady, 2*time.Minute, 2*time.Second).Should(Succeed())
 	})
-
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
-
-	Context("Eviction Webhook Validation", func() {
-		It("should allow eviction of a pod because it is within the disruption window", func() {
+	Context("MaintenanceReadiness Validation", func() {
+		It("should evaluate MaintenanceReadiness to Ready when within disruption window", func() {
+			By("Updating the WorkloadClass to simulate being within a disruption window")
 			currentDay := time.Now().UTC().Weekday().String()
 
 			By("Patching the Guardrail to allow today")
@@ -187,53 +161,54 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patchWC)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-
-			By("Attempting to evict the Pod via the eviction subresource")
-			yamlData, err := os.ReadFile("config/samples/eviction.yaml")
-			Expect(err).NotTo(HaveOccurred())
-
-			jsonData, err := yaml.YAMLToJSON(yamlData)
-			Expect(err).NotTo(HaveOccurred())
-
-			evictionFile := filepath.Join("/tmp", "eviction.json")
-			err = os.WriteFile(evictionFile, jsonData, 0644)
-			Expect(err).NotTo(HaveOccurred())
-
-			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile)
-			out, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Eviction should be allowed but failed: %s", out))
+			By("Verifying the Guardrail controller reconciles the WorkloadClass and updates its status")
+			verifyMaintenanceReadiness := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample", "-o", "jsonpath={.status.maintenanceReadiness}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Ready"))
+			}
+			Eventually(verifyMaintenanceReadiness, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
-
-		It("should deny eviction of a pod because it is outside of the window", func() {
+		It("should evaluate MaintenanceReadiness to NotReady when outside disruption window", func() {
+			By("Updating the Guardrail and WorkloadClass to simulate being outside a disruption window")
 			notToday := time.Now().AddDate(0, 0, 1).Weekday().String()
-
-			By("Patching the Guardrail to allow tomorrow")
 			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, notToday)
+			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
+
 			cmd := exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Patching the WorkloadClass to simulate being outside a disruption window")
-			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
 			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Attempting to evict the Pod via the eviction subresource")
-			yamlData, err := os.ReadFile("config/samples/eviction.yaml")
+			By("Verifying the Guardrail controller reconciles the WorkloadClass and updates its status")
+			verifyMaintenanceReadiness := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample", "-o", "jsonpath={.status.maintenanceReadiness}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("NotReady"))
+			}
+			Eventually(verifyMaintenanceReadiness, 2*time.Minute, 2*time.Second).Should(Succeed())
+		})
+
+		It("should evaluate MaintenanceReadiness to Overdue when maxNonDisruptionDurationDays is exceeded", func() {
+			By("Updating the WorkloadClass to trigger an overdue state")
+			patch := `{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "maxNonDisruptionDurationDays": 0}}}`
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patch)
+			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			jsonData, err := yaml.YAMLToJSON(yamlData)
-			Expect(err).NotTo(HaveOccurred())
-
-			evictionFile := filepath.Join("/tmp", "eviction.json")
-			err = os.WriteFile(evictionFile, jsonData, 0644)
-			Expect(err).NotTo(HaveOccurred())
-
-			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile)
-			out, err := utils.Run(cmd)
-			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the WorkloadClass policy")
-			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
+			By("Verifying the Guardrail controller reconciles the WorkloadClass and updates its status")
+			verifyMaintenanceReadiness := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample", "-o", "jsonpath={.status.maintenanceReadiness}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Overdue"))
+			}
+			Eventually(verifyMaintenanceReadiness, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
 	})
 })
