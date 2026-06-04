@@ -289,6 +289,15 @@ var _ = Describe("Manager", Ordered, func() {
 				_, err = utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClassGuardrail")
 
+				By("Verifying the Guardrail controller reconciles and updates the status")
+				verifyGuardrailStatus := func(g Gomega) {
+					cmd = exec.Command("kubectl", "get", "workloadclassguardrail", "default", "-o", "jsonpath={.status.conditions[?(@.type=='Validated')].status}")
+					out, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(Equal("True"))
+				}
+				Eventually(verifyGuardrailStatus, 2*time.Minute, 2*time.Second).Should(Succeed())
+
 				By("Applying the WorkloadClass sample")
 				cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
 				_, err = utils.Run(cmd)
