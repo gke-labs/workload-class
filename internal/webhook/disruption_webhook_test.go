@@ -412,11 +412,10 @@ func TestHandle(t *testing.T) {
 		eviction  = "eviction"
 	)
 	var (
-		inWindowDay          = time.Now().Weekday().String()
-		outOfWindowDay       = time.Now().AddDate(0, 0, 1).Weekday().String()
-		podNowCreationTime   = time.Now()
-		recentLastDisruption = time.Now().AddDate(0, 0, -5)
-		labels               = map[string]string{"labelA": "valueA"}
+		inWindowDay        = time.Now().Weekday().String()
+		outOfWindowDay     = time.Now().AddDate(0, 0, 1).Weekday().String()
+		podNowCreationTime = time.Now()
+		labels             = map[string]string{"labelA": "valueA"}
 	)
 
 	wc := &workloadsv1.WorkloadClass{
@@ -510,30 +509,30 @@ func TestHandle(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name               string
-		desc               string
-		req                admissionv1.AdmissionRequest
-		getPodErr          error
-		listWCErr          error
-		listWCResp         *workloadsv1.WorkloadClassList
-		getWCErr           error
-		getWCResp          *workloadsv1.WorkloadClass
-		guardrailValFails  bool
-		emergencyOverride  bool
-		inWindow           bool
-		overdue            bool
-		podCreationTime    time.Time
-		lastDisruptionTime time.Time
-		want               admission.Response
+		name              string
+		desc              string
+		req               admissionv1.AdmissionRequest
+		getPodErr         error
+		listWCErr         error
+		listWCResp        *workloadsv1.WorkloadClassList
+		getWCErr          error
+		getWCResp         *workloadsv1.WorkloadClass
+		guardrailValFails bool
+		emergencyOverride bool
+		inWindow          bool
+		overdue           bool
+		podCreationTime   time.Time
+		readiness         workloadsv1.MaintenanceReadiness
+		want              admission.Response
 	}{
 		{
-			name:               "errorGettingPod",
-			desc:               "Error getting pod, admission Errored",
-			req:                evictionRequest,
-			getPodErr:          fmt.Errorf("error getting Pod"),
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: recentLastDisruption,
-			want:               admission.Errored(http.StatusInternalServerError, fmt.Errorf("error getting Pod")),
+			name:            "errorGettingPod",
+			desc:            "Error getting pod, admission Errored",
+			req:             evictionRequest,
+			getPodErr:       fmt.Errorf("error getting Pod"),
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessReady,
+			want:            admission.Errored(http.StatusInternalServerError, fmt.Errorf("error getting Pod")),
 		},
 		{
 			name: "notAnEviction",
@@ -543,90 +542,90 @@ func TestHandle(t *testing.T) {
 				Namespace:   namespace,
 				SubResource: "not-an-eviction",
 			},
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: recentLastDisruption,
-			want:               admission.Allowed("Not an eviction"),
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Allowed("Not an eviction"),
 		},
 		{
-			name:               "errorGettingBestMatchWC",
-			desc:               "Error getting best match WC, admission Allowed",
-			req:                evictionRequest,
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: recentLastDisruption,
-			listWCErr:          fmt.Errorf("error listing WorkloadClasses"),
-			want:               admission.Allowed("Failed to get WorkloadClass matches this pod or namespace"),
+			name:            "errorGettingBestMatchWC",
+			desc:            "Error getting best match WC, admission Allowed",
+			req:             evictionRequest,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			listWCErr:       fmt.Errorf("error listing WorkloadClasses"),
+			want:            admission.Allowed("Failed to get WorkloadClass matches this pod or namespace"),
 		},
 		{
-			name:               "bestMatchWCIsNil",
-			desc:               "Best match WC is nil, admission Allowed",
-			req:                evictionRequest,
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: recentLastDisruption,
-			want:               admission.Allowed("No WorkloadClass matches this pod or namespace"),
+			name:            "bestMatchWCIsNil",
+			desc:            "Best match WC is nil, admission Allowed",
+			req:             evictionRequest,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Allowed("No WorkloadClass matches this pod or namespace"),
 		},
 		{
-			name:               "guardrailValidationFailed",
-			desc:               "Guardrail validation failed, admission Allowed",
-			req:                evictionRequest,
-			podCreationTime:    podNowCreationTime,
-			getWCResp:          wcValFailed,
-			lastDisruptionTime: recentLastDisruption,
-			want:               admission.Allowed("WorkloadClass failed Guardrail validation"),
+			name:            "guardrailValidationFailed",
+			desc:            "Guardrail validation failed, admission Allowed",
+			req:             evictionRequest,
+			podCreationTime: podNowCreationTime,
+			getWCResp:       wcValFailed,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Allowed("WorkloadClass failed Guardrail validation"),
 		},
 		{
-			name:               "emergencyOverride",
-			desc:               "Emergency override, admission Allowed",
-			req:                evictionRequest,
-			podCreationTime:    podNowCreationTime,
-			getWCResp:          wc,
-			lastDisruptionTime: recentLastDisruption,
-			emergencyOverride:  true,
-			want:               admission.Allowed("Emergency override active"),
+			name:              "emergencyOverride",
+			desc:              "Emergency override, admission Allowed",
+			req:               evictionRequest,
+			podCreationTime:   podNowCreationTime,
+			getWCResp:         wc,
+			readiness:         workloadsv1.ReadinessNotReady,
+			emergencyOverride: true,
+			want:              admission.Allowed("Emergency override active"),
 		},
 		{
-			name:               "allowedUser",
-			desc:               "Allowed user, admission Allowed",
-			req:                evictionRequest,
-			getWCResp:          wc,
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: recentLastDisruption,
-			want:               admission.Allowed("Disruption allowed for authorized user: VPA"),
+			name:            "allowedUser",
+			desc:            "Allowed user, admission Allowed",
+			req:             evictionRequest,
+			getWCResp:       wc,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Allowed("Disruption allowed for authorized user: VPA"),
 		},
 		{
-			name:               "overdue",
-			desc:               "Overdue, admission Allowed",
-			req:                evictionRequestNonMatchingUser,
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: time.Now().AddDate(-1, 0, 0),
-			getWCResp:          wc,
-			want:               admission.Allowed("Workload class is overdue for maintenance, bypassing constraints"),
+			name:            "overdue",
+			desc:            "Overdue, admission Allowed",
+			req:             evictionRequestNonMatchingUser,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessOverdue,
+			getWCResp:       wc,
+			want:            admission.Allowed("Workload class is overdue for maintenance, bypassing constraints"),
 		},
 		{
-			name:               "notInWindowNotOverdue",
-			desc:               "Not in window, not overdue, admission Denied",
-			req:                evictionRequestNonMatchingUser,
-			podCreationTime:    podNowCreationTime,
-			getWCResp:          wcOutOfWindow,
-			lastDisruptionTime: recentLastDisruption,
-			want:               admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcOutOfWindow.Name)),
+			name:            "notInWindowNotOverdue",
+			desc:            "Not in window, not overdue, admission Denied",
+			req:             evictionRequestNonMatchingUser,
+			podCreationTime: podNowCreationTime,
+			getWCResp:       wcOutOfWindow,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcOutOfWindow.Name)),
 		},
 		{
-			name:               "podIsTooNew",
-			desc:               "Pod is too new, admission Denied",
-			req:                evictionRequestNonMatchingUser,
-			getWCResp:          wc,
-			podCreationTime:    podNowCreationTime,
-			lastDisruptionTime: recentLastDisruption,
+			name:            "podIsTooNew",
+			desc:            "Pod is too new, admission Denied",
+			req:             evictionRequestNonMatchingUser,
+			getWCResp:       wc,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
 			want: admission.Denied(fmt.Sprintf("Eviction blocked: pod is too new (running for %v, required %d days)",
 				time.Since(podNowCreationTime).Round(time.Minute), wc.Spec.DisruptionPolicy.MinInitialRunDurationDays)),
 		},
 		{
-			name:               "inWindowNotOverduePodNotTooNew",
-			desc:               "In window, not overdue, Pod not too new, admission Allowed",
-			req:                evictionRequestNonMatchingUser,
-			lastDisruptionTime: recentLastDisruption,
-			podCreationTime:    time.Now().AddDate(0, 0, -4),
-			want:               admission.Allowed("Eviction allowed by WorkloadClass policy"),
+			name:            "inWindowNotOverduePodNotTooNew",
+			desc:            "In window, not overdue, Pod not too new, admission Allowed",
+			req:             evictionRequestNonMatchingUser,
+			readiness:       workloadsv1.ReadinessNotReady,
+			podCreationTime: time.Now().AddDate(0, 0, -4),
+			want:            admission.Allowed("Eviction allowed by WorkloadClass policy"),
 		},
 	}
 
@@ -637,7 +636,7 @@ func TestHandle(t *testing.T) {
 
 			if tc.getWCResp != nil {
 				tc.getWCResp.Status = workloadsv1.WorkloadClassStatus{
-					LastDisruptionTime: &metav1.Time{Time: tc.lastDisruptionTime},
+					MaintenanceReadiness: tc.readiness,
 				}
 				tc.getWCResp.Spec.DisruptionPolicy.EmergencyOverride = tc.emergencyOverride
 			}

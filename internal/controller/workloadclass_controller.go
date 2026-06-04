@@ -81,9 +81,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 3. Update Status if changed
 	if wc.Status.MaintenanceReadiness != readiness {
 		wc.Status.MaintenanceReadiness = readiness
-		if readiness == workloadsv1.ReadinessReady {
-			log.Info("Workload is now READY for maintenance")
-		}
+		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
 		if err := r.Status().Update(ctx, wc); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -93,6 +91,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
+	log := logf.FromContext(ctx)
 	now := time.Now().UTC()
 
 	// 1. Emergency Override
@@ -101,12 +100,9 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	// 2. Check Overdue (Maximum Protected Duration)
-	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 && wc.Status.LastDisruptionTime != nil {
-		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
-		diff := now.Sub(wc.Status.LastDisruptionTime.Time)
-		if diff > maxDuration {
-			return workloadsv1.ReadinessOverdue, 0, nil
-		}
+	if overdue(wc, now) {
+		log.Info(fmt.Sprintf("Time since last disruption for WorkloadClass %s/%s exceeds MaxNonDisruptionDurationDays. WorkloadClass is overdue for maintenance", wc.Namespace, wc.Name))
+		return workloadsv1.ReadinessOverdue, 0, nil
 	}
 
 	// 3. Check Temporal Windows
@@ -136,6 +132,17 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	return workloadsv1.ReadinessReady, nextWindow, nil
+}
+
+func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
+	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 {
+		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
+		if wc.Status.LastDisruptionTime != nil {
+			return now.Sub(wc.Status.LastDisruptionTime.Time) > maxDuration
+		}
+		return now.Sub(wc.CreationTimestamp.Time) > maxDuration
+	}
+	return true
 }
 
 func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context, wc *workloadsv1.WorkloadClass) (metav1.Condition, error) {
