@@ -39,10 +39,34 @@ func TestIsTimeInWindows(t *testing.T) {
 			wantIn: true,
 		},
 		{
+			name: "In window same day, start equals end",
+			now:  time.Date(2026, 4, 20, 23, 0, 0, 0, time.UTC), // Monday 23:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "12:00", EndTime: "12:00"},
+			},
+			wantIn: true,
+		},
+		{
+			name: "In window same day, different time zone",
+			now:  time.Date(2026, 4, 20, 23, 0, 0, 0, time.UTC), // Monday 23:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "16:00", EndTime: "17:59", TimeZone: "America/Guatemala"},
+			},
+			wantIn: true,
+		},
+		{
 			name: "Outside window same day",
 			now:  time.Date(2026, 4, 20, 21, 0, 0, 0, time.UTC), // Monday 21:00
 			windows: []workloadsv1.DisruptionWindow{
 				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "23:59"},
+			},
+			wantIn: false,
+		},
+		{
+			name: "Outside window same day, different time zone",
+			now:  time.Date(2026, 4, 20, 21, 0, 0, 0, time.UTC), // Monday 21:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "23:59", TimeZone: "Asia/Manila"},
 			},
 			wantIn: false,
 		},
@@ -55,10 +79,26 @@ func TestIsTimeInWindows(t *testing.T) {
 			wantIn: true,
 		},
 		{
+			name: "Wraps around midnight - currently in (after start), different time zone",
+			now:  time.Date(2026, 4, 20, 15, 0, 0, 0, time.UTC), // Monday 15:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00", TimeZone: "Asia/Manila"},
+			},
+			wantIn: true,
+		},
+		{
 			name: "Wraps around midnight - currently in (before end)",
 			now:  time.Date(2026, 4, 20, 02, 0, 0, 0, time.UTC), // Monday 02:00
 			windows: []workloadsv1.DisruptionWindow{
 				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00"},
+			},
+			wantIn: true,
+		},
+		{
+			name: "Wraps around midnight - currently in (before end), different time zone",
+			now:  time.Date(2026, 4, 20, 8, 0, 0, 0, time.UTC), // Monday 8:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00", TimeZone: "America/Guatemala"},
 			},
 			wantIn: true,
 		},
@@ -70,41 +110,22 @@ func TestIsTimeInWindows(t *testing.T) {
 			},
 			wantIn: false,
 		},
+		{
+			name: "Wraps around midnight - currently outside, different time zone",
+			now:  time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC), // Monday 10:00
+			windows: []workloadsv1.DisruptionWindow{
+				{DaysOfWeek: []string{"Monday"}, StartTime: "22:00", EndTime: "04:00", TimeZone: "America/Toronto"},
+			},
+			wantIn: false,
+		},
 	}
 
+	ctx := t.Context()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotIn, _ := IsTimeInWindows(tt.now, tt.windows)
+			gotIn, _ := IsTimeInWindows(ctx, tt.now, tt.windows)
 			if gotIn != tt.wantIn {
 				t.Errorf("IsTimeInWindows() gotIn = %v, want %v", gotIn, tt.wantIn)
-			}
-		})
-	}
-}
-
-func TestCalculateWindowDuration(t *testing.T) {
-	tests := []struct {
-		name    string
-		window  workloadsv1.DisruptionWindow
-		wantDur time.Duration
-	}{
-		{
-			name:    "Standard window",
-			window:  workloadsv1.DisruptionWindow{StartTime: "10:00", EndTime: "12:00"},
-			wantDur: 2 * time.Hour,
-		},
-		{
-			name:    "Wraparound window",
-			window:  workloadsv1.DisruptionWindow{StartTime: "22:00", EndTime: "04:00"},
-			wantDur: 6 * time.Hour,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := CalculateWindowDuration(tt.window)
-			if got != tt.wantDur {
-				t.Errorf("CalculateWindowDuration() = %v, want %v", got, tt.wantDur)
 			}
 		})
 	}
