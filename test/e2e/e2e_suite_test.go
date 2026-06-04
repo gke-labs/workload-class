@@ -1,5 +1,4 @@
 //go:build e2e
-// +build e2e
 
 /*
 Copyright 2026.
@@ -36,6 +35,11 @@ var (
 	managerImage = "example.com/workload-class:v0.0.1"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
+
+	// namespace where the project is deployed in
+	namespace = "workload-class-system"
+	// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
+	metricsRoleBindingName = "workload-class-metrics-binding"
 )
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
