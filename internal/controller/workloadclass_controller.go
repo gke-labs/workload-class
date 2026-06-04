@@ -182,7 +182,7 @@ func gracePeriodPassed(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.
 
 	// Check if Pod's deletion timestamp is set
 	if pod.DeletionTimestamp == nil {
-		return false, time.Duration(gracePeriod) * time.Second
+		return true, time.Duration(0) * time.Second
 	}
 
 	// Check if the grace period has passed

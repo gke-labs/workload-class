@@ -644,10 +644,10 @@ func TestGracePeriodPassed(t *testing.T) {
 	}{
 		{
 			name:         "del_timestamp_not_set",
-			desc:         "Pod's DeletionTimestamp is nil, expect false and duration == grace period",
+			desc:         "Pod's DeletionTimestamp is nil, expect true and duration = 0",
 			grace:        5,
-			wantPassed:   false,
-			wantDuration: time.Duration(5) * time.Second,
+			wantPassed:   true,
+			wantDuration: time.Duration(0) * time.Second,
 		},
 		{
 			name:         "grace_period_not_passed",
