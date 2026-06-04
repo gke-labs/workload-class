@@ -46,15 +46,15 @@ type DisruptionWebhook struct {
 func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
 	log := logf.FromContext(ctx).WithValues("name", req.Name, "namespace", req.Namespace, "user", req.UserInfo.Username)
 
+	// 1.1 Verify this is an eviction, not a standard pod create/delete
+	if req.SubResource != "eviction" {
+		return admission.Allowed("Not an eviction")
+	}
+
 	// 1. Identify the Pod
 	pod := &corev1.Pod{}
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: req.Name, Namespace: req.Namespace}, pod); err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	// 1.1 Verify this is an eviction, not a deletion
-	if req.SubResource != "eviction" {
-		return admission.Allowed("Not an eviction")
 	}
 
 	// 2. Find matching WorkloadClasses

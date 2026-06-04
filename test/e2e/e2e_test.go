@@ -29,6 +29,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/workload-class/test/utils"
 )
@@ -77,8 +78,12 @@ var _ = Describe("Manager", Ordered, func() {
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
+		By("cleaning up the clusterrolebinding")
+		cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
 		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		cmd = exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -175,11 +180,13 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
+			_, err := utils.Run(exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found"))
+			Expect(err).NotTo(HaveOccurred(), "Failed to delete clusterrolebinding")
 			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
 				"--clusterrole=workload-class-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
-			_, err := utils.Run(cmd)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
 
 			By("validating that the metrics service is available")
@@ -270,15 +277,57 @@ var _ = Describe("Manager", Ordered, func() {
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		Context("WorkloadClass and Disruption Webhook", func() {
+			It("should apply WorkloadClass and Guardrail, and enforce eviction policies", func() {
+				By("Applying a namespace")
+				cmd := exec.Command("kubectl", "apply", "-f", "config/samples/sample_namespace.yaml")
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to apply Namespace")
+
+				By("Applying the WorkloadClassGuardrail sample")
+				cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClassGuardrail")
+
+				By("Applying the WorkloadClass sample")
+				cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClass")
+				// Note: By default the sample WorkloadClass "critical-batch" might be denied eviction
+				// due to temporal window constraints or initial run constraints in disruption_webhook.go.
+
+				By("Creating a dummy Pod matching the WorkloadClass selector")
+				cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_pod.yaml")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create test pod")
+
+				By("Waiting for the Pod to be ready")
+				verifyPodReady := func(g Gomega) {
+					cmd = exec.Command("kubectl", "get", "pod", "test-pod", "-n", "sample", "-o", "jsonpath={.status.phase}")
+					out, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(Equal("Running"))
+				}
+				Eventually(verifyPodReady, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+				By("Attempting to evict the Pod via the eviction subresource")
+				yamlData, err := os.ReadFile("config/samples/eviction.yaml")
+				Expect(err).NotTo(HaveOccurred())
+				
+				jsonData, err := yaml.YAMLToJSON(yamlData)
+				Expect(err).NotTo(HaveOccurred())
+				
+				evictionFile := filepath.Join("/tmp", "eviction.json")
+				err = os.WriteFile(evictionFile, jsonData, 0644)
+				Expect(err).NotTo(HaveOccurred())
+
+				cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile)
+				out, err := utils.Run(cmd)
+				// We expect an error because the disruption webhook will deny the eviction based on policy
+				Expect(err).To(HaveOccurred(), "Eviction should be blocked by the WorkloadClass policy")
+				Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
+			})
+		})
 	})
 })
 
