@@ -13,5 +13,5 @@ spec:
   - $(SERVICE_NAME).$(SERVICE_NAMESPACE).svc.cluster.local
   issuerRef:
     kind: Issuer
-    name: selfsigned-issuer
+    name: workload-class-selfsigned-issuer
   secretName: webhook-server-cert # this secret will not exist, until cert-manager creates it

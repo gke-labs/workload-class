@@ -2,7 +2,7 @@ apiVersion: workloads.gke.io/v1
 kind: WorkloadClass
 metadata:
   name: critical-batch
-  namespace: demo
+  namespace: sample
 spec:
   podSelector:
     matchLabels:
