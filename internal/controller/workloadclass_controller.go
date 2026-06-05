@@ -28,7 +28,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
@@ -174,8 +176,8 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		}
 	}
 
-	if len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows) > int(*maxAllowedWindows) {
-		violations = append(violations, fmt.Sprintf("number of windows %v exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.AllowedDisruptionWindows, int(*maxAllowedWindows)))
+	if maxAllowedWindows != nil && len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows) > int(*maxAllowedWindows) {
+		violations = append(violations, fmt.Sprintf("number of windows %v exceeds guardrail limit %d", len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows), int(*maxAllowedWindows)))
 	}
 
 	if maxNonDisruptionDurationDays != nil && wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > *maxNonDisruptionDurationDays {
@@ -189,9 +191,30 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
-		Owns(&workloadsv1.WorkloadClassGuardrail{}). // Re-trigger validation if guardrails change
+		Watches(
+			&workloadsv1.WorkloadClassGuardrail{},
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
+		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassesToReconcile(ctx context.Context, guardrail client.Object) []reconcile.Request {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(workloadClasses.Items))
+	for i, item := range workloadClasses.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      item.GetName(),
+				Namespace: item.GetNamespace(),
+			},
+		}
+	}
+	return requests
 }
 
 func condition(violations []string) metav1.Condition {
@@ -225,14 +248,20 @@ func guardrailDisruptionConstraints(guardrails []workloadsv1.WorkloadClassGuardr
 	var maxNonDisruptionDurationDays *int32
 
 	for _, g := range guardrails {
-		if maxNonDisruptionDurationDays == nil || g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays < *maxNonDisruptionDurationDays {
-			maxNonDisruptionDurationDays = &g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
+		if g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays > 0 {
+			if maxNonDisruptionDurationDays == nil || g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays < *maxNonDisruptionDurationDays {
+				maxNonDisruptionDurationDays = &g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
+			}
 		}
 
-		allowedDisruptionDays = append(allowedDisruptionDays, g.Spec.Constraints.Disruption.AllowedDisruptionDays)
+		if len(g.Spec.Constraints.Disruption.AllowedDisruptionDays) > 0 {
+			allowedDisruptionDays = append(allowedDisruptionDays, g.Spec.Constraints.Disruption.AllowedDisruptionDays)
+		}
 
-		if maxAllowedWindows == nil || g.Spec.Constraints.Disruption.MaxAllowedWindows < *maxAllowedWindows {
-			maxAllowedWindows = &g.Spec.Constraints.Disruption.MaxAllowedWindows
+		if g.Spec.Constraints.Disruption.MaxAllowedWindows > 0 {
+			if maxAllowedWindows == nil || g.Spec.Constraints.Disruption.MaxAllowedWindows < *maxAllowedWindows {
+				maxAllowedWindows = &g.Spec.Constraints.Disruption.MaxAllowedWindows
+			}
 		}
 	}
 

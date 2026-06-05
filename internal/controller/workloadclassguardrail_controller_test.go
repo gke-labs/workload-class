@@ -142,3 +142,175 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 		})
 	})
 })
+
+var _ = Describe("WorkloadClassGuardrail Controller triggering Validation", func() {
+	var (
+		wc1Name, wc2Name, wc3Name, wcgName = "wc1", "wc2", "wc3", "wcg"
+	)
+
+	testCases := []struct {
+		name            string
+		desc            string
+		newAllowedDays  []string
+		wantInvalidated []string
+	}{
+		{
+			name: "none_invalidated",
+			desc: "Updating the guardrail does not cause workload classes to become invalid",
+		},
+		{
+			name:            "some_invalidated",
+			desc:            "Updating the guardrail causes some workload classes to become invalid",
+			newAllowedDays:  []string{"Sunday"},
+			wantInvalidated: []string{wc1Name, wc2Name},
+		},
+		{
+			name:            "all_invalidated",
+			desc:            "Updating the guardrail causes all workloadclasses to become invalid",
+			newAllowedDays:  []string{"Tuesday"},
+			wantInvalidated: []string{wc1Name, wc2Name, wc3Name},
+		},
+	}
+
+	for _, tc := range testCases {
+		It(tc.desc, func() {
+			ctx := context.Background()
+
+			wcgNamespacedName := types.NamespacedName{Name: wcgName}
+			wcg := &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: wcgName},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Disruption: workloadsv1.Disruption{
+							MaxNonDisruptionDurationDays: 20,
+							MaxAllowedWindows:            5,
+							AllowedDisruptionDays:        []string{"Friday", "Saturday", "Sunday"},
+						},
+					},
+				},
+			}
+			wc1 := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wc1Name, Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 15,
+						AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+							{Name: "Friday Maintenance", DaysOfWeek: []string{"Friday"}, TimeZone: "America/Toronto", StartTime: "00:00", EndTime: "23:59"},
+						},
+					},
+				},
+			}
+			wc2 := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wc2Name, Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 15,
+						AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+							{Name: "Saturday Maintenance", DaysOfWeek: []string{"Saturday"}, TimeZone: "America/Toronto", StartTime: "00:00", EndTime: "23:59"},
+						},
+					},
+				},
+			}
+			wc3 := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wc3Name, Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 15,
+						AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+							{Name: "Sunday Maintenance", DaysOfWeek: []string{"Sunday"}, TimeZone: "America/Toronto", StartTime: "00:00", EndTime: "23:59"},
+						},
+					},
+				},
+			}
+
+			// Clean up objects after the test finishes
+			defer func() {
+				_ = k8sClient.Delete(ctx, wcg)
+				_ = k8sClient.Delete(ctx, wc1)
+				_ = k8sClient.Delete(ctx, wc2)
+				_ = k8sClient.Delete(ctx, wc3)
+			}()
+
+			Expect(k8sClient.Create(ctx, wcg)).To(Succeed())
+			Expect(k8sClient.Create(ctx, wc1)).To(Succeed())
+			Expect(k8sClient.Create(ctx, wc2)).To(Succeed())
+			Expect(k8sClient.Create(ctx, wc3)).To(Succeed())
+
+			controllerReconciler := &WorkloadClassReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Run initial reconcile for all WorkloadClasses to set initial status
+			for _, wcName := range []string{wc1Name, wc2Name, wc3Name} {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+					NamespacedName: types.NamespacedName{Name: wcName, Namespace: "default"},
+				})
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Verify initial creation was processed
+			wcList := &workloadsv1.WorkloadClassList{}
+			Expect(k8sClient.List(ctx, wcList)).To(Succeed())
+			validCount := 0
+			for _, wc := range wcList.Items {
+				for _, c := range wc.Status.Conditions {
+					if c.Reason == workloadsv1.ReasonValidationPassed {
+						validCount++
+					}
+				}
+			}
+			Expect(validCount).To(Equal(3))
+
+			// Update the guardrail
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, wcgNamespacedName, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Disruption.AllowedDisruptionDays = tc.newAllowedDays
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			// Emulate the Watch event triggering the map function and enqueuing requests
+			requests := controllerReconciler.findWorkloadClassesToReconcile(ctx, guardrail)
+			for _, req := range requests {
+				_, err := controllerReconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Verify the updated status matches expectations
+			Expect(k8sClient.List(ctx, wcList)).To(Succeed())
+			invalidatedWCs := []string{}
+			for _, wc := range wcList.Items {
+				for _, c := range wc.Status.Conditions {
+					if c.Reason == workloadsv1.ReasonValidationFailed {
+						invalidatedWCs = append(invalidatedWCs, wc.Name)
+					}
+				}
+			}
+			Expect(ElementsMatch(invalidatedWCs, tc.wantInvalidated)).To(BeTrue(), "expected invalidated %v to match %v", invalidatedWCs, tc.wantInvalidated)
+		})
+
+	}
+})
+
+// ElementsMatch checks if two slices contain the exact same elements, regardless of order.
+func ElementsMatch(a, b []string) bool {
+	// If lengths differ, they can't have the same items
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Count occurrences of each item in the first slice
+	counts := make(map[string]int)
+	for _, item := range a {
+		counts[item]++
+	}
+
+	// Verify occurrences match in the second slice
+	for _, item := range b {
+		counts[item]--
+		if counts[item] < 0 {
+			return false // Either item not in 'a', or appears more times in 'b'
+		}
+	}
+
+	return true
+}
