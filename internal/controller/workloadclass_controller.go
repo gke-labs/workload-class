@@ -111,23 +111,39 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		return workloadsv1.ReadinessNotReady, nextWindow, nil
 	}
 
-	// 4. Check Pod Ages (Min Initial Run)
-	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
-		pods := &corev1.PodList{}
-		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
-		if err != nil {
-			return workloadsv1.ReadinessNotReady, 0, err
-		}
-		if err := r.List(ctx, pods, client.MatchingLabelsSelector{Selector: selector}); err != nil {
-			return workloadsv1.ReadinessNotReady, 0, err
-		}
+	// Get pods for the next two checks
+	pods := &corev1.PodList{}
+	selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+	if err != nil {
+		return workloadsv1.ReadinessNotReady, 0, err
+	}
+	if err := r.List(ctx, pods, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return workloadsv1.ReadinessNotReady, 0, err
+	}
 
+	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDuration)
+	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
 		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
 		for _, pod := range pods.Items {
 			if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
 				// Pod hasn't run long enough
 				return workloadsv1.ReadinessNotReady, minRunDuration - now.Sub(pod.CreationTimestamp.Time), nil
 			}
+		}
+	}
+
+	// 5. Check if grace period has passed for all pods (GraceTerminationDuration)
+	if wc.Spec.DisruptionPolicy.GraceTerminationDuration > 0 {
+		gracePeriodsPassed := true
+		maxTimeForGracePeriod := 0 * time.Second
+		for _, pod := range pods.Items {
+			// Check the grace period has passed for this pod. We want all grace periods to have passed.
+			gracePeriodsPassed, maxTimeForGracePeriod = evaluatePodGracePeriod(wc, &pod, now, gracePeriodsPassed, maxTimeForGracePeriod)
+		}
+
+		if !gracePeriodsPassed {
+			// Grace periods have not passed
+			return workloadsv1.ReadinessNotReady, maxTimeForGracePeriod, nil
 		}
 	}
 
@@ -143,6 +159,36 @@ func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 		return now.Sub(wc.CreationTimestamp.Time) > maxDuration
 	}
 	return true
+}
+
+func evaluatePodGracePeriod(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {
+	gracePeriodPassedForPod, timeUntilGracePeriodPassed := gracePeriodPassed(wc, pod, now)
+
+	gracePeriodsPassed = gracePeriodsPassed && gracePeriodPassedForPod
+	maxDurationForGracePeriod := max(maxDuration, timeUntilGracePeriodPassed)
+
+	return gracePeriodsPassed, maxDurationForGracePeriod
+}
+
+// gracePeriodPassed returns true if the GraceTerminationDuration has passed for the Pod, indicating that maintenance should not be blocked.
+//
+// It checks if the pod has a DeletionTimestamp, which indicates when the pod began deletion.
+// The function then compares the WorkloadClass' GraceTerminationDuration against the time passed since the DeletionTimestamp.
+//
+// If the time passed is not greater than or equal to the GraceTerminationDuration, the function returns false and the time remaining until the grace period expires.
+// If the time passed is greater than or equal to the GraceTerminationDuration, the function returns, and the WorkloadClass is marked Ready for maintenance.
+func gracePeriodPassed(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time) (bool, time.Duration) {
+	gracePeriod := wc.Spec.DisruptionPolicy.GraceTerminationDuration
+
+	// Check if Pod's deletion timestamp is set
+	if pod.DeletionTimestamp == nil {
+		return true, time.Duration(0) * time.Second
+	}
+
+	// Check if the grace period has passed
+	// GraceTerminationDuration - time passed since deletion timestamp
+	diff := (time.Duration(gracePeriod) * time.Second) - now.Sub(pod.DeletionTimestamp.Time)
+	return diff <= 0, diff
 }
 
 func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context, wc *workloadsv1.WorkloadClass) (metav1.Condition, error) {
