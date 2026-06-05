@@ -1,5 +1,7 @@
 ## Append samples of your project ##
 resources:
-- workloads_v1_workloadclass.yaml
+- sample_namespace.yaml
 - workloads_v1_workloadclassguardrail.yaml
+- workloads_v1_workloadclass.yaml
+- dummy_pod.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

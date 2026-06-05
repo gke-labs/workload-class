@@ -22,6 +22,111 @@ This project implements the GKE Workload Class feature. It allows platform engin
 ## Description
 The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails. A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration).
 
+## Example Usage
+
+**1. Platform Engineer defines a Guardrail**
+The platform team creates a `WorkloadClassGuardrail` (Cluster-scoped) to enforce organizational limits:
+```yaml
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClassGuardrail
+metadata:
+  name: default
+spec:
+  constraints:
+    disruption:
+      allowedDisruptionDays:
+        - Saturday
+        - Sunday
+      maxAllowedWindows: 2
+      maxNonDisruptionDurationDays: 30
+```
+
+**2. Workload Owner defines a WorkloadClass**
+The workload owner creates a `WorkloadClass` (Namespace-scoped) to protect their specific pods from disruption during active hours:
+```yaml
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: critical-batch
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      role: batch-processor
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+        startTime: "00:00"
+        endTime: "04:00"
+        timeZone: "America/Toronto"
+    minInitialRunDurationDays: 2
+    maxNonDisruptionDurationDays: 1
+    allowedDisruptionsOutsideOfWindow:
+      - VPA
+      - ClusterAutoscaler
+```
+
+**3. Testing the Capabilities**
+
+**A. Testing Disruption Webhooks**
+You can deploy a dummy pod that matches the `WorkloadClass` selector and attempt to disrupt it. If the current time is outside the `weekend-maintenance` window, the webhook will intercept and reject the disruption:
+
+```sh
+# 1. Apply the CRDs, dummy pod, and sample namespace
+kubectl apply -k config/samples/
+
+# 2. Attempt to evict the pod outside the maintenance window using the Eviction API
+kubectl proxy &
+PROXY_PID=$!
+sleep 2
+
+curl -s -X POST "http://127.0.0.1:8001/api/v1/namespaces/sample/pods/test-pod/eviction" \
+  -H "Content-Type: application/json" \
+  -d '{"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "test-pod", "namespace": "sample"}}'
+
+kill $PROXY_PID
+```
+*Expected Output (if outside window):*
+```json
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "metadata": {},
+  "status": "Failure",
+  "message": "admission webhook \"vpoddisruption.gke.io\" denied the request: Eviction blocked: currently outside of allowed disruption windows for WorkloadClass critical-batch",
+  "reason": "Forbidden",
+  "code": 403
+}
+```
+
+**B. Testing Guardrail Validation**
+You can attempt to update the `WorkloadClass` with an invalid policy that violates the `WorkloadClassGuardrail` (e.g., setting 32 maxNonDisruptionDurationDays when the guardrail only allows 30). The validation will fail and the WorkloadClass Status will be updated:
+
+```sh
+# Attempt to apply a WorkloadClass with too many windows or invalid duration
+kubectl apply -f config/samples/workloads_v1_workloadclass.yaml
+```
+*Expected Status (if invalid):*
+```sh
+# Describe the WorkloadClass
+kubectl apply describe workloadclass critical-workload -n demo
+```
+```
+Status:
+  Conditions:
+    Last Transition Time:  2026-06-05T14:59:29Z
+    Message:               maxNonDisruptionDurationDays 32 exceeds guardrail limit 30
+    Reason:                ValidationFailed
+    Status:                False
+    Type:                  Validated
+  Maintenance Readiness:   NotReady
+Events:                    <none>
+```
+
+
 ## Getting Started
 
 ### Prerequisites
@@ -29,6 +134,7 @@ The Workload Class Controller manages the lifecycle of disruption policies, ensu
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
+- cert-manager version v1.x (required for webhooks).
 
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
@@ -63,7 +169,7 @@ You can apply the samples (examples) from the config/sample:
 kubectl apply -k config/samples/
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+>**NOTE**: Ensure that the samples have default values to test it out.
 
 ### To Uninstall
 **Delete the instances (CRs) from the cluster:**
