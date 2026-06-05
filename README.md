@@ -118,7 +118,7 @@ kubectl apply -f config/samples/workloads_v1_workloadclass.yaml
 *Expected Status (if invalid):*
 ```sh
 # Describe the WorkloadClass
-kubectl apply describe workloadclass critical-workload -n demo
+kubectl describe workloadclass critical-workload -n demo
 ```
 ```
 Status:
