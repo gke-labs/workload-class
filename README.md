@@ -25,7 +25,9 @@ The Workload Class Controller manages the lifecycle of disruption policies, ensu
 ## Example Usage
 
 **1. Platform Engineer defines a Guardrail**
+
 The platform team creates a `WorkloadClassGuardrail` (Cluster-scoped) to enforce organizational limits:
+
 ```yaml
 apiVersion: workloads.gke.io/v1
 kind: WorkloadClassGuardrail
@@ -42,7 +44,9 @@ spec:
 ```
 
 **2. Workload Owner defines a WorkloadClass**
+
 The workload owner creates a `WorkloadClass` (Namespace-scoped) to protect their specific pods from disruption during active hours:
+
 ```yaml
 apiVersion: workloads.gke.io/v1
 kind: WorkloadClass
@@ -72,6 +76,7 @@ spec:
 **3. Testing the Capabilities**
 
 **A. Testing Disruption Webhooks**
+
 You can deploy a dummy pod that matches the `WorkloadClass` selector and attempt to disrupt it. If the current time is outside the `weekend-maintenance` window, the webhook will intercept and reject the disruption:
 
 ```sh
@@ -103,6 +108,7 @@ kill $PROXY_PID
 ```
 
 **B. Testing Guardrail Validation**
+
 You can attempt to update the `WorkloadClass` with an invalid policy that violates the `WorkloadClassGuardrail` (e.g., setting 32 maxNonDisruptionDurationDays when the guardrail only allows 30). The validation will fail and the WorkloadClass Status will be updated:
 
 ```sh
