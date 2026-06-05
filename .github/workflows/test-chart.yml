@@ -63,7 +63,7 @@ jobs:
 
       - name: Deploy manager via Helm
         run: |
-          make helm-deploy IMG=workload-class:v0.1.0
+          make helm-deploy IMG=controller:latest
 
       - name: Check Helm release status
         run: |
