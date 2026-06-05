@@ -1,4 +1,4 @@
-{{- if .Values.metrics.enable }}
+{{- if .Values.webhook.enable }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,16 +7,13 @@ metadata:
     app.kubernetes.io/name: {{ include "workload-class.name" . }}
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/instance: {{ .Release.Name }}
-    control-plane: controller-manager
-  name: {{ include "workload-class.resourceName" (dict "suffix" "controller-manager-metrics-service" "context" $) }}
+  name: {{ include "workload-class.resourceName" (dict "suffix" "webhook-service" "context" $) }}
   namespace: {{ .Release.Namespace }}
 spec:
   ports:
-  - name: {{ if .Values.metrics.secure }}https{{ else }}http{{ end }}
-    port: {{ .Values.metrics.port }}
+  - port: 443
     protocol: TCP
-    targetPort: {{ .Values.metrics.port }}
+    targetPort: {{ .Values.webhook.port }}
   selector:
-    app.kubernetes.io/name: {{ include "workload-class.name" . }}
     control-plane: controller-manager
 {{- end }}
