@@ -29,6 +29,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 // WorkloadClassGuardrailReconciler reconciles a WorkloadClassGuardrail object
@@ -90,7 +91,7 @@ func validateDisruptionDays(allowedDisruptionDays []string) error {
 		time.Saturday.String(),
 	}
 
-	if !isSubset(allowedDisruptionDays, days) {
+	if !utils.IsSubset(allowedDisruptionDays, days) {
 		return fmt.Errorf("allowedDisruptionDays contains invalid days, valid days are: %v, got %v", days, allowedDisruptionDays)
 	}
 

@@ -215,7 +215,7 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		if !allowedDisruptionDaysValid(dw.DaysOfWeek, allowedDisruptionDays) {
 			violations = append(violations, fmt.Sprintf("disruption window %s contains day(s) of week that are not allowed by guardrail. Found DaysOfWeek: %v, guardrail AllowedDisruptionDays: %v", dw.Name, dw.DaysOfWeek, allowedDisruptionDays))
 		}
-		if !timeZoneValid(dw.TimeZone) {
+		if !utils.TimeZoneValid(dw.TimeZone) {
 			violations = append(violations, fmt.Sprintf("disruption window %s has invalid time zone %s", dw.Name, dw.TimeZone))
 		}
 	}
@@ -292,32 +292,8 @@ func allowedDisruptionDaysValid(wcAllowedDisruptionDays []string, guardrail [][]
 
 	valid := true
 	for _, days := range guardrail {
-		valid = valid && isSubset(wcAllowedDisruptionDays, days)
+		valid = valid && utils.IsSubset(wcAllowedDisruptionDays, days)
 	}
 
 	return valid
-}
-
-func timeZoneValid(timeZone string) bool {
-	_, err := time.LoadLocation(timeZone)
-	return err == nil
-}
-
-func isSubset(subset, superset []string) bool {
-	if len(subset) == 0 {
-		return true
-	}
-
-	supersetMap := make(map[string]struct{}, len(superset))
-	for _, d := range superset {
-		supersetMap[d] = struct{}{}
-	}
-
-	for _, d := range subset {
-		if _, found := supersetMap[d]; !found {
-			return false
-		}
-	}
-
-	return true
 }

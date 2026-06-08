@@ -199,6 +199,12 @@ func main() {
 	mgr.GetWebhookServer().Register("/validate-disruption", &admission.Webhook{
 		Handler: &internalwebhook.DisruptionWebhook{Client: mgr.GetClient()},
 	})
+
+	setupLog.Info("Registering guardrail webhook")
+	mgr.GetWebhookServer().Register("/validate-workloadclassguardrail", &admission.Webhook{
+		Handler: &internalwebhook.GuardrailWebhook{Client: mgr.GetClient()},
+	})
+
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

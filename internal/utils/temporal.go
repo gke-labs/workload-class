@@ -27,6 +27,14 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// TimeZoneValid checks if the provided string represents a valid IANA Time Zone
+// identifier (e.g., "America/New_York", "UTC"). It returns true if the time zone
+// is recognized and can be loaded by the system, and false otherwise.
+func TimeZoneValid(timeZone string) bool {
+	_, err := time.LoadLocation(timeZone)
+	return err == nil
+}
+
 // IsTimeInWindows checks if the given time is within any of the defined disruption windows.
 // Returns true if in window, and the duration until the next state change (window opens or closes).
 func IsTimeInWindows(ctx context.Context, nowUTC time.Time, windows []workloadsv1.DisruptionWindow) (bool, time.Duration) {
