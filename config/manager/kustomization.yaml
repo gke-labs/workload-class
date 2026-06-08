@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: example.com/workload-class
-  newTag: v0.0.1
+  newTag: latest
