@@ -1,0 +1,35 @@
+name: Tag version
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "version.json"
+
+permissions: read-all
+
+jobs:
+  tag-action:
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: "0"
+
+      - name: Extract version from version.json
+        id: get_version
+        run: echo "CUSTOM_TAG=v$(jq -r '.version' version.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version and push tag
+        uses: anothrNick/github-tag-action@1.75.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_TAG: ${{ steps.get_version.outputs.CUSTOM_TAG }}
+
+      - name: Trigger release workflow
+        run: gh workflow run release -r  ${{ steps.get_version.outputs.CUSTOM_TAG }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
