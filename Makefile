@@ -303,3 +303,7 @@ helm-history: ## Show Helm release history.
 .PHONY: helm-rollback
 helm-rollback: ## Rollback to previous Helm release.
 	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+update-version: ## Update version. Usage: make update-version [BUMP_TYPE=major|minor|patch]
+	@echo "Updating version..."
+	@./dev/tasks/update_version.sh $(BUMP_TYPE)
