@@ -26,10 +26,6 @@ jobs:
       - name: Bump version and push tag
         uses: anothrNick/github-tag-action@1.75.0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT }}
           CUSTOM_TAG: ${{ steps.get_version.outputs.CUSTOM_TAG }}
 
-      - name: Trigger release workflow
-        run: gh workflow run release -r  ${{ steps.get_version.outputs.CUSTOM_TAG }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
