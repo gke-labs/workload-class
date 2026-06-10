@@ -27,6 +27,27 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// WeekdaysValid checks if a given slice of strings contains only valid,
+// fully-capitalized days of the week (e.g., "Monday", "Tuesday").
+// It returns an error if any unrecognized or incorrectly formatted days are found.
+func WeekdaysValid(days []string) error {
+	validWeekdays := []string{
+		time.Sunday.String(),
+		time.Monday.String(),
+		time.Tuesday.String(),
+		time.Wednesday.String(),
+		time.Thursday.String(),
+		time.Friday.String(),
+		time.Saturday.String(),
+	}
+
+	if !IsSubset(days, validWeekdays) {
+		return fmt.Errorf("allowedDisruptionDays contains invalid days, valid days are: %v, got %v", validWeekdays, days)
+	}
+
+	return nil
+}
+
 // TimeZoneValid checks if the provided string represents a valid IANA Time Zone
 // identifier (e.g., "America/New_York", "UTC"). It returns true if the time zone
 // is recognized and can be loaded by the system, and false otherwise.

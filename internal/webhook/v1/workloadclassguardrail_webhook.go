@@ -36,7 +36,7 @@ var workloadclassguardraillog = logf.Log.WithName("workloadclassguardrail-resour
 // SetupWorkloadClassGuardrailWebhookWithManager registers the webhook for WorkloadClassGuardrail in the manager.
 func SetupWorkloadClassGuardrailWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &workloadsv1.WorkloadClassGuardrail{}).
-		WithValidator(&WorkloadClassGuardrailCustomValidator{}).
+		WithValidator(&WorkloadClassGuardrailCustomValidator{Client: mgr.GetClient()}).
 		Complete()
 }
 
@@ -55,12 +55,20 @@ type WorkloadClassGuardrailCustomValidator struct {
 func (v *WorkloadClassGuardrailCustomValidator) ValidateCreate(ctx context.Context, obj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
 	workloadclassguardraillog.Info("Validation for WorkloadClassGuardrail upon creation", "name", obj.GetName())
 
+	if err := utils.WeekdaysValid(obj.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
+		return []string{err.Error()}, err
+	}
+
 	return v.validateAgainstWorkloadClasses(ctx, obj)
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type WorkloadClassGuardrail.
 func (v *WorkloadClassGuardrailCustomValidator) ValidateUpdate(ctx context.Context, _, newObj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
 	workloadclassguardraillog.Info("Validation for WorkloadClassGuardrail upon update", "name", newObj.GetName())
+
+	if err := utils.WeekdaysValid(newObj.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
+		return []string{err.Error()}, err
+	}
 
 	return v.validateAgainstWorkloadClasses(ctx, newObj)
 }
