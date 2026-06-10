@@ -196,6 +196,71 @@ make uninstall
 make undeploy
 ```
 
+## Deploying to GKE with `kubectl` (No `make`)
+
+This section guides you through creating a GKE cluster and deploying the Workload Class controller and resources using `gcloud` and `kubectl` directly, using our pre-built public container image.
+
+### 1. Create a GKE Cluster
+
+Create a GKE Standard cluster to run your workloads:
+
+```sh
+gcloud container clusters create workload-class-demo \
+    --region us-central1 \
+    --num-nodes 3 \
+    --project YOUR_PROJECT_ID
+```
+
+After creation, ensure your `kubectl` is configured to connect to the cluster:
+```sh
+gcloud container clusters get-credentials workload-class-demo \
+    --region us-central1 \
+    --project YOUR_PROJECT_ID
+```
+*(Note: Adjust the region and project ID as necessary.)*
+
+### 2. Install cert-manager
+
+The controller's webhooks require `cert-manager` to provision certificates. Install it on your cluster:
+
+```sh
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.20.2/cert-manager.yaml
+```
+
+Wait for the cert-manager pods to be up and running:
+```sh
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
+```
+
+### 3. Deploy the Controller
+
+Deploy the controller using `kubectl` with built-in Kustomize support, pointing to the public GitHub Container Registry package.
+
+Apply the configuration to your cluster:
+
+```sh
+kubectl apply -k config/default
+```
+
+### 4. Create the Guardrail and Workload Class
+
+Once the controller is running, you can create the guardrail and workload class resources.
+
+Apply the sample guardrail from the samples directory:
+```sh
+kubectl apply -f ./config/samples/workloads_v1_workloadclassguardrail.yaml
+```
+
+Apply the sample workload class from the samples directory:
+```sh
+kubectl apply -f ./config/samples/workloads_v1_workloadclass.yaml
+```
+
+Alternatively, you can apply all samples (including namespace and dummy pod) from `config/sampleskube`:
+```sh
+kubectl apply -k config/samples
+```
+
 ## Project Distribution
 
 Following the options to release and provide this solution to the users.
