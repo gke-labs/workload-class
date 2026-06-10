@@ -219,31 +219,36 @@ kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manage
 
 ### 3. Deploy the Controller
 
-Deploy the controller using `kubectl` with built-in Kustomize support, pointing to the public GitHub Container Registry package.
+Deploy the controller directly from the official release bundle. This configuration is already set to automatically pull the latest image from our [public GitHub Container Registry package](https://github.com/gke-labs/workload-class/pkgs/container/workload-class).
 
 Apply the configuration to your cluster:
 
 ```sh
-kubectl apply -k config/default
+kubectl apply -f https://raw.githubusercontent.com/gke-labs/workload-class/main/dist/install.yaml
 ```
 
 ### 4. Create the Guardrail and Workload Class
 
 Once the controller is running, you can create the guardrail and workload class resources.
 
-Apply the sample guardrail from the samples directory:
+Apply the sample guardrail:
 ```sh
-kubectl apply -f ./config/samples/workloads_v1_workloadclassguardrail.yaml
+kubectl apply -f https://raw.githubusercontent.com/gke-labs/workload-class/main/config/samples/workloads_v1_workloadclassguardrail.yaml
 ```
 
-Apply the sample workload class from the samples directory:
+Apply a sample namespace:
 ```sh
-kubectl apply -f ./config/samples/workloads_v1_workloadclass.yaml
+kubectl apply -f https://raw.githubusercontent.com/gke-labs/workload-class/main/config/samples/sample_namespace.yaml
 ```
 
-Alternatively, you can apply all samples (including namespace and dummy pod) from `config/samples/`:
+Apply the sample workload class:
 ```sh
-kubectl apply -k config/samples/
+kubectl apply -f https://raw.githubusercontent.com/gke-labs/workload-class/main/config/samples/workloads_v1_workloadclass.yaml
+```
+
+Alternatively, you can apply all samples (including the test namespace and dummy pod) directly via Kustomize:
+```sh
+kubectl apply -k https://github.com/gke-labs/workload-class/config/samples\?ref\=main
 ```
 
 ## Project Distribution

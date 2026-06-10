@@ -20,7 +20,7 @@ spec:
     listKind: WorkloadClassList
     plural: workloadclasses
     singular: workloadclass
-  scope: Cluster
+  scope: Namespaced
   versions:
   - name: v1
     schema:
@@ -47,69 +47,72 @@ spec:
           spec:
             description: spec defines the desired state of WorkloadClass
             properties:
-              allowedDisruptionWindows:
-                description: AllowedDisruptionWindows defines when disruptions are
-                  allowed.
-                items:
-                  description: DisruptionWindow defines a temporal window when disruptions
-                    are allowed.
-                  properties:
-                    dayOfWeek:
-                      description: DayOfWeek specifies the day of the week (Monday-Sunday).
-                      enum:
-                      - Monday
-                      - Tuesday
-                      - Wednesday
-                      - Thursday
-                      - Friday
-                      - Saturday
-                      - Sunday
+              disruptionPolicy:
+                description: DisruptionPolicy specifies the policy governing pod disruptions.
+                properties:
+                  allowedDisruptionWindows:
+                    description: AllowedDisruptionWindows defines when disruptions
+                      are allowed.
+                    items:
+                      description: DisruptionWindow defines a temporal window when
+                        disruptions are allowed.
+                      properties:
+                        daysOfWeek:
+                          description: DaysOfWeek specifies the days of the week (Monday-Sunday).
+                          items:
+                            type: string
+                          type: array
+                        endTime:
+                          description: EndTime is the end time of the window in HH:MM
+                            format (e.g. 04:00) in UTC.
+                          pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
+                          type: string
+                        name:
+                          description: Name is the name of the DisruptionWindow.
+                          type: string
+                        startTime:
+                          description: StartTime is the start time of the window in
+                            HH:MM format (e.g. 22:00) in UTC.
+                          pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
+                          type: string
+                        timeZone:
+                          description: TimeZone is the IANA Time Zone Database name
+                            (e.g., "America/Los_Angeles", "Etc/UTC"). See https://www.iana.org/time-zones.
+                          pattern: ^[A-Za-z_]+/[A-Za-z_]+$
+                          type: string
+                      type: object
+                    type: array
+                  allowedDisruptionsOutsideOfWindow:
+                    description: AllowedDisruptionsOutsideOfWindow specifies identities
+                      or components that can disrupt even outside of windows. (e.g.
+                      "VPA", "ClusterAutoscaler")
+                    items:
                       type: string
-                    endTime:
-                      description: EndTime is the end time of the window in HH:MM
-                        format (e.g. 04:00) in UTC.
-                      pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
-                      type: string
-                    startTime:
-                      description: StartTime is the start time of the window in HH:MM
-                        format (e.g. 22:00) in UTC.
-                      pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
-                      type: string
-                  required:
-                  - dayOfWeek
-                  - endTime
-                  - startTime
-                  type: object
-                type: array
-              allowedDisruptionsOutsideOfWindow:
-                description: |-
-                  AllowedDisruptionsOutsideOfWindow specifies identities or components that can disrupt even outside of windows.
-                  (e.g. "VPA", "ClusterAutoscaler")
-                items:
-                  type: string
-                type: array
-              emergencyOverride:
-                description: EmergencyOverride allows bypassing all constraints immediately.
-                type: boolean
-              enforcedDisruptionTimeoutSeconds:
-                description: EnforcedDisruptionTimeoutSeconds defines how long to
-                  wait before forcing disruption if blocked by PDBs.
-                format: int32
-                minimum: 0
-                type: integer
-              maxNonDisruptionDurationDays:
-                description: |-
-                  MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
-                  If exceeded, maintenance takes precedence over per-pod run-duration hints.
-                format: int32
-                minimum: 0
-                type: integer
-              minInitialRunDurationDays:
-                description: MinInitialRunDurationDays is the minimum duration a pod
-                  must run before it can be disrupted.
-                format: int32
-                minimum: 0
-                type: integer
+                    type: array
+                  emergencyOverride:
+                    description: EmergencyOverride allows bypassing all constraints
+                      immediately.
+                    type: boolean
+                  graceTerminationDuration:
+                    description: GraceTerminationDuration is the maximum time in seconds
+                      for a pod to terminate gracefully.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  maxNonDisruptionDurationDays:
+                    description: |-
+                      MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
+                      If exceeded, maintenance takes precedence over per-pod run-duration hints.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  minInitialRunDurationDays:
+                    description: MinInitialRunDurationDays is the minimum duration
+                      a pod must run before it can be disrupted.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
               podSelector:
                 description: PodSelector matches the pods that this class applies
                   to.
@@ -281,30 +284,51 @@ spec:
           spec:
             description: spec defines the desired state of WorkloadClassGuardrail
             properties:
-              maxNonDisruptionDurationDaysLimit:
-                description: MaxNonDisruptionDurationDaysLimit is the maximum value
-                  allowed for MaxNonDisruptionDurationDays in WorkloadClass.
-                format: int32
-                minimum: 1
-                type: integer
-              maxWindowDurationMinutes:
-                description: MaxWindowDurationMinutes is the maximum duration any
-                  single window defined in WorkloadClass can have.
-                format: int32
-                minimum: 1
-                type: integer
-              maxWindowsPerWeek:
-                description: MaxWindowsPerWeek is the maximum number of windows defined
-                  in WorkloadClass allowed per week.
-                format: int32
-                minimum: 1
-                type: integer
-              minInitialRunDurationDaysLimit:
-                description: MinInitialRunDurationDaysLimit is the maximum value allowed
-                  for MinInitialRunDurationDays in WorkloadClass.
-                format: int32
-                minimum: 0
-                type: integer
+              constraints:
+                description: Constraints defines the guardrails for WorkloadClasses.
+                properties:
+                  disruption:
+                    description: Disruption defines the constraints within which WorkloadClasses
+                      can set disruption policies.
+                    properties:
+                      allowedDisruptionDays:
+                        description: AllowedDisruptionDays specifies days on which
+                          disruption can happen (Monday-Sunday).
+                        items:
+                          type: string
+                        type: array
+                      emergencyOverride:
+                        description: EmergencyOverride allows bypassing all constraints
+                          immediately.
+                        type: boolean
+                      enforcedDisruptionTimeoutSeconds:
+                        description: EnforcedDisruptionTimeoutSeconds is the maximum
+                          time in seconds before a disruption is forced.
+                        format: int32
+                        maximum: 3600
+                        type: integer
+                      maxAllowedWindows:
+                        description: |-
+                          MaxAllowedWindows sets the limit of how many windows workload owners can set.
+                          This avoid complications where windows are too short or cases where there could be too many disruptions to workloads.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      maxNonDisruptionDurationDays:
+                        description: MaxNonDisruptionDurationDays is the limit for
+                          how long workload owners can go without having an open maintenance
+                          window.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - maxNonDisruptionDurationDays
+                    type: object
+                required:
+                - disruption
+                type: object
+            required:
+            - constraints
             type: object
           status:
             description: status defines the observed state of WorkloadClassGuardrail
@@ -452,6 +476,7 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
   - pods
   verbs:
   - get
@@ -722,6 +747,22 @@ spec:
     app.kubernetes.io/name: workload-class
     control-plane: controller-manager
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: workload-class
+  name: workload-class-webhook-service
+  namespace: workload-class-system
+spec:
+  ports:
+  - port: 443
+    protocol: TCP
+    targetPort: 9443
+  selector:
+    control-plane: controller-manager
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -752,7 +793,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: controller:latest
+        image: ghcr.io/gke-labs/workload-class:latest
         livenessProbe:
           httpGet:
             path: /healthz
@@ -760,7 +801,10 @@ spec:
           initialDelaySeconds: 15
           periodSeconds: 20
         name: manager
-        ports: []
+        ports:
+        - containerPort: 9443
+          name: webhook-server
+          protocol: TCP
         readinessProbe:
           httpGet:
             path: /readyz
@@ -780,11 +824,75 @@ spec:
             drop:
             - ALL
           readOnlyRootFilesystem: true
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /tmp/k8s-webhook-server/serving-certs
+          name: cert
+          readOnly: true
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: workload-class-controller-manager
       terminationGracePeriodSeconds: 10
-      volumes: []
+      volumes:
+      - name: cert
+        secret:
+          defaultMode: 420
+          secretName: webhook-server-cert
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: workload-class
+  name: workload-class-serving-cert
+  namespace: workload-class-system
+spec:
+  dnsNames:
+  - workload-class-webhook-service.workload-class-system.svc
+  - workload-class-webhook-service.workload-class-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: workload-class-selfsigned-issuer
+  secretName: webhook-server-cert
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: workload-class
+  name: workload-class-selfsigned-issuer
+  namespace: workload-class-system
+spec:
+  selfSigned: {}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: workload-class-system/workload-class-serving-cert
+  name: workload-class-validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /validate-disruption
+  failurePolicy: Fail
+  name: vpoddisruption.gke.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - DELETE
+    resources:
+    - pods
+    - pods/eviction
+  sideEffects: None
