@@ -1,23 +1,13 @@
-# workload-class
+# GKE Workload Class Controller
 
 WorkloadClass establishes a high-level control layer, allowing Platform Engineers to define operational guardrails and Workload Owners to simply declare their desired workload outcomes.
 
-## Contributing
-
-This project is licensed under the [Apache 2.0 License](LICENSE).
-
-We welcome contributions! Please see [docs/contributing.md](docs/contributing.md) for more information.
-
-We follow [Google's Open Source Community Guidelines](https://opensource.google.com/conduct/).
+This project implements the GKE Workload Class feature. It allows platform engineers and workload owners to collaborate on managing workload disruptions during maintenance.
 
 ## Disclaimer
 
 This is not an officially supported Google product.
-
 This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.
-# GKE Workload Class Controller
-
-This project implements the GKE Workload Class feature. It allows platform engineers and workload owners to collaborate on managing workload disruptions during maintenance.
 
 ## Description
 The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails. A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration).
@@ -142,16 +132,9 @@ Events:                    <none>
 - Access to a Kubernetes v1.11.3+ cluster.
 - cert-manager version v1.x (required for webhooks).
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+### For Developers: Deploy using Make
 
-```sh
-make docker-build docker-push IMG=<some-registry>/workload-class:tag
-```
-
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+> **NOTE:** Our GitHub Actions workflow automatically builds and pushes the controller image to `ghcr.io/gke-labs/workload-class` on every push to `main`. You only need to build locally if you are testing uncommitted changes.
 
 **Install the CRDs into the cluster:**
 
@@ -159,11 +142,13 @@ Make sure you have the proper permission to the registry if the above commands d
 make install
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+**Deploy the Manager to the cluster using the public image:**
 
 ```sh
-make deploy IMG=<some-registry>/workload-class:tag
+make deploy IMG=ghcr.io/gke-labs/workload-class:latest
 ```
+
+*(If you are testing local code changes, you can optionally build and push your own image first using `make docker-build docker-push IMG=<your-registry>/workload-class:dev` and then deploy with that `IMG`.)*
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
 privileges or be logged in as admin.
@@ -177,7 +162,7 @@ kubectl apply -k config/samples/
 
 >**NOTE**: Ensure that the samples have default values to test it out.
 
-### To Uninstall
+### For Developers: Uninstall using Make
 **Delete the instances (CRs) from the cluster:**
 
 ```sh
@@ -196,7 +181,7 @@ make uninstall
 make undeploy
 ```
 
-## Deploying to GKE with `kubectl` (No `make`)
+## For Users: Deploying to GKE with `kubectl`
 
 This section guides you through creating a GKE cluster and deploying the Workload Class controller and resources using `gcloud` and `kubectl` directly, using our pre-built public container image.
 
@@ -256,9 +241,9 @@ Apply the sample workload class from the samples directory:
 kubectl apply -f ./config/samples/workloads_v1_workloadclass.yaml
 ```
 
-Alternatively, you can apply all samples (including namespace and dummy pod) from `config/sampleskube`:
+Alternatively, you can apply all samples (including namespace and dummy pod) from `config/samples/`:
 ```sh
-kubectl apply -k config/samples
+kubectl apply -k config/samples/
 ```
 
 ## Project Distribution
@@ -267,24 +252,24 @@ Following the options to release and provide this solution to the users.
 
 ### By providing a bundle with all YAML files
 
-1. Build the installer for the image built and published in the registry:
+**1. Build the installer for the image built and published in the registry:**
 
 ```sh
-make build-installer IMG=<some-registry>/workload-class:tag
+make build-installer IMG=ghcr.io/gke-labs/workload-class:latest
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
+**NOTE:** The makefile target mentioned above generates an `install.yaml`
 file in the dist directory. This file contains all the resources built
 with Kustomize, which are necessary to install this project without its
 dependencies.
 
-2. Using the installer
+**2. Using the installer**
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
+Users can just run `kubectl apply -f <URL for YAML BUNDLE>` to install
 the project, i.e.:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/workload-class/<tag or branch>/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/gke-labs/workload-class/main/dist/install.yaml
 ```
 
 ### By providing a Helm Chart
@@ -306,25 +291,13 @@ previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml
 is manually re-applied afterwards.
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
 
-**NOTE:** Run `make help` for more information on all potential `make` targets
+We welcome contributions! Please see [docs/contributing.md](docs/contributing.md) for more information.
+We follow [Google's Open Source Community Guidelines](https://opensource.google.com/conduct/).
 
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+**NOTE:** Run `make help` for more information on all potential `make` targets. More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html).
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+This project is licensed under the [Apache 2.0 License](LICENSE).
 
