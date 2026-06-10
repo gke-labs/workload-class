@@ -67,10 +67,12 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply Namespace")
 
-		By("Applying the WorkloadClassGuardrail sample")
-		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClassGuardrail")
+		By("Applying the WorkloadClassGuardrail sample (retrying until webhook is ready)")
+		Eventually(func() error {
+			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
+			_, err = utils.Run(cmd)
+			return err
+		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Failed to apply WorkloadClassGuardrail")
 
 		By("Applying the WorkloadClass sample")
 		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
