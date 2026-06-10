@@ -35,10 +35,12 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/controller"
 	internalwebhook "github.com/gke-labs/workload-class/internal/webhook"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	webhookv1 "github.com/gke-labs/workload-class/internal/webhook/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -200,11 +202,13 @@ func main() {
 		Handler: &internalwebhook.DisruptionWebhook{Client: mgr.GetClient()},
 	})
 
-	setupLog.Info("Registering guardrail webhook")
-	mgr.GetWebhookServer().Register("/validate-workloadclassguardrail", &admission.Webhook{
-		Handler: &internalwebhook.GuardrailWebhook{Client: mgr.GetClient()},
-	})
-
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1.SetupWorkloadClassGuardrailWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "WorkloadClassGuardrail")
+			os.Exit(1)
+		}
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
