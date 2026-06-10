@@ -196,6 +196,98 @@ make uninstall
 make undeploy
 ```
 
+## Deploying to GKE with `kubectl` (No `make`)
+
+This section guides you through creating a GKE cluster and deploying the Workload Class controller and resources using `gcloud` and `kubectl` directly.
+
+### 1. Create a GKE Cluster
+
+You can use either GKE Autopilot (recommended) or GKE Standard.
+
+**Option A: GKE Autopilot (Recommended)**
+```sh
+gcloud container clusters create-auto workload-class-demo \
+    --region us-central1 \
+    --project YOUR_PROJECT_ID
+```
+
+**Option B: GKE Standard**
+```sh
+gcloud container clusters create workload-class-demo \
+    --zone us-central1-a \
+    --num-nodes 3 \
+    --project YOUR_PROJECT_ID
+```
+
+After creation, ensure your `kubectl` is configured to connect to the cluster:
+```sh
+gcloud container clusters get-credentials workload-class-demo \
+    --zone us-central1-a \
+    --project YOUR_PROJECT_ID
+```
+*(Note: Adjust the region/zone and project ID as necessary.)*
+
+### 2. Build and Push the Controller Image
+
+If you are developing changes, you need to build and push the controller image to your registry:
+
+```sh
+# Define your image registry and tag
+export IMG=<some-registry>/workload-class:tag
+
+# Build the image
+docker build -t $IMG .
+
+# Push the image
+docker push $IMG
+```
+
+### 3. Deploy the Controller
+
+Deploy the controller using `kubectl` with built-in Kustomize support.
+
+**Step 3.1: Update the image configuration**
+Before deploying, you need to tell Kustomize to use your image. Edit `config/manager/kustomization.yaml` to set `newName` and `newTag` to match your image:
+
+```yaml
+images:
+- name: controller
+  newName: <some-registry>/workload-class
+  newTag: <tag>
+```
+
+**Step 3.2: Apply the manifests**
+Apply the configuration to your cluster:
+
+```sh
+kubectl apply -k config/default
+```
+
+*Alternatively, if you don't want to edit the file, you can apply the default and then use `kubectl set image`:*
+```sh
+kubectl apply -k config/default
+kubectl set image deployment/workload-class-controller-manager -n workload-class-system manager=$IMG
+```
+
+### 4. Create the Guardrail and Workload Class
+
+Once the controller is running, you can create the guardrail and workload class resources.
+
+Apply the sample guardrail from the root directory:
+```sh
+kubectl apply -f guardrail.yaml
+```
+
+Apply the sample workload class from the root directory:
+```sh
+kubectl apply -f workloadclass.yaml
+```
+
+Alternatively, you can apply all samples (including namespace and dummy pod) from `config/samples/`:
+```sh
+kubectl apply -k config/samples/
+```
+
 ## Project Distribution
 
 Following the options to release and provide this solution to the users.
