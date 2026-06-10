@@ -116,8 +116,8 @@ func (v *WorkloadClassGuardrailCustomValidator) violatesGuardrail(wc *workloadsv
 
 	if len(allowedDisruptionDays) > 0 {
 		for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
-			if utils.IsSubset(dw.DaysOfWeek, allowedDisruptionDays) {
-				violations = append(violations, fmt.Sprintf("guardrail limits allowed disruption days to %v, but but existing WorkloadClass '%s' requires %v", allowedDisruptionDays, wc.Name, dw.DaysOfWeek))
+			if !utils.IsSubset(dw.DaysOfWeek, allowedDisruptionDays) {
+				violations = append(violations, fmt.Sprintf("guardrail limits disruption days to %v, but but existing WorkloadClass '%s' requires %v", allowedDisruptionDays, wc.Name, dw.DaysOfWeek))
 			}
 		}
 	}
