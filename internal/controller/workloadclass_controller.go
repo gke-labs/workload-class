@@ -28,7 +28,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
@@ -215,7 +217,7 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		if !allowedDisruptionDaysValid(dw.DaysOfWeek, allowedDisruptionDays) {
 			violations = append(violations, fmt.Sprintf("disruption window %s contains day(s) of week that are not allowed by guardrail. Found DaysOfWeek: %v, guardrail AllowedDisruptionDays: %v", dw.Name, dw.DaysOfWeek, allowedDisruptionDays))
 		}
-		if !timeZoneValid(dw.TimeZone) {
+		if !utils.TimeZoneValid(dw.TimeZone) {
 			violations = append(violations, fmt.Sprintf("disruption window %s has invalid time zone %s", dw.Name, dw.TimeZone))
 		}
 	}
@@ -235,9 +237,30 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
-		Owns(&workloadsv1.WorkloadClassGuardrail{}). // Re-trigger validation if guardrails change
+		Watches(
+			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
+		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassesToReconcile(ctx context.Context, guardrail client.Object) []reconcile.Request {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(workloadClasses.Items))
+	for i, item := range workloadClasses.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      item.GetName(),
+				Namespace: item.GetNamespace(),
+			},
+		}
+	}
+	return requests
 }
 
 func condition(violations []string) metav1.Condition {
@@ -292,32 +315,8 @@ func allowedDisruptionDaysValid(wcAllowedDisruptionDays []string, guardrail [][]
 
 	valid := true
 	for _, days := range guardrail {
-		valid = valid && isSubset(wcAllowedDisruptionDays, days)
+		valid = valid && utils.IsSubset(wcAllowedDisruptionDays, days)
 	}
 
 	return valid
-}
-
-func timeZoneValid(timeZone string) bool {
-	_, err := time.LoadLocation(timeZone)
-	return err == nil
-}
-
-func isSubset(subset, superset []string) bool {
-	if len(subset) == 0 {
-		return true
-	}
-
-	supersetMap := make(map[string]struct{}, len(superset))
-	for _, d := range superset {
-		supersetMap[d] = struct{}{}
-	}
-
-	for _, d := range subset {
-		if _, found := supersetMap[d]; !found {
-			return false
-		}
-	}
-
-	return true
 }

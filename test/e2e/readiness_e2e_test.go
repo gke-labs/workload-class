@@ -59,10 +59,12 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply Namespace")
 
-		By("Applying the WorkloadClassGuardrail sample")
-		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClassGuardrail")
+		By("Applying the WorkloadClassGuardrail sample (retrying until webhook is ready)")
+		Eventually(func() error {
+			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
+			_, err = utils.Run(cmd)
+			return err
+		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Failed to apply WorkloadClassGuardrail")
 
 		By("Applying the WorkloadClass sample")
 		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
@@ -150,17 +152,18 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 			By("Updating the WorkloadClass to simulate being within a disruption window")
 			currentDay := time.Now().UTC().Weekday().String()
 
-			By("Patching the Guardrail to allow today")
-			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, currentDay)
-			cmd := exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", patchGR)
+			By("Patching the WorkloadClass to be within the disruption window and zero out MinInitialRunDurationDays")
+			patchWC := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, currentDay)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patchWC)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Patching the WorkloadClass to be within the disruption window and zero out MinInitialRunDurationDays")
-			patchWC := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, currentDay)
-			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patchWC)
+			By("Patching the Guardrail to allow today")
+			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, currentDay)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", patchGR)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
 			By("Verifying the Guardrail controller reconciles the WorkloadClass and updates its status")
 			verifyMaintenanceReadiness := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample", "-o", "jsonpath={.status.maintenanceReadiness}")
@@ -176,11 +179,11 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, notToday)
 			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
 
-			cmd := exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
