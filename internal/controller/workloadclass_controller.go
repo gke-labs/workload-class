@@ -28,7 +28,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
@@ -235,9 +237,30 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
-		Owns(&workloadsv1.WorkloadClassGuardrail{}). // Re-trigger validation if guardrails change
+		Watches(
+			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
+		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassesToReconcile(ctx context.Context, guardrail client.Object) []reconcile.Request {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(workloadClasses.Items))
+	for i, item := range workloadClasses.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      item.GetName(),
+				Namespace: item.GetNamespace(),
+			},
+		}
+	}
+	return requests
 }
 
 func condition(violations []string) metav1.Condition {
