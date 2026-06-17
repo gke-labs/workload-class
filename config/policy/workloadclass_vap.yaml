@@ -1,0 +1,41 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: workload-class-guardrail-parameterized
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: workloads.gke.io/v1
+    kind: WorkloadClassGuardrail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["workloads.gke.io"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["workloadclasses"]
+  validations:
+    - expression: >-
+        !has(object.spec.disruptionPolicy) ||
+        !has(object.spec.disruptionPolicy.maxNonDisruptionDurationDays) ||
+        (object.spec.disruptionPolicy.maxNonDisruptionDurationDays <= params.spec.constraints.disruption.maxNonDisruptionDurationDays)
+      messageExpression: >-
+        'maxNonDisruptionDurationDays exceeds guardrail limit of ' + string(params.spec.constraints.disruption.maxNonDisruptionDurationDays)
+
+    - expression: >-
+        !has(object.spec.disruptionPolicy) ||
+        !has(object.spec.disruptionPolicy.allowedDisruptionWindows) ||
+        !has(params.spec.constraints.disruption.maxAllowedWindows) ||
+        (size(object.spec.disruptionPolicy.allowedDisruptionWindows) <= params.spec.constraints.disruption.maxAllowedWindows)
+      messageExpression: >-
+        'Allowed disruption windows count exceeds guardrail limit of ' + string(params.spec.constraints.disruption.maxAllowedWindows)
+
+    - expression: >-
+        !has(object.spec.disruptionPolicy) ||
+        !has(object.spec.disruptionPolicy.allowedDisruptionWindows) ||
+        !has(params.spec.constraints.disruption.allowedDisruptionDays) ||
+        size(params.spec.constraints.disruption.allowedDisruptionDays) == 0 ||
+        object.spec.disruptionPolicy.allowedDisruptionWindows.all(w,
+          !has(w.daysOfWeek) ||
+          w.daysOfWeek.all(d, d in params.spec.constraints.disruption.allowedDisruptionDays)
+        )
+      message: "Disruption windows contain days not allowed by the guardrail"

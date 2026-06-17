@@ -1,0 +1,3 @@
+resources:
+- workloadclass_vap.yaml
+- workloadclass_vap_binding.yaml

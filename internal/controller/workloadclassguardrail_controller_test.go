@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -113,32 +112,9 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 
 			invalidDays := []string{"Christmas", "Eid", "Birthday"}
 			g.Spec.Constraints.Disruption.AllowedDisruptionDays = invalidDays
-			Expect(k8sClient.Update(ctx, g)).To(Succeed())
-
-			By("reconiling")
-			controllerReconciler := &WorkloadClassGuardrailReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("checking the status for violations")
-			updatedGuardrail := &workloadsv1.WorkloadClassGuardrail{}
-			Eventually(func() bool {
-				Expect(k8sClient.Get(ctx, typeNamespacedName, updatedGuardrail)).To(Succeed())
-				for _, cond := range updatedGuardrail.Status.Conditions {
-					if cond.Type == workloadsv1.ConditionTypeValidated {
-						return cond.Status == metav1.ConditionFalse &&
-							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "allowedDisruptionDays contains invalid days, valid days are")
-					}
-				}
-				return false
-			}, "10s", "1s").Should(BeTrue())
+			err := k8sClient.Update(ctx, g)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("Unsupported value"))
 		})
 	})
 })
