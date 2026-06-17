@@ -16,7 +16,8 @@ limitations under the License.
 
 package utils
 
-// IsSubset returns true if `subset` is a subset of `superset`.
+// IsSubset checks if all elements in the `subset` slice are present in the `superset` slice.
+// It treats the slices as mathematical sets, ignoring the order and duplicate values.
 func IsSubset(subset, superset []string) bool {
 	if len(subset) == 0 {
 		return true
