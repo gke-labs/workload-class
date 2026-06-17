@@ -67,10 +67,12 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply Namespace")
 
-		By("Applying the WorkloadClassGuardrail sample")
-		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClassGuardrail")
+		By("Applying the WorkloadClassGuardrail sample (retrying until webhook is ready)")
+		Eventually(func() error {
+			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
+			_, err = utils.Run(cmd)
+			return err
+		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Failed to apply WorkloadClassGuardrail")
 
 		By("Applying the WorkloadClass sample")
 		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
@@ -176,15 +178,15 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		It("should allow eviction of a pod because it is within the disruption window", func() {
 			currentDay := time.Now().UTC().Weekday().String()
 
-			By("Patching the Guardrail to allow today")
-			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, currentDay)
-			cmd := exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", patchGR)
+			By("Patching the WorkloadClass to be within the disruption window and zero out MinInitialRunDurationDays")
+			patchWC := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, currentDay)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patchWC)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Patching the WorkloadClass to be within the disruption window and zero out MinInitialRunDurationDays")
-			patchWC := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, currentDay)
-			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patchWC)
+			By("Patching the Guardrail to allow today")
+			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, currentDay)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", patchGR)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -205,17 +207,17 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		})
 
 		It("should deny eviction of a pod because it is outside of the window", func() {
-			notToday := time.Now().AddDate(0, 0, 1).Weekday().String()
+			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
 
-			By("Patching the Guardrail to allow tomorrow")
-			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, notToday)
-			cmd := exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
+			By("Patching the WorkloadClass to simulate being outside a disruption window")
+			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"maxNonDisruptionDurationDays": 10, "minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Patching the WorkloadClass to simulate being outside a disruption window")
-			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
-			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
+			By("Patching the Guardrail to allow tomorrow")
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
