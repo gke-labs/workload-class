@@ -262,6 +262,9 @@ func (r *WorkloadClassReconciler) validateSelectors(ctx context.Context, wc *wor
 
 	var matches []workloadsv1.WorkloadClass
 	for _, ewc := range workloadClasses.Items {
+		if ewc.Name == wc.Name {
+			continue
+		}
 		if sameLabelSelectorSemantic(wc.Spec.PodSelector, ewc.Spec.PodSelector) {
 			matches = append(matches, ewc)
 		}
