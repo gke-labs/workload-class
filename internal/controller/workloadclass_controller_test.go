@@ -25,12 +25,16 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
@@ -68,8 +72,19 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Name:      guardrailName,
 			Namespace: "", // Explicitly empty for cluster-scoped
 		}
+		var (
+			controllerReconciler *WorkloadClassReconciler
+			fakeRecorder         *events.FakeRecorder
+		)
 
 		BeforeEach(func() {
+			fakeRecorder = events.NewFakeRecorder(100)
+			controllerReconciler = &WorkloadClassReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: fakeRecorder,
+			}
+
 			By("Creating the custom resource for the Kind WorkloadClass")
 			workloadclass := &workloadsv1.WorkloadClass{}
 			err := k8sClient.Get(ctx, typeNamespacedName, workloadclass)
@@ -143,10 +158,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -165,10 +176,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -202,10 +209,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -239,10 +242,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -278,10 +277,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -364,10 +359,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -404,10 +395,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -439,10 +426,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -475,10 +458,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -510,10 +489,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -528,6 +503,46 @@ var _ = Describe("WorkloadClass Controller", func() {
 				}
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessReady
 			}, "30s", "1s").Should(BeTrue())
+		})
+
+		It("should emit warning when another WorkloadClass has the same selector", func() {
+			By("Creating another WorkloadClass with the same selector")
+			wcSameName := "wc-same-selector"
+			wcSame := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wcSameName,
+					Namespace: defaultNamespace,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"duck-duck": "goose"},
+					},
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 1,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wcSame)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, wcSame)
+			}()
+
+			By("Updating the first WorkloadClass to match the selector")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{
+				MatchLabels: map[string]string{"duck-duck": "goose"},
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling the first WorkloadClass")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying a warning event was emitted")
+			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring("ValidationFailed")))
 		})
 	})
 })
@@ -762,6 +777,182 @@ func TestEvaluatePodGracePeriod(t *testing.T) {
 
 			if gotDuration != tc.wantDuration {
 				t.Errorf("evaluatePodGracePeriod() returned an unexpected duration, got: %v, want: %v", gotDuration, tc.wantDuration)
+			}
+		})
+	}
+}
+
+func TestSameLabelSelectorSemantic(t *testing.T) {
+	testCases := []struct {
+		name string
+		a    *metav1.LabelSelector
+		b    *metav1.LabelSelector
+		want bool
+	}{
+		{
+			name: "both_nil",
+			a:    nil,
+			b:    nil,
+			want: true,
+		},
+		{
+			name: "one_nil",
+			a:    &metav1.LabelSelector{},
+			b:    nil,
+			want: false,
+		},
+		{
+			name: "same_match_labels",
+			a:    &metav1.LabelSelector{MatchLabels: map[string]string{"foo": "bar", "baz": "qux"}},
+			b:    &metav1.LabelSelector{MatchLabels: map[string]string{"baz": "qux", "foo": "bar"}},
+			want: true,
+		},
+		{
+			name: "different_match_labels",
+			a:    &metav1.LabelSelector{MatchLabels: map[string]string{"foo": "bar"}},
+			b:    &metav1.LabelSelector{MatchLabels: map[string]string{"foo": "baz"}},
+			want: false,
+		},
+		{
+			name: "same_expressions_different_order",
+			a: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"bar", "baz"}},
+					{Key: "qux", Operator: metav1.LabelSelectorOpExists},
+				},
+			},
+			b: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "qux", Operator: metav1.LabelSelectorOpExists},
+					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"bar", "baz"}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "same_expressions_different_values_order",
+			a: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"bar", "baz"}},
+				},
+			},
+			b: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"baz", "bar"}},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameLabelSelectorSemantic(tc.a, tc.b); got != tc.want {
+				t.Errorf("sameLabelSelectorSemantic() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateSelectors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+	ns := "test-namespace"
+	wcCurrent := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-current",
+			Namespace:         ns,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "nginx"},
+			},
+		},
+	}
+	testCases := []struct {
+		name          string
+		existing      []client.Object
+		wantErrSuffix string
+	}{
+		{
+			name:          "no_other_workload_classes",
+			existing:      []client.Object{wcCurrent},
+			wantErrSuffix: "",
+		},
+		{
+			name: "other_different_selector",
+			existing: []client.Object{
+				wcCurrent,
+				&workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "wc-different",
+						Namespace: ns,
+					},
+					Spec: workloadsv1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"app": "redis"},
+						},
+					},
+				},
+			},
+			wantErrSuffix: "",
+		},
+		{
+			name: "other_same_selector",
+			existing: []client.Object{
+				wcCurrent,
+				&workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "wc-same",
+						Namespace: ns,
+					},
+					Spec: workloadsv1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"app": "nginx"},
+						},
+					},
+				},
+			},
+			wantErrSuffix: "the following WorkloadClasses have the same PodSelector as wc-current: wc-same",
+		},
+		{
+			name: "same_selector_different_namespace",
+			existing: []client.Object{
+				wcCurrent,
+				&workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "wc-same-other-ns",
+						Namespace: "another-namespace",
+					},
+					Spec: workloadsv1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"app": "nginx"},
+						},
+					},
+				},
+			},
+			wantErrSuffix: "",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.existing...).Build()
+			r := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+			err := r.validateSelectors(context.Background(), wcCurrent)
+			if tc.wantErrSuffix == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSuffix) {
+					t.Fatalf("expected error containing suffix %q, got: %v", tc.wantErrSuffix, err)
+				}
 			}
 		})
 	}

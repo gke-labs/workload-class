@@ -183,8 +183,9 @@ func main() {
 	}
 
 	if err := (&controller.WorkloadClassReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("workloadclass-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadClass")
 		os.Exit(1)
@@ -199,7 +200,10 @@ func main() {
 
 	setupLog.Info("Registering disruption webhook")
 	mgr.GetWebhookServer().Register("/validate-disruption", &admission.Webhook{
-		Handler: &internalwebhook.DisruptionWebhook{Client: mgr.GetClient()},
+		Handler: &internalwebhook.DisruptionWebhook{
+			Client:   mgr.GetClient(),
+			Recorder: mgr.GetEventRecorder("disruption-webhoook"),
+		},
 	})
 
 	// nolint:goconst

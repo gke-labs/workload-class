@@ -28,6 +28,7 @@ import (
 	v1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -138,65 +139,65 @@ func TestUpdateBestMatch(t *testing.T) {
 		wc           *workloadsv1.WorkloadClass
 		bm           *workloadsv1.WorkloadClass
 		maxSpec      int
-		otherMatches []string
+		otherMatches map[string]int
 
 		wantBM           *workloadsv1.WorkloadClass
 		wantMaxSpec      int
-		wantOtherMatches []string
+		wantOtherMatches map[string]int
 	}{
 		{
 			name:             "nil_best_match_update_to_new_best_match",
 			desc:             "No WC has been selected yet, update the best match",
 			wc:               wc1,
-			otherMatches:     []string{},
+			otherMatches:     map[string]int{},
 			maxSpec:          -1,
 			wantBM:           wc1,
 			wantMaxSpec:      1,
-			wantOtherMatches: []string{},
+			wantOtherMatches: map[string]int{},
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_>_N_update_to_new_best_match",
 			desc:             "A match has already been selected, the current WC being processed has a higher specificity, update best match",
 			wc:               wc2,
 			bm:               wc1,
-			otherMatches:     []string{},
+			otherMatches:     map[string]int{},
 			maxSpec:          1,
 			wantBM:           wc2,
 			wantMaxSpec:      2,
-			wantOtherMatches: []string{"namespace/wc1"},
+			wantOtherMatches: map[string]int{"namespace/wc1": 1},
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_==_N_wc_is_older_update_to_new_best_match",
 			desc:             "A match has already been selected, the current WC being processed has the same specificity but is older, update best match",
 			wc:               wc22,
 			bm:               wc2,
-			otherMatches:     []string{},
+			otherMatches:     map[string]int{},
 			maxSpec:          2,
 			wantBM:           wc22,
 			wantMaxSpec:      2,
-			wantOtherMatches: []string{"namespace/wc2"},
+			wantOtherMatches: map[string]int{"namespace/wc2": 2},
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_==_N_wc_is_not_older_no_update",
 			desc:             "A match has already been selected, the current WC being processed has the same specificity but is newer, no update to best match",
 			wc:               wc22,
 			bm:               wc2,
-			otherMatches:     []string{},
+			otherMatches:     map[string]int{},
 			maxSpec:          2,
 			wantBM:           wc22,
 			wantMaxSpec:      2,
-			wantOtherMatches: []string{"namespace/wc2"},
+			wantOtherMatches: map[string]int{"namespace/wc2": 2},
 		},
 		{
 			name:             "not_nil_best_match_N_specificty_spec_<_N_no_update",
 			desc:             "A match has already been selected, the current WC being processed has a lower specificity, no update to best match",
 			wc:               wc1,
 			bm:               wc2,
-			otherMatches:     []string{},
+			otherMatches:     map[string]int{},
 			maxSpec:          2,
 			wantBM:           wc2,
 			wantMaxSpec:      2,
-			wantOtherMatches: []string{"namespace/wc1"},
+			wantOtherMatches: map[string]int{"namespace/wc1": 1},
 		},
 	}
 
@@ -209,7 +210,7 @@ func TestUpdateBestMatch(t *testing.T) {
 			if tc.maxSpec != tc.wantMaxSpec {
 				t.Errorf("updateBestMatch() did not update maxSpecificity as expected, got: %d, want %d", tc.maxSpec, tc.wantMaxSpec)
 			}
-			if !stringSlicesEqualUnordered(gotOtherMatches, tc.wantOtherMatches) {
+			if !mapsEqual(gotOtherMatches, tc.wantOtherMatches) {
 				t.Errorf("updateBestMatch() did not update otherMatches as expected, got: %v, want: %v", tc.otherMatches, tc.wantOtherMatches)
 			}
 		})
@@ -668,22 +669,88 @@ func TestHandle(t *testing.T) {
 	}
 }
 
-func stringSlicesEqualUnordered(s1, s2 []string) bool {
-	if len(s1) != len(s2) {
+func TestBestMatchWorkloadClass_EmitEvent(t *testing.T) {
+	const namespace = "namespace"
+	wc1 := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc1",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"labelA": "valueA",
+				},
+			},
+		},
+	}
+	wc2 := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc2",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"labelA": "valueA",
+				},
+			},
+		},
+	}
+	pod := &corev1.Pod{}
+	pod.Name = "my-pod"
+	pod.Namespace = namespace
+	pod.Labels = map[string]string{"labelA": "valueA"}
+	listWCResult := &workloadsv1.WorkloadClassList{
+		Items: []workloadsv1.WorkloadClass{wc1, wc2},
+	}
+
+	ctx := t.Context()
+	req := admission.Request{}
+	req.Name = "name"
+	req.Namespace = namespace
+	req.UserInfo.Username = "test-user"
+
+	testClient := createClient(nil, nil, nil, nil, nil, &wc1, listWCResult, nil)
+	// Create fake event recorder
+	fakeRecorder := events.NewFakeRecorder(10)
+	v := &DisruptionWebhook{
+		Client:   testClient,
+		Recorder: fakeRecorder,
+	}
+
+	t.Run("validate_event_emitted", func(t *testing.T) {
+		gotBestMatch, err := v.bestMatchWorkloadClass(ctx, req, pod)
+		if err != nil {
+			t.Fatalf("bestMatchWorkloadClass returned unexpected error: %v", err)
+		}
+		if gotBestMatch.Name != "wc1" {
+			t.Errorf("Expected wc1 to be best match, got: %s", gotBestMatch.Name)
+		}
+		// Verify that the event was emitted
+		select {
+		case event := <-fakeRecorder.Events:
+			expected := "Warning AmbiguousMatch the following WorkloadClasses match pods with the same specificity as the best match, but were not selected: namespace/wc2"
+			if event != expected {
+				t.Errorf("Expected event: %q, got: %q", expected, event)
+			}
+		default:
+			t.Error("Expected AmbiguousMatch event to be emitted, but none was found")
+		}
+	})
+}
+
+func mapsEqual(m1, m2 map[string]int) bool {
+	if len(m1) != len(m2) {
 		return false
 	}
 
-	counts := make(map[string]int)
-	for _, s := range s1 {
-		counts[s]++
-	}
-
-	for _, s := range s2 {
-		if counts[s] == 0 {
-			// Either s is not in s1, or we've seen it more times in s2
+	for k, val1 := range m1 {
+		if val2, ok := m2[k]; !ok || val1 != val2 {
 			return false
 		}
-		counts[s]--
 	}
 
 	return true

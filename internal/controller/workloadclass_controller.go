@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -39,7 +40,8 @@ import (
 // WorkloadClassReconciler reconciles a WorkloadClass object
 type WorkloadClassReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -71,6 +73,21 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		log.Error(err, "Failed to update Status conditions")
 		return ctrl.Result{}, err
+	}
+
+	// 2. Check if other existing WorkloadClasses have the same PodSelector
+	err = r.validateSelectors(ctx, wc)
+	if err != nil {
+		// Emit a warning event
+		r.Recorder.Eventf(
+			wc,
+			nil,
+			corev1.EventTypeWarning,
+			"ValidationFailed",
+			"SelectorValidation",
+			"%s",
+			err.Error(),
+		)
 	}
 
 	// 2. Calculate Readiness
@@ -231,6 +248,67 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 	}
 
 	return condition(violations), nil
+}
+
+// validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.
+// If another workloadclass has the exact same PodSelector, an error is returned to be emitted as a warning.
+// If two workloadclasses match a Pod with the same specificity, the oldest workloadclass takes precedence.
+func (r *WorkloadClassReconciler) validateSelectors(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
+		return fmt.Errorf("failed to fetch workloadclasses: %w", err)
+	}
+
+	if len(workloadClasses.Items) == 0 {
+		return nil
+	}
+
+	var matches []workloadsv1.WorkloadClass
+	for _, ewc := range workloadClasses.Items {
+		if ewc.Name == wc.Name {
+			continue
+		}
+		if sameLabelSelectorSemantic(wc.Spec.PodSelector, ewc.Spec.PodSelector) {
+			matches = append(matches, ewc)
+		}
+	}
+
+	return formatError(wc, matches)
+}
+
+func formatError(wc *workloadsv1.WorkloadClass, matches []workloadsv1.WorkloadClass) error {
+	if len(matches) == 0 {
+		return nil
+	}
+
+	oldest := wc
+	var matchNames []string
+	for _, m := range matches {
+		matchNames = append(matchNames, m.Name)
+		if m.CreationTimestamp.Before(&oldest.CreationTimestamp) {
+			oldest = &m
+		}
+	}
+
+	return fmt.Errorf("the following WorkloadClasses have the same PodSelector as %s: %s", wc.Name, strings.Join(matchNames, ", "))
+}
+
+// sameLabelSelectorSemantic returns true if the two label selectors select the
+// same resources, regardless of the order of rules/expressions.
+func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	selA, errA := metav1.LabelSelectorAsSelector(a)
+	selB, errB := metav1.LabelSelectorAsSelector(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	// .String() returns a sorted, deterministic representation of the selector rules.
+	return selA.String() == selB.String()
 }
 
 // SetupWithManager sets up the controller with the Manager.
