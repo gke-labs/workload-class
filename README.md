@@ -10,7 +10,7 @@ This is not an officially supported Google product.
 This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.
 
 ## Description
-The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails. A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration).
+The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails. It also detects and warns if multiple WorkloadClasses in the same namespace share the same PodSelector. A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration).
 
 ## Example Usage
 
@@ -120,6 +120,27 @@ Status:
     Type:                  Validated
   Maintenance Readiness:   NotReady
 Events:                    <none>
+```
+
+**C. Testing Selector Conflict Validation**
+
+If you create multiple `WorkloadClass` resources with the same `podSelector` in the same namespace, the controller will detect the conflict and emit a warning Event:
+
+```sh
+# Apply a duplicate WorkloadClass in the same namespace with the same selector
+kubectl apply -f config/samples/workloads_v1_workloadclass_duplicate.yaml
+```
+
+*Expected Events:*
+```sh
+# Describe the duplicate WorkloadClass
+kubectl describe workloadclass critical-batch-duplicate -n sample
+```
+```
+Events:
+  Type     Reason            Age   From                       Message
+  ----     ------            ----  ----                       -------
+  Warning  ValidationFailed  10s   workloadclass-controller   the following WorkloadClasses have the same PodSelector as critical-batch-duplicate: critical-batch
 ```
 
 
