@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -41,7 +41,7 @@ import (
 type WorkloadClassReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -79,10 +79,13 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	err = r.validateSelectors(ctx, wc)
 	if err != nil {
 		// Emit a warning event
-		r.Recorder.Event(
+		r.Recorder.Eventf(
 			wc,
+			nil,
 			corev1.EventTypeWarning,
 			"ValidationFailed",
+			"SelectorValidation",
+			"%s",
 			err.Error(),
 		)
 	}

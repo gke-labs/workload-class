@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -74,11 +74,11 @@ var _ = Describe("WorkloadClass Controller", func() {
 		}
 		var (
 			controllerReconciler *WorkloadClassReconciler
-			fakeRecorder         *record.FakeRecorder
+			fakeRecorder         *events.FakeRecorder
 		)
 
 		BeforeEach(func() {
-			fakeRecorder = record.NewFakeRecorder(100)
+			fakeRecorder = events.NewFakeRecorder(100)
 			controllerReconciler = &WorkloadClassReconciler{
 				Client:   k8sClient,
 				Scheme:   k8sClient.Scheme(),

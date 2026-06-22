@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -36,8 +37,9 @@ import (
 
 // DisruptionWebhook handles Pod eviction requests.
 type DisruptionWebhook struct {
-	Client  client.Client
-	decoder *admission.Decoder
+	Client   client.Client
+	decoder  *admission.Decoder
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods;pods/eviction,verbs=create;delete,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
@@ -128,14 +130,13 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 // returns the default WorkloadClass for the Pod's namespace, if one is defined.
 // If no specific or default WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
-	log := logf.FromContext(ctx).WithValues("name", req.Name, "namespace", req.Namespace, "user", req.UserInfo.Username)
 	wcs := &workloadsv1.WorkloadClassList{}
 	if err := v.Client.List(ctx, wcs); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
 	}
 
 	// Keep track of all other matches to emit a warning message
-	var otherMatches []string
+	otherMatches := map[string]int{}
 	maxSpecificity := -1
 
 	for _, wc := range wcs.Items {
@@ -152,25 +153,54 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admi
 	bestMatch = v.namespaceDefaultWorkloadClass(ctx, pod, bestMatch)
 
 	// Emit warning message for WorkloadClasses that matched, but are ignored
-	if len(otherMatches) != 0 {
-		log.Info(fmt.Sprintf("Multiple WorkloadClasses matched Pod %s/%s, but were not the best match: %v", pod.Namespace, pod.Name, otherMatches))
-	}
+	v.emitWarning(ctx, req, pod, bestMatch, otherMatches, maxSpecificity)
 
 	return bestMatch, nil
 }
 
-func updateBestMatch(wc, bestMatch *workloadsv1.WorkloadClass, maxSpecificity *int, otherMatches []string) (*workloadsv1.WorkloadClass, []string) {
+func (v *DisruptionWebhook) emitWarning(ctx context.Context, req admission.Request, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass, matches map[string]int, maxSpecificity int) {
+	if len(matches) == 0 {
+		return
+	}
+
+	log := logf.FromContext(ctx).WithValues("name", req.Name, "namespace", req.Namespace, "user", req.UserInfo.Username)
+	log.Info(fmt.Sprintf("Multiple WorkloadClasses matched Pod %s/%s, but were not the best match: %v", pod.Namespace, pod.Name, matches))
+
+	var matchesWithMaxSpecificity []string
+	for m, s := range matches {
+		if s == maxSpecificity {
+			matchesWithMaxSpecificity = append(matchesWithMaxSpecificity, m)
+		}
+	}
+
+	// Emit a warning specifically for those with max specificity that were not selected
+	if len(matchesWithMaxSpecificity) != 0 {
+		warning := fmt.Sprintf("the following WorkloadClasses match pods with the same specificity as the best match, but were not selected: %s", strings.Join(matchesWithMaxSpecificity, ", "))
+		// Emit a warning event
+		v.Recorder.Eventf(
+			bestMatch,
+			nil,
+			corev1.EventTypeWarning,
+			"AmbiguousMatch",
+			"SelectWorkloadClass",
+			"%s",
+			warning,
+		)
+	}
+}
+
+func updateBestMatch(wc, bestMatch *workloadsv1.WorkloadClass, maxSpecificity *int, otherMatches map[string]int) (*workloadsv1.WorkloadClass, map[string]int) {
 	spec := getSpecificity(wc.Spec.PodSelector)
 	equalSpecOlderWC := spec == *maxSpecificity && wc.CreationTimestamp.Before(&bestMatch.CreationTimestamp)
 	if spec > *maxSpecificity || equalSpecOlderWC {
-		*maxSpecificity = spec
 		if bestMatch != nil {
-			otherMatches = append(otherMatches, fmt.Sprintf("%s/%s", bestMatch.Namespace, bestMatch.Name))
+			otherMatches[fmt.Sprintf("%s/%s", bestMatch.Namespace, bestMatch.Name)] = *maxSpecificity
 		}
+		*maxSpecificity = spec
 		return wc, otherMatches
 	}
 	// This WC still matched the Pod, track it for logging
-	otherMatches = append(otherMatches, fmt.Sprintf("%s/%s", wc.Namespace, wc.Name))
+	otherMatches[fmt.Sprintf("%s/%s", wc.Namespace, wc.Name)] = spec
 	return bestMatch, otherMatches
 }
 
