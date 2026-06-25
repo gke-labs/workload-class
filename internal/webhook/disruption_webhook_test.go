@@ -776,7 +776,7 @@ func TestMatchesIdentity(t *testing.T) {
 		{
 			name:        "invalid_identity_not_allowed",
 			allowedUser: ClusterAutoscaler,
-			username:    "system:service-account:kube-system:sam",
+			username:    "system:service-account:kube-system:vpa-updater",
 			want:        false,
 		},
 	}

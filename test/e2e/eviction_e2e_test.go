@@ -67,6 +67,23 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply Namespace")
 
+		By("Creating RBAC bindings for impersonated test users")
+		// Grant cluster-admin to the correct service account so it passes API server authorization
+		cmd = exec.Command("kubectl", "create", "clusterrolebinding", "vpa-updater-admin", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:vpa-updater")
+		_, _ = utils.Run(cmd) // Ignore error if it already exists
+
+		// Grant cluster-admin to the typo user in case we want to test webhook denial
+		cmd = exec.Command("kubectl", "create", "clusterrolebinding", "vpa-updater-typo-admin", "--clusterrole=cluster-admin", "--user=system:service-account:kube-system:vpa-updater")
+		_, _ = utils.Run(cmd) // Ignore error if it already exists
+
+		By("Creating RBAC bindings for impersonated test users")
+		// Grant cluster-admin to the correct service account so it passes API server authorization
+		cmd = exec.Command("kubectl", "create", "clusterrolebinding", "vpa-updater-admin", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:vpa-updater")
+		_, _ = utils.Run(cmd) // Ignore error if it already exists
+		// Grant cluster-admin to the typo user in case we want to test webhook denial
+		cmd = exec.Command("kubectl", "create", "clusterrolebinding", "vpa-updater-typo-admin", "--clusterrole=cluster-admin", "--user=system:service-account:kube-system:vpa-updater")
+		_, _ = utils.Run(cmd) // Ignore error if it already exists
+
 		By("Applying the WorkloadClassGuardrail sample (retrying until webhook is ready)")
 		Eventually(func() error {
 			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
@@ -233,6 +250,71 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile)
+			out, err := utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the WorkloadClass policy")
+			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
+		})
+
+		It("should allow eviction of a pod outside of the window by an allowed user", func() {
+			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+
+			By("Patching the WorkloadClass to simulate being outside a disruption window")
+			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"allowedDisruptionsOutsideOfWindow": ["VPA"], "maxNonDisruptionDurationDays": 10, "minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Patching the Guardrail to allow tomorrow")
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Attempting to evict the Pod via the eviction subresource")
+			yamlData, err := os.ReadFile("config/samples/eviction.yaml")
+			Expect(err).NotTo(HaveOccurred())
+
+			jsonData, err := yaml.YAMLToJSON(yamlData)
+			Expect(err).NotTo(HaveOccurred())
+
+			evictionFile := filepath.Join("/tmp", "eviction.json")
+			err = os.WriteFile(evictionFile, jsonData, 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Add the --as flag to impersonate the vpa-updater user
+			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile, "--as", "system:serviceaccount:kube-system:vpa-updater")
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Eviction should be allowed but was blocked: %v | Output: %s", err, string(out)))
+		})
+
+		It("should block eviction of a pod outside of the window if user is not in wc's allowed list", func() {
+			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+
+			By("Patching the WorkloadClass to simulate being outside a disruption window")
+			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"allowedDisruptionsOutsideOfWindow": ["ClusterAutoscaler"], "maxNonDisruptionDurationDays": 10, "minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Patching the Guardrail to allow tomorrow")
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Attempting to evict the Pod via the eviction subresource")
+			yamlData, err := os.ReadFile("config/samples/eviction.yaml")
+			Expect(err).NotTo(HaveOccurred())
+
+			jsonData, err := yaml.YAMLToJSON(yamlData)
+			Expect(err).NotTo(HaveOccurred())
+
+			evictionFile := filepath.Join("/tmp", "eviction.json")
+			err = os.WriteFile(evictionFile, jsonData, 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Add the --as flag to impersonate the vpa-updater user
+			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile, "--as", "system:serviceaccount:kube-system:vpa-updater")
 			out, err := utils.Run(cmd)
 			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the WorkloadClass policy")
 			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
