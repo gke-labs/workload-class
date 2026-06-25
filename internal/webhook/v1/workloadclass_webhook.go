@@ -19,6 +19,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,7 +49,6 @@ func SetupWorkloadClassWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// NOTE: If you want to customise the 'path', use the flags '--defaulting-path' or '--validation-path'.
 // +kubebuilder:webhook:path=/validate-workloads-gke-io-v1-workloadclass,mutating=false,failurePolicy=fail,sideEffects=None,groups=workloads.gke.io,resources=workloadclasses,verbs=create;update,versions=v1,name=vworkloadclass-v1.kb.io,admissionReviewVersions=v1
 
 // WorkloadClassCustomValidator struct is responsible for validating the WorkloadClass resource
@@ -118,15 +118,20 @@ func validateAllowedDisruptions(allowedDisruptions []string) error {
 //
 // NOTE: The +kubebuilder:object:generate=false marker prevents controller-gen from generating DeepCopy methods,
 // as it is used only for temporary operations and does not need to be deeply copied.
-type WorkloadClassCustomDefaulter struct {
-	// TODO(user): Add more fields as needed for defaulting
-}
+type WorkloadClassCustomDefaulter struct{}
 
 // Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind WorkloadClass.
 func (d *WorkloadClassCustomDefaulter) Default(_ context.Context, obj *workloadsv1.WorkloadClass) error {
 	workloadclasslog.Info("Defaulting for WorkloadClass", "name", obj.GetName())
 
-	// TODO(user): fill in your defaulting logic.
+	workloadclasslog.Info("Deduplicating AllowedDisruptionsOutsideOfWindow for WorkloadClass", "name", obj.GetName())
+	deduplicatedList := deduplicate(obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow)
+	obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = deduplicatedList
 
 	return nil
+}
+
+func deduplicate(allowedDisruptions []string) []string {
+	slices.Sort(allowedDisruptions)
+	return slices.Compact(allowedDisruptions)
 }
