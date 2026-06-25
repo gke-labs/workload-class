@@ -435,7 +435,7 @@ func TestHandle(t *testing.T) {
 				},
 				MinInitialRunDurationDays:         2,
 				MaxNonDisruptionDurationDays:      30,
-				AllowedDisruptionsOutsideOfWindow: []string{"VPA"},
+				AllowedDisruptionsOutsideOfWindow: []string{VPA},
 			},
 		},
 	}
@@ -492,11 +492,11 @@ func TestHandle(t *testing.T) {
 	pod.Labels = labels
 
 	evictionRequest := admissionv1.AdmissionRequest{
-		Name:        "VPA",
+		Name:        VPA,
 		Namespace:   namespace,
 		SubResource: eviction,
 		UserInfo: v1.UserInfo{
-			Username: "vpa-recommender",
+			Username: VPAUpdaterSA,
 		},
 	}
 
@@ -539,7 +539,7 @@ func TestHandle(t *testing.T) {
 			name: "notAnEviction",
 			desc: "Not an eviction, admission Allowed",
 			req: admissionv1.AdmissionRequest{
-				Name:        "VPA",
+				Name:        VPA,
 				Namespace:   namespace,
 				SubResource: "not-an-eviction",
 			},
@@ -740,6 +740,54 @@ func TestBestMatchWorkloadClass_EmitEvent(t *testing.T) {
 			t.Error("Expected AmbiguousMatch event to be emitted, but none was found")
 		}
 	})
+}
+
+func TestMatchesIdentity(t *testing.T) {
+	testCases := []struct {
+		name        string
+		allowedUser string
+		username    string
+		want        bool
+	}{
+		{
+			name:        "cluster_autoscaler_allowed",
+			allowedUser: ClusterAutoscaler,
+			username:    ClusterAutoscalerSA,
+			want:        true,
+		},
+		{
+			name:        "vpa_recommender_allowed",
+			allowedUser: VPA,
+			username:    VPARecommenderSA,
+			want:        true,
+		},
+		{
+			name:        "vpa_updater_allowed",
+			allowedUser: VPA,
+			username:    VPAUpdaterSA,
+			want:        true,
+		},
+		{
+			name:        "valid_identity_not_in_allowed_list_not_allowed",
+			allowedUser: ClusterAutoscaler,
+			username:    VPAUpdaterSA,
+			want:        false,
+		},
+		{
+			name:        "invalid_identity_not_allowed",
+			allowedUser: ClusterAutoscaler,
+			username:    "system:service-account:kube-system:sam",
+			want:        false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := matchesIdentity(tc.username, tc.allowedUser); got != tc.want {
+				t.Errorf("matchesIdentity(%s, %s) returned an unexpected result, got: %v, want: %v", tc.username, tc.allowedUser, got, tc.want)
+			}
+		})
+	}
 }
 
 func mapsEqual(m1, m2 map[string]int) bool {

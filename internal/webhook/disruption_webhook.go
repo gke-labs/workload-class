@@ -35,6 +35,15 @@ import (
 	"github.com/gke-labs/workload-class/internal/utils"
 )
 
+const (
+	VPA               string = "VPA"
+	ClusterAutoscaler string = "ClusterAutoscaler"
+
+	VPARecommenderSA    string = "system:serviceaccount:kube-system:vpa-recommender"
+	VPAUpdaterSA        string = "system:serviceaccount:kube-system:vpa-updater"
+	ClusterAutoscalerSA string = "system:serviceaccount:kube-system:cluster-autoscaler"
+)
+
 // DisruptionWebhook handles Pod eviction requests.
 type DisruptionWebhook struct {
 	Client   client.Client
@@ -88,7 +97,6 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	// 4. Identity-Based Filtering
 	for _, allowedUser := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
-		// Example: "VPA" maps to its service account
 		if matchesIdentity(req.UserInfo.Username, allowedUser) {
 			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", allowedUser))
 		}
@@ -229,14 +237,14 @@ func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, p
 
 func matchesIdentity(username string, allowed string) bool {
 	// Simple mapping for common GKE components
-	if allowed == "VPA" && strings.Contains(username, "vpa-recommender") {
-		return true
+	switch allowed {
+	case VPA:
+		return username == VPARecommenderSA || username == VPAUpdaterSA
+	case ClusterAutoscaler:
+		return username == ClusterAutoscalerSA
+	default:
+		return false
 	}
-	if allowed == "ClusterAutoscaler" && strings.Contains(username, "cluster-autoscaler") {
-		return true
-	}
-	// Direct match
-	return username == allowed || strings.HasSuffix(username, "/"+allowed)
 }
 
 // InjectDecoder injects the decoder.
