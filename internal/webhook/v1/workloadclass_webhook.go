@@ -30,11 +30,8 @@ import (
 )
 
 const (
-	VPA = "VPA"
-	CA  = "ClusterAutoscaler"
-
-	VPAServiceAccount = "system:serviceaccount:kube-system:vpa-updater"
-	CAServiceAccount  = "system:serviceaccount:kube-system:cluster-autoscaler"
+	VPA string = "VPA"
+	CA  string = "ClusterAutoscaler"
 )
 
 // nolint:unused

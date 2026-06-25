@@ -47,7 +47,7 @@ var _ = Describe("WorkloadClass Webhook", func() {
 	Context("When creating or updating WorkloadClass under Validating Webhook", func() {
 		It("Should deny creation if AllowedDisruptionsOutsideOfWindow contains invalid values", func() {
 			By("simulating an invalid creation scenario")
-			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{"VPA", "ClusterAutobot"}
+			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{VPA, "ClusterAutobot"}
 			warnings, err := validator.ValidateCreate(ctx, obj)
 			Expect(err).To(HaveOccurred())
 			Expect(warnings).To(ContainElement(ContainSubstring("invalid identities found in allowedDisruptionsOutsideOfWindow: ClusterAutobot")))
@@ -63,14 +63,14 @@ var _ = Describe("WorkloadClass Webhook", func() {
 
 		It("Should admit creation if AllowedDisruptionsOutsideOfWindow only contains valid values", func() {
 			By("simulating an invalid creation scenario")
-			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{"VPA", "ClusterAutoscaler"}
+			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{VPA, CA}
 			Expect(validator.ValidateCreate(ctx, obj)).To(BeNil())
 		})
 
 		It("Should validate updates correctly", func() {
 			By("simulating a valid update scenario")
-			oldObj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{"ClusterAutoscaler"}
-			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{"VPA", "ClusterAutoscaler"}
+			oldObj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{CA}
+			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{VPA, CA}
 			Expect(validator.ValidateUpdate(ctx, oldObj, obj)).To(BeNil())
 		})
 	})
@@ -78,21 +78,21 @@ var _ = Describe("WorkloadClass Webhook", func() {
 	Context("When creating WorkloadClass under Defaulting Webhook", func() {
 		It("Should remove duplicate values from AllowedDisruptionsOutsideOfWindow", func() {
 			By("simulating a scenario where defaults should be applied")
-			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{"VPA", "VPA", "VPA"}
+			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{VPA, VPA, VPA}
 			By("calling the Default method to apply defaults")
 			err := defaulter.Default(ctx, obj)
 			By("checking that the default values are set")
-			Expect(obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow).To(Equal([]string{"VPA"}))
+			Expect(obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow).To(Equal([]string{VPA}))
 			Expect(err).ToNot(HaveOccurred())
 		})
 		It("Should not change values in AllowedDisruptionsOutsideOfWindow if it has no duplicates", func() {
 			By("simulating a scenario where defaults should be applied")
-			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{"VPA", "ClusterAutoscaler"}
+			obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []string{VPA, CA}
 			By("calling the Default method to apply defaults")
 			err := defaulter.Default(ctx, obj)
 			By("checking that the default values are set")
 			// Also sorts the strings
-			Expect(obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow).To(Equal([]string{"ClusterAutoscaler", "VPA"}))
+			Expect(obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow).To(Equal([]string{CA, VPA}))
 			Expect(err).ToNot(HaveOccurred())
 		})
 	})
