@@ -18,12 +18,22 @@ package v1
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+)
+
+const (
+	VPA = "VPA"
+	CA  = "ClusterAutoscaler"
+
+	VPAServiceAccount = "system:serviceaccount:kube-system:vpa-updater"
+	CAServiceAccount  = "system:serviceaccount:kube-system:cluster-autoscaler"
 )
 
 // nolint:unused
@@ -37,9 +47,6 @@ func SetupWorkloadClassWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// TODO(user): EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-
-// TODO(user): change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
 // NOTE: If you want to customise the 'path', use the flags '--defaulting-path' or '--validation-path'.
 // +kubebuilder:webhook:path=/validate-workloads-gke-io-v1-workloadclass,mutating=false,failurePolicy=fail,sideEffects=None,groups=workloads.gke.io,resources=workloadclasses,verbs=create;update,versions=v1,name=vworkloadclass-v1.kb.io,admissionReviewVersions=v1
 
@@ -56,7 +63,9 @@ type WorkloadClassCustomValidator struct {
 func (v *WorkloadClassCustomValidator) ValidateCreate(_ context.Context, obj *workloadsv1.WorkloadClass) (admission.Warnings, error) {
 	workloadclasslog.Info("Validation for WorkloadClass upon creation", "name", obj.GetName())
 
-	// TODO(user): fill in your validation logic upon object creation.
+	if err := validateAllowedDisruptions(obj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow); err != nil {
+		return []string{err.Error()}, err
+	}
 
 	return nil, nil
 }
@@ -65,7 +74,9 @@ func (v *WorkloadClassCustomValidator) ValidateCreate(_ context.Context, obj *wo
 func (v *WorkloadClassCustomValidator) ValidateUpdate(_ context.Context, oldObj, newObj *workloadsv1.WorkloadClass) (admission.Warnings, error) {
 	workloadclasslog.Info("Validation for WorkloadClass upon update", "name", newObj.GetName())
 
-	// TODO(user): fill in your validation logic upon object update.
+	if err := validateAllowedDisruptions(newObj.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow); err != nil {
+		return []string{err.Error()}, err
+	}
 
 	return nil, nil
 }
@@ -73,8 +84,28 @@ func (v *WorkloadClassCustomValidator) ValidateUpdate(_ context.Context, oldObj,
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type WorkloadClass.
 func (v *WorkloadClassCustomValidator) ValidateDelete(_ context.Context, obj *workloadsv1.WorkloadClass) (admission.Warnings, error) {
 	workloadclasslog.Info("Validation for WorkloadClass upon deletion", "name", obj.GetName())
-
-	// TODO(user): fill in your validation logic upon object deletion.
-
+	// No validation on delete
 	return nil, nil
+}
+
+// validateAllowedDisruptions validates that strings in the allowedDisruptionsOutsideOfWindowField are either "VPA" or "ClusterAutoscaler"
+func validateAllowedDisruptions(allowedDisruptions []string) error {
+	if len(allowedDisruptions) == 0 {
+		return nil
+	}
+
+	allowedIdentities := map[string]struct{}{VPA: {}, CA: {}}
+	invalidIdentities := []string{}
+
+	for _, i := range allowedDisruptions {
+		if _, ok := allowedIdentities[i]; !ok {
+			invalidIdentities = append(invalidIdentities, i)
+		}
+	}
+
+	if len(invalidIdentities) > 0 {
+		return fmt.Errorf("invalid identities found in allowedDisruptionsOutsideOfWindow: %s", strings.Join(invalidIdentities, ", "))
+	}
+
+	return nil
 }
