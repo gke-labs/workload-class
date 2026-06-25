@@ -44,6 +44,7 @@ var workloadclasslog = logf.Log.WithName("workloadclass-resource")
 func SetupWorkloadClassWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &workloadsv1.WorkloadClass{}).
 		WithValidator(&WorkloadClassCustomValidator{}).
+		WithDefaulter(&WorkloadClassCustomDefaulter{}).
 		Complete()
 }
 
@@ -106,6 +107,26 @@ func validateAllowedDisruptions(allowedDisruptions []string) error {
 	if len(invalidIdentities) > 0 {
 		return fmt.Errorf("invalid identities found in allowedDisruptionsOutsideOfWindow: %s", strings.Join(invalidIdentities, ", "))
 	}
+
+	return nil
+}
+
+// +kubebuilder:webhook:path=/mutate-workloads-gke-io-v1-workloadclass,mutating=true,failurePolicy=fail,sideEffects=None,groups=workloads.gke.io,resources=workloadclasses,verbs=create;update,versions=v1,name=mworkloadclass-v1.kb.io,admissionReviewVersions=v1
+
+// WorkloadClassCustomDefaulter struct is responsible for setting default values on the custom resource of the
+// Kind WorkloadClass when those are created or updated.
+//
+// NOTE: The +kubebuilder:object:generate=false marker prevents controller-gen from generating DeepCopy methods,
+// as it is used only for temporary operations and does not need to be deeply copied.
+type WorkloadClassCustomDefaulter struct {
+	// TODO(user): Add more fields as needed for defaulting
+}
+
+// Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind WorkloadClass.
+func (d *WorkloadClassCustomDefaulter) Default(_ context.Context, obj *workloadsv1.WorkloadClass) error {
+	workloadclasslog.Info("Defaulting for WorkloadClass", "name", obj.GetName())
+
+	// TODO(user): fill in your defaulting logic.
 
 	return nil
 }

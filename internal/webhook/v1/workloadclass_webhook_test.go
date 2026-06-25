@@ -29,6 +29,7 @@ var _ = Describe("WorkloadClass Webhook", func() {
 		obj       *workloadsv1.WorkloadClass
 		oldObj    *workloadsv1.WorkloadClass
 		validator WorkloadClassCustomValidator
+		defaulter WorkloadClassCustomDefaulter
 	)
 
 	BeforeEach(func() {
@@ -38,6 +39,8 @@ var _ = Describe("WorkloadClass Webhook", func() {
 		Expect(validator).NotTo(BeNil(), "Expected validator to be initialized")
 		Expect(oldObj).NotTo(BeNil(), "Expected oldObj to be initialized")
 		Expect(obj).NotTo(BeNil(), "Expected obj to be initialized")
+		defaulter = WorkloadClassCustomDefaulter{}
+		Expect(defaulter).NotTo(BeNil(), "Expected defaulter to be initialized")
 	})
 
 	AfterEach(func() {
@@ -64,6 +67,19 @@ var _ = Describe("WorkloadClass Webhook", func() {
 		//     oldObj.SomeRequiredField = "updated_value"
 		//     obj.SomeRequiredField = "updated_value"
 		//     Expect(validator.ValidateUpdate(ctx, oldObj, obj)).To(BeNil())
+		// })
+	})
+
+	Context("When creating WorkloadClass under Defaulting Webhook", func() {
+		// TODO (user): Add logic for defaulting webhooks
+		// Example:
+		// It("Should apply defaults when a required field is empty", func() {
+		//     By("simulating a scenario where defaults should be applied")
+		//     obj.SomeFieldWithDefault = ""
+		//     By("calling the Default method to apply defaults")
+		//     defaulter.Default(ctx, obj)
+		//     By("checking that the default values are set")
+		//     Expect(obj.SomeFieldWithDefault).To(Equal("default_value"))
 		// })
 	})
 
