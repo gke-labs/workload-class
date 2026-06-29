@@ -173,6 +173,7 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 			}
 			Eventually(verifyMaintenanceReadiness, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
+
 		It("should evaluate MaintenanceReadiness to NotReady when outside disruption window", func() {
 			By("Updating the Guardrail and WorkloadClass to simulate being outside a disruption window")
 			notToday := time.Now().AddDate(0, 0, 1).Weekday().String()
