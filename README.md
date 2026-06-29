@@ -10,7 +10,11 @@ This is not an officially supported Google product.
 This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.
 
 ## Description
-The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails. It also detects and warns if multiple WorkloadClasses in the same namespace share the same PodSelector. A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration).
+The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails.
+
+A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration). The webhook resolves the applicable `WorkloadClass` for a pod using the following order of precedence:
+1. **Namespace-level default**: If a default `WorkloadClass` is labeled on the pod's namespace (`workloads.gke.io/default-class`), it is chosen immediately, overriding any other potential matches.
+2. **Pod label selectors**: If no namespace default is defined, the webhook selects the `WorkloadClass` in the pod's namespace that has the highest specificity (matching label selectors) against the pod. If multiple `WorkloadClasses` have the same specificity, the oldest `WorkloadClass` takes precedence.
 
 ## Example Usage
 
@@ -63,7 +67,20 @@ spec:
       - ClusterAutoscaler
 ```
 
-**3. Testing the Capabilities**
+**3. (Optional) Assign a Default WorkloadClass to a Namespace**
+
+You can assign a default `WorkloadClass` to a namespace using a label. This namespace-level default takes precedence over all individual pod label selectors in that namespace: if a default is defined, it will be applied to all pods in the namespace, ignoring any other matching `WorkloadClass` selectors.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample
+  labels:
+    workloads.gke.io/default-class: critical-batch
+```
+
+**4. Testing the Capabilities**
 
 **A. Testing Disruption Webhooks**
 

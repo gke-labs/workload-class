@@ -213,10 +213,10 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 }
 
 func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) *workloadsv1.WorkloadClass {
-	const defaultClassAnnotation = "workloads.gke.io/default-class"
+	const defaultClassLabel = "workloads.gke.io/default-class"
 	ns := &corev1.Namespace{}
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
-		if defaultClass, ok := ns.Labels[defaultClassAnnotation]; ok {
+		if defaultClass, ok := ns.Labels[defaultClassLabel]; ok {
 			wc := &workloadsv1.WorkloadClass{}
 			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
 				return wc
