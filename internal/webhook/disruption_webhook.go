@@ -121,15 +121,19 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 // bestMatchWorkloadClass finds the most suitable WorkloadClass for a given Pod.
 //
-// Selection preference is given to the WorkloadClass in the Pod's namespace
-// that has the highest number of matching labels and expressions against the Pod.
+// Selection preference is given to the namespace's default WorkloadClass.
+// If no default is defined, the WorkloadClass in the Pod's namespace that has the
+// highest number of matching labels and expressions against the Pod is selected.
 // If two or more WorkloadClasses match in specificity to the Pod, the oldest
 // WorkloadClass takes precedence.
 //
-// If no WorkloadClass matches based on labels or expressions, this function
-// returns the default WorkloadClass for the Pod's namespace, if one is defined.
 // If no specific or default WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+	// Use the namespace's default workload class if it exists
+	if bestMatch = v.namespaceDefaultWorkloadClass(ctx, pod); bestMatch != nil {
+		return bestMatch, nil
+	}
+
 	wcs := &workloadsv1.WorkloadClassList{}
 	if err := v.Client.List(ctx, wcs); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
@@ -148,9 +152,6 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admi
 			bestMatch, otherMatches = updateBestMatch(&wc, bestMatch, &maxSpecificity, otherMatches)
 		}
 	}
-
-	// 2.1 Fallback to Namespace default if bestMatch is nil
-	bestMatch = v.namespaceDefaultWorkloadClass(ctx, pod, bestMatch)
 
 	// Emit warning message for WorkloadClasses that matched, but are ignored
 	v.emitWarning(ctx, req, pod, bestMatch, otherMatches, maxSpecificity)
@@ -211,20 +212,18 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 	return len(sel.MatchLabels) + len(sel.MatchExpressions)
 }
 
-func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
-	if bestMatch == nil {
-		const defaultClassAnnotation = "workloads.gke.io/default-class"
-		ns := &corev1.Namespace{}
-		if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
-			if defaultClass, ok := ns.Annotations[defaultClassAnnotation]; ok {
-				wc := &workloadsv1.WorkloadClass{}
-				if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
-					return wc
-				}
+func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) *workloadsv1.WorkloadClass {
+	const defaultClassLabel = "workloads.gke.io/default-class"
+	ns := &corev1.Namespace{}
+	if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
+		if defaultClass, ok := ns.Labels[defaultClassLabel]; ok {
+			wc := &workloadsv1.WorkloadClass{}
+			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
+				return wc
 			}
 		}
 	}
-	return bestMatch
+	return nil
 }
 
 func matchesIdentity(username string, allowed string) bool {
