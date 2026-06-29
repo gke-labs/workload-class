@@ -19,5 +19,9 @@ spec:
     minInitialRunDurationDays: 2
     maxNonDisruptionDurationDays: 1
     allowedDisruptionsOutsideOfWindow:
-      - VPA
-      - ClusterAutoscaler
+      - kind: ServiceAccount
+        name: vpa-updater
+        namespace: kube-system
+      - kind: ServiceAccount
+        name: cluster-autoscaler
+        namespace: kube-system
