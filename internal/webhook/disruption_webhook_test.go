@@ -25,8 +25,9 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	admissionv1 "k8s.io/api/admission/v1"
-	v1 "k8s.io/api/authentication/v1"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -438,8 +439,10 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 
 func TestHandle(t *testing.T) {
 	const (
-		namespace = "namespace"
-		eviction  = "eviction"
+		namespace     = "namespace"
+		eviction      = "eviction"
+		adminUsername = "admin@mycompany.com"
+		podName       = "podrick"
 	)
 	var (
 		inWindowDay        = time.Now().Weekday().String()
@@ -464,7 +467,7 @@ func TestHandle(t *testing.T) {
 				},
 				MinInitialRunDurationDays:         2,
 				MaxNonDisruptionDurationDays:      30,
-				AllowedDisruptionsOutsideOfWindow: []string{"VPA"},
+				AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{{Kind: rbacv1.UserKind, Name: adminUsername}},
 			},
 		},
 	}
@@ -519,21 +522,22 @@ func TestHandle(t *testing.T) {
 	pod := &corev1.Pod{}
 	pod.Namespace = namespace
 	pod.Labels = labels
+	pod.Name = podName
 
 	evictionRequest := admissionv1.AdmissionRequest{
-		Name:        "VPA",
+		Name:        podName,
 		Namespace:   namespace,
 		SubResource: eviction,
-		UserInfo: v1.UserInfo{
-			Username: "vpa-recommender",
+		UserInfo: authv1.UserInfo{
+			Username: adminUsername,
 		},
 	}
 
 	evictionRequestNonMatchingUser := admissionv1.AdmissionRequest{
-		Name:        "something-else",
+		Name:        podName,
 		Namespace:   namespace,
 		SubResource: eviction,
-		UserInfo: v1.UserInfo{
+		UserInfo: authv1.UserInfo{
 			Username: "something-else",
 		},
 	}
@@ -568,7 +572,7 @@ func TestHandle(t *testing.T) {
 			name: "notAnEviction",
 			desc: "Not an eviction, admission Allowed",
 			req: admissionv1.AdmissionRequest{
-				Name:        "VPA",
+				Name:        adminUsername,
 				Namespace:   namespace,
 				SubResource: "not-an-eviction",
 			},
@@ -779,6 +783,374 @@ func TestBestMatchWorkloadClass_EmitEvent(t *testing.T) {
 			t.Error("Expected AmbiguousMatch event to be emitted, but none was found")
 		}
 	})
+}
+
+func TestMatchesUserKind(t *testing.T) {
+	testCases := []struct {
+		name     string
+		userInfo authv1.UserInfo
+		subject  workloadsv1.Subject
+		want     bool
+		wantErr  bool
+	}{
+		{
+			name: "exact_username_match_without_namespace",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind: "User",
+				Name: "jane.doe@example.com",
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "usernam_mismatch_without_namespace",
+			userInfo: authv1.UserInfo{
+				Username: "bob@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind: "User",
+				Name: "jane.doe@example.com",
+			},
+			want:    false,
+			wantErr: false,
+		},
+		{
+			name: "returns_error_if_namespace_is_provided_even_if_username_matches",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "User",
+				Name:      "jane.doe@example.com",
+				Namespace: "default", // Users are cluster-scoped, so this is invalid
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "returns_error_if_namespace_is_provided_mismatch",
+			userInfo: authv1.UserInfo{
+				Username: "bob@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "User",
+				Name:      "jane.doe@example.com",
+				Namespace: "kube-system",
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "edge_case_empty_usernames_match",
+			userInfo: authv1.UserInfo{
+				Username: "",
+			},
+			subject: workloadsv1.Subject{
+				Kind: "User",
+				Name: "",
+			},
+			want:    true,
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := matchesUserKind(tc.userInfo, tc.subject)
+
+			if (err != nil) != tc.wantErr {
+				t.Errorf("matchesUserKind() error = %v, wantErr %v", err, tc.wantErr)
+				return
+			}
+			if got != tc.want {
+				t.Errorf("matchesUserKind() got = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchesGroupKind(t *testing.T) {
+	testCases := []struct {
+		name     string
+		userInfo authv1.UserInfo
+		subject  workloadsv1.Subject
+		want     bool
+		wantErr  bool
+	}{
+		{
+			name: "exact_group_match_single_group",
+			userInfo: authv1.UserInfo{
+				Groups: []string{"system:masters"},
+			},
+			subject: workloadsv1.Subject{
+				Kind: "Group",
+				Name: "system:masters",
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "exact_group_match_multiple_groups",
+			userInfo: authv1.UserInfo{
+				Groups: []string{"system:authenticated", "devops@example.com", "developers"},
+			},
+			subject: workloadsv1.Subject{
+				Kind: "Group",
+				Name: "system:authenticated",
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "group_mismatch",
+			userInfo: authv1.UserInfo{
+				Groups: []string{"system:authenticated", "developers"},
+			},
+			subject: workloadsv1.Subject{
+				Kind: "Group",
+				Name: "system:masters",
+			},
+			want:    false,
+			wantErr: false,
+		},
+		{
+			name: "returns_error_if_namespace_is_provided_even_if_group_matches",
+			userInfo: authv1.UserInfo{
+				Groups: []string{"devops@example.com"},
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "Group",
+				Name:      "devops@example.com",
+				Namespace: "default", // Groups are cluster-scoped, so this is invalid
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "user_with_no_groups_does_not_match",
+			userInfo: authv1.UserInfo{
+				Groups: []string{},
+			},
+			subject: workloadsv1.Subject{
+				Kind: "Group",
+				Name: "developers",
+			},
+			want:    false,
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := matchesGroupKind(tc.userInfo, tc.subject)
+
+			if (err != nil) != tc.wantErr {
+				t.Errorf("matchesGroupKind() error = %v, wantErr %v", err, tc.wantErr)
+				return
+			}
+			if got != tc.want {
+				t.Errorf("matchesGroupKind() got = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchesServiceAccountKind(t *testing.T) {
+	testCases := []struct {
+		name     string
+		userInfo authv1.UserInfo
+		subject  workloadsv1.Subject
+		want     bool
+	}{
+		{
+			name: "exact_service_account_match",
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:default:my-app-sa",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "my-app-sa",
+				Namespace: "default",
+			},
+			want: true,
+		},
+		{
+			name: "mismatch_on_namespace",
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:kube-system:my-app-sa",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "my-app-sa",
+				Namespace: "default",
+			},
+			want: false,
+		},
+		{
+			name: "mismatch_on_name",
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:default:other-sa",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "my-app-sa",
+				Namespace: "default",
+			},
+			want: false,
+		},
+		{
+			name: "missing_namespace_in_subject_results_in_mismatch",
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:default:my-app-sa",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "my-app-sa",
+				Namespace: "", // This will format to system:serviceaccount::my-app-sa
+			},
+			want: false,
+		},
+		{
+			name: "regular_user_trying_to_spoof_service_account_structure_fails",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "jane.doe@example.com",
+				Namespace: "default",
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := matchesServiceAccountKind(tc.userInfo, tc.subject)
+
+			if got != tc.want {
+				t.Errorf("matchesServiceAccountKind() got = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchesIdentity(t *testing.T) {
+	testCases := []struct {
+		name     string
+		userInfo authv1.UserInfo
+		subject  workloadsv1.Subject
+		want     bool
+		wantErr  bool
+	}{
+		// 1. Validation Logic
+		{
+			name: "returns_error_if_subject_name_is_empty",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind: "User",
+				Name: "",
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "returns_error_for_unsupported_or_invalid_Kind",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind: "RoleBinding", // Invalid subject kind for this function
+				Name: "my-role",
+			},
+			want:    false,
+			wantErr: true,
+		},
+		{
+			name: "propagates_errors_from_sub-functions_User_with_Namespace",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "User",
+				Name:      "jane.doe@example.com",
+				Namespace: "default", // Triggers an error inside matchesUserKind
+			},
+			want:    false,
+			wantErr: true,
+		},
+
+		// 2. Routing Logic (Proving it correctly routes to the right sub-function)
+		{
+			name: "successfully_routes_and_matches_User",
+			userInfo: authv1.UserInfo{
+				Username: "jane.doe@example.com",
+			},
+			subject: workloadsv1.Subject{
+				Kind: "User",
+				Name: "jane.doe@example.com",
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "successfully_routes_and_matches_Group",
+			userInfo: authv1.UserInfo{
+				Groups: []string{"devops@example.com"},
+			},
+			subject: workloadsv1.Subject{
+				Kind: "Group",
+				Name: "devops@example.com",
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "successfully_routes_and_matches_ServiceAccount",
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:default:my-app-sa",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "my-app-sa",
+				Namespace: "default",
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "correctly_routes_but_fails_match_for_ServiceAccount",
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:kube-system:my-app-sa",
+			},
+			subject: workloadsv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "my-app-sa",
+				Namespace: "default",
+			},
+			want:    false,
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := matchesIdentity(tc.userInfo, tc.subject)
+
+			if (err != nil) != tc.wantErr {
+				t.Errorf("matchesIdentity() error = %v, wantErr %v", err, tc.wantErr)
+				return
+			}
+			if got != tc.want {
+				t.Errorf("matchesIdentity() got = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func mapsEqual(m1, m2 map[string]int) bool {

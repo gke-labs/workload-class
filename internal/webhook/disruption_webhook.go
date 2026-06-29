@@ -20,10 +20,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
@@ -87,10 +90,13 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 4. Identity-Based Filtering
-	for _, allowedUser := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
-		// Example: "VPA" maps to its service account
-		if matchesIdentity(req.UserInfo.Username, allowedUser) {
-			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", allowedUser))
+	for _, allowedSubject := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
+		allowed, err := matchesIdentity(req.UserInfo, allowedSubject)
+		if err != nil {
+			log.Error(err, "Failed to check if UserInfo matches allowed Subject", "subject", allowedSubject)
+		}
+		if allowed {
+			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", allowedSubject))
 		}
 	}
 
@@ -226,16 +232,42 @@ func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, p
 	return nil
 }
 
-func matchesIdentity(username string, allowed string) bool {
-	// Simple mapping for common GKE components
-	if allowed == "VPA" && strings.Contains(username, "vpa-recommender") {
-		return true
+func matchesIdentity(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
+	if subject.Name == "" {
+		return false, fmt.Errorf("subject name cannot be empty")
 	}
-	if allowed == "ClusterAutoscaler" && strings.Contains(username, "cluster-autoscaler") {
-		return true
+
+	switch subject.Kind {
+	case rbacv1.UserKind:
+		return matchesUserKind(userInfo, subject)
+	case rbacv1.GroupKind:
+		return matchesGroupKind(userInfo, subject)
+	case rbacv1.ServiceAccountKind:
+		return matchesServiceAccountKind(userInfo, subject)
+	default:
+		return false, fmt.Errorf("subject has invalid Kind: %s", subject.Kind)
 	}
-	// Direct match
-	return username == allowed || strings.HasSuffix(username, "/"+allowed)
+}
+
+func matchesUserKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
+	if subject.Namespace != "" {
+		return false, fmt.Errorf("subject is kind %s, but has Namespace: %s", subject.Kind, subject.Namespace)
+	}
+
+	return userInfo.Username == subject.Name, nil
+}
+
+func matchesGroupKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
+	if subject.Namespace != "" {
+		return false, fmt.Errorf("subject is kind %s, but has Namespace: %s", subject.Kind, subject.Namespace)
+	}
+
+	return slices.Contains(userInfo.Groups, subject.Name), nil
+}
+
+func matchesServiceAccountKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
+	expectedUsername := fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
+	return userInfo.Username == expectedUsername, nil
 }
 
 // InjectDecoder injects the decoder.

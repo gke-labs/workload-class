@@ -83,11 +83,36 @@ spec:
                       type: object
                     type: array
                   allowedDisruptionsOutsideOfWindow:
-                    description: AllowedDisruptionsOutsideOfWindow specifies identities
-                      or components that can disrupt even outside of windows. (e.g.
-                      "VPA", "ClusterAutoscaler")
+                    description: AllowedDisruptionsOutsideOfWindow specifies subjects
+                      that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
                     items:
-                      type: string
+                      description: |-
+                        Subject defines the identity of a user, group, or service account.
+                        It is used to specify who or what is granted permissions or is the target
+                        of a policy. The structure aligns with standard Kubernetes RBAC subjects.
+                      properties:
+                        kind:
+                          description: Kind can be User, Group, or ServiceAccount
+                          enum:
+                          - User
+                          - Group
+                          - ServiceAccount
+                          type: string
+                        name:
+                          description: Name of the identity
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Namespace of the ServiceAccount (only for ServiceAccount
+                            kind)
+                          maxLength: 63
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - kind
+                      - name
+                      type: object
                     type: array
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
