@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-deployment
+  namespace: sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      role: batch-processor
+  template:
+    metadata:
+      labels:
+        role: batch-processor
+    spec:
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9

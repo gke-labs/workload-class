@@ -67,20 +67,21 @@ spec:
 
 **A. Testing Disruption Webhooks**
 
-You can deploy a dummy pod that matches the `WorkloadClass` selector and attempt to disrupt it. If the current time is outside the `weekend-maintenance` window, the webhook will intercept and reject the disruption:
+You can deploy a dummy deployment that matches the `WorkloadClass` selector and attempt to disrupt its pods. If the current time is outside the `weekend-maintenance` window, the webhook will intercept and reject the disruption:
 
 ```sh
-# 1. Apply the CRDs, dummy pod, and sample namespace
+# 1. Apply the CRDs, dummy deployment, and sample namespace
 kubectl apply -k config/samples/
 
-# 2. Attempt to evict the pod outside the maintenance window using the Eviction API
+# 2. Attempt to evict the deployment's pod outside the maintenance window using the Eviction API
 kubectl proxy &
 PROXY_PID=$!
 sleep 2
 
-curl -s -X POST "http://127.0.0.1:8001/api/v1/namespaces/sample/pods/test-pod/eviction" \
+POD_NAME=$(kubectl get pods -n sample -l role=batch-processor -o jsonpath='{.items[0].metadata.name}')
+curl -s -X POST "http://127.0.0.1:8001/api/v1/namespaces/sample/pods/$POD_NAME/eviction" \
   -H "Content-Type: application/json" \
-  -d '{"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "test-pod", "namespace": "sample"}}'
+  -d "{\"apiVersion\": \"policy/v1\", \"kind\": \"Eviction\", \"metadata\": {\"name\": \"$POD_NAME\", \"namespace\": \"sample\"}}"
 
 kill $PROXY_PID
 ```
@@ -267,7 +268,7 @@ Apply the sample workload class:
 kubectl apply -f https://raw.githubusercontent.com/gke-labs/workload-class/main/config/samples/workloads_v1_workloadclass.yaml
 ```
 
-Alternatively, you can apply all samples (including the test namespace and dummy pod) directly via Kustomize:
+Alternatively, you can apply all samples (including the test namespace and dummy deployment) directly via Kustomize:
 ```sh
 kubectl apply -k https://github.com/gke-labs/workload-class/config/samples\?ref\=main
 ```
