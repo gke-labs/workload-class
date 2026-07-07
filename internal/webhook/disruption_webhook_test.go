@@ -238,16 +238,16 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-default",
 			Namespace: namespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				defaultClassAnnotation: "wc",
 			},
 		},
 	}
-	nsNoAnnotation := &corev1.Namespace{
+	nsNoDefault := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-no-wc",
 			Namespace: namespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"something-else": "true",
 			},
 		},
@@ -258,18 +258,11 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	testCases := []struct {
 		name          string
 		desc          string
-		bestMatch     *workloadsv1.WorkloadClass
 		getNSError    error
 		getNSResult   *corev1.Namespace
 		getWCError    error
 		wantBestMatch *workloadsv1.WorkloadClass
 	}{
-		{
-			name:          "best_match_not_nil",
-			desc:          "Best match WC is not nil, do not set to namespace default",
-			bestMatch:     wc,
-			wantBestMatch: wc,
-		},
 		{
 			name:       "error_getting_namespace",
 			desc:       "Error getting namespace, expect nil best match",
@@ -278,7 +271,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 		{
 			name:        "no_default_class_with_namespace",
 			desc:        "Namespace does not have a default WC, expect nil best match",
-			getNSResult: nsNoAnnotation,
+			getNSResult: nsNoDefault,
 		},
 		{
 			name:        "error_getting_wc",
@@ -301,7 +294,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			v := &DisruptionWebhook{
 				Client: client,
 			}
-			gotWC := v.namespaceDefaultWorkloadClass(ctx, pod, tc.bestMatch)
+			gotWC := v.namespaceDefaultWorkloadClass(ctx, pod)
 			if (gotWC != nil) != (tc.wantBestMatch != nil) {
 				t.Errorf("namespaceDefaultWorkloadClass() returned an unexpected result, got: %v, want: %v", gotWC, tc.wantBestMatch)
 			}
@@ -331,12 +324,35 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			},
 		},
 	}
-	nsNoAnnotation := &corev1.Namespace{
+	wcDefault := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-default",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"labelB": "valueB", // Won't match with Pod
+				},
+			},
+		},
+	}
+	nsNoDefault := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-no-wc",
 			Namespace: namespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"something-else": "true",
+			},
+		},
+	}
+	nsWithDefault := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "namespace-with-wc",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"workloads.gke.io/default-class": "wc-default",
 			},
 		},
 	}
@@ -352,6 +368,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 		getNSError    error
 		getNSResult   *corev1.Namespace
 		getWCError    error
+		getWCResult   *workloadsv1.WorkloadClass
 		wantBestMatch *workloadsv1.WorkloadClass
 		wantErr       bool
 	}{
@@ -360,15 +377,27 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			desc:         "Error listing WorkloadClasses, expect nil result and error",
 			listWCError:  fmt.Errorf("error listing WorkloadClasses"),
 			listWCResult: &workloadsv1.WorkloadClassList{},
+			getNSResult:  nsNoDefault,
 			wantErr:      true,
 		},
 		{
-			name: "success",
-			desc: "Success getting best match",
+			name: "success_getting_namespace_default",
+			desc: "Success getting namespace default as best match",
+			listWCResult: &workloadsv1.WorkloadClassList{
+				Items: []workloadsv1.WorkloadClass{wc, wcDefault},
+			},
+			getNSResult:   nsWithDefault,
+			getWCResult:   &wcDefault,
+			wantBestMatch: &wcDefault,
+			wantErr:       false,
+		},
+		{
+			name: "success_no_namespace_default",
+			desc: "Success getting best match with selectors (no namespace default)",
 			listWCResult: &workloadsv1.WorkloadClassList{
 				Items: []workloadsv1.WorkloadClass{wc},
 			},
-			getNSResult:   nsNoAnnotation,
+			getNSResult:   nsNoDefault,
 			wantBestMatch: &wc,
 			wantErr:       false,
 		},
@@ -382,7 +411,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := createClient(tc.getNSError, tc.getWCError, tc.listWCError, nil, tc.getNSResult, &wc, tc.listWCResult, nil)
+			client := createClient(tc.getNSError, tc.getWCError, tc.listWCError, nil, tc.getNSResult, tc.getWCResult, tc.listWCResult, nil)
 			v := &DisruptionWebhook{
 				Client: client,
 			}
@@ -707,13 +736,23 @@ func TestBestMatchWorkloadClass_EmitEvent(t *testing.T) {
 		Items: []workloadsv1.WorkloadClass{wc1, wc2},
 	}
 
+	nsNoDefault := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "namespace-no-wc",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"something-else": "true",
+			},
+		},
+	}
+
 	ctx := t.Context()
 	req := admission.Request{}
 	req.Name = "name"
 	req.Namespace = namespace
 	req.UserInfo.Username = "test-user"
 
-	testClient := createClient(nil, nil, nil, nil, nil, &wc1, listWCResult, nil)
+	testClient := createClient(nil, nil, nil, nil, nsNoDefault, &wc1, listWCResult, nil)
 	// Create fake event recorder
 	fakeRecorder := events.NewFakeRecorder(10)
 	v := &DisruptionWebhook{
