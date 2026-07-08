@@ -40,6 +40,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 type GracePeriodSeconds int64
@@ -1345,7 +1346,7 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			expectedPDB := pdb(tc.wc)
+			expectedPDB := utils.PDBBase(tc.wc)
 			if tc.pdbExists {
 				// Inject an existing, outdated, PDB into the fake cluster
 				existingPDB := &policyv1.PodDisruptionBudget{
@@ -1595,7 +1596,7 @@ func TestReconcilePDB(t *testing.T) {
 
 			// Purposefully inject a dummy PDB beforehand.
 			// If deletePDB is called, it will vanish. If createOrUpdatePDB is called, it will remain/be updated.
-			expectedPDB := pdb(tc.wc)
+			expectedPDB := utils.PDBBase(tc.wc)
 			dummyPDB := &policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace},
 			}

@@ -23,13 +23,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -193,7 +191,7 @@ func oldestWorkloadClass(wc *workloadsv1.WorkloadClass, overlappingClasses []wor
 }
 
 func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
-	pdb := pdb(wc)
+	pdb := utils.PDBBase(wc)
 
 	if err := r.Delete(ctx, pdb); err != nil {
 		// If it's already gone, that's a success for a delete operation
@@ -207,13 +205,13 @@ func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1
 }
 
 func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
-	pdb := pdb(wc)
+	pdb := utils.PDBBase(wc)
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
 		// Set owner reference so the PDB gets automatically deleted if the WorkloadClass is deleted
 		if err := controllerutil.SetControllerReference(wc, pdb, r.Scheme); err != nil {
 			return err
 		}
-		return syncPDBWithWorkloadClass(wc, pdb)
+		return utils.SyncPDBWithWorkloadClass(wc, pdb)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to reconcile PDB: %w", err)
@@ -221,48 +219,6 @@ func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *wor
 
 	logf.FromContext(ctx).Info("Reconciled PDB", "operation", op)
 	return nil
-}
-
-func syncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget) error {
-	if wc == nil {
-		return fmt.Errorf("failed to sync PDB with WorkloadClass, WorkloadClass is nil")
-	}
-
-	// Selectors must match exactly
-	pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
-
-	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget
-	policy := policyv1.IfHealthyBudget
-	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
-
-	var open = intstr.IntOrString{
-		Type:   1, // Type 1 is a string
-		StrVal: "100%",
-	}
-	var closed = intstr.IntOrString{
-		Type:   0, // Type 0 is an int
-		IntVal: 0,
-	}
-
-	maxUnavailableMap := map[workloadsv1.MaintenanceReadiness]*intstr.IntOrString{
-		workloadsv1.ReadinessReady:    &open,
-		workloadsv1.ReadinessNotReady: &closed,
-		workloadsv1.ReadinessOverdue:  &open,
-	}
-
-	// Set MaxUnavailable based on the WorkloadClass' MaintenanceReadiness
-	pdb.Spec.MaxUnavailable = maxUnavailableMap[wc.Status.MaintenanceReadiness]
-
-	return nil
-}
-
-func pdb(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
-	return &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("workload-%s", wc.Name),
-			Namespace: wc.Namespace,
-		},
-	}
 }
 
 func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
