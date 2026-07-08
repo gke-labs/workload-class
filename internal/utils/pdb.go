@@ -122,7 +122,7 @@ func AllowLease(pdb *policyv1.PodDisruptionBudget) bool {
 }
 
 // PDBWithLease configures a PDB with annotations to represent a temporary lease and sets MaxUnavailable to 100%
-func PDBWithLease(ctx context.Context, client client.Client, pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) error {
+func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) error {
 	if wc == nil {
 		return fmt.Errorf("failed to update PDB with lease, WorkloadClass is nil")
 	}
@@ -150,7 +150,7 @@ func PDBWithLease(ctx context.Context, client client.Client, pdb *policyv1.PodDi
 	}
 
 	pdb.Annotations[BypassPod] = pod.Name
-	pdb.Annotations[BypassExpiration] = time.Now().Add(5 * time.Second).String()
+	pdb.Annotations[BypassExpiration] = time.Now().Add(5 * time.Second).Format(ExpirationFormat)
 
 	return nil
 }
