@@ -23,12 +23,17 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -50,6 +55,7 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods;namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop.
 func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -76,7 +82,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 2. Check if other existing WorkloadClasses have the same PodSelector
-	err = r.validateSelectors(ctx, wc)
+	overlappingClasses, err := r.validateSelectors(ctx, wc)
 	if err != nil {
 		// Emit a warning event
 		r.Recorder.Eventf(
@@ -106,7 +112,157 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// 4. Reconcile the PDB
+	err = r.reconcilePDB(ctx, wc, validationCond, overlappingClasses)
+	if err != nil {
+		r.Recorder.Eventf(
+			wc,
+			nil,
+			corev1.EventTypeWarning,
+			"ReconcilePDBFailed",
+			"Reconciling PodDisruptionBudget",
+			"Failed to reconcile PDB: %s",
+			err.Error(),
+		)
+	}
+
 	return ctrl.Result{RequeueAfter: nextReconcile}, nil
+}
+
+func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, overlappingClasses []workloadsv1.WorkloadClass) error {
+	log := logf.FromContext(ctx)
+
+	// If the WorkloadClass is invalid, delete the associated PDB
+	if condition.Reason != workloadsv1.ReasonValidationPassed {
+		log.Info(fmt.Sprintf("WorkloadClass %s is invalid, deleting associated PDB", wc.Name))
+		return r.deletePDB(ctx, wc)
+	}
+
+	// Check if the current WorkloadClass is the namespace default
+	namespaceDefaultWC, err := r.namespaceDefault(ctx, wc)
+	if err != nil {
+		return err
+	}
+
+	if namespaceDefaultWC == wc.Name {
+		return r.createOrUpdatePDB(ctx, wc)
+	} else if namespaceDefaultWC != "" {
+		// There exists a namespace default WorkloadClass, but it is not this WorkloadClass
+		return r.deletePDB(ctx, wc)
+	}
+
+	// Check if other WC's have the same selector
+	if len(overlappingClasses) == 0 {
+		return r.createOrUpdatePDB(ctx, wc)
+	}
+
+	// Check if the current WorkloadClass is the oldest one with these selectors
+	if oldestWorkloadClass(wc, overlappingClasses).Name == wc.Name {
+		return r.createOrUpdatePDB(ctx, wc)
+	}
+
+	return r.deletePDB(ctx, wc)
+}
+
+func (r *WorkloadClassReconciler) namespaceDefault(ctx context.Context, wc *workloadsv1.WorkloadClass) (string, error) {
+	const defaultClassLabel = "workloads.gke.io/default-class"
+	ns := &corev1.Namespace{}
+
+	// We use types.NamespacedName. Since Namespaces are cluster-scoped,
+	// the Namespace field inside NamespacedName is left empty, and we just provide the Name.
+	reqKey := types.NamespacedName{Name: wc.Namespace}
+	if err := r.Get(ctx, reqKey, ns); err != nil {
+		return "", fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
+	}
+
+	if value, ok := ns.Labels[defaultClassLabel]; ok {
+		return value, nil
+	}
+
+	return "", nil
+}
+
+func oldestWorkloadClass(wc *workloadsv1.WorkloadClass, overlappingClasses []workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
+	oldest := wc
+	for _, c := range overlappingClasses {
+		if c.CreationTimestamp.Before(&oldest.CreationTimestamp) {
+			oldest = &c
+		}
+	}
+	return oldest
+}
+
+func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+	pdb := pdb(wc)
+
+	if err := r.Delete(ctx, pdb); err != nil {
+		// If it's already gone, that's a success for a delete operation
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete PDB: %w", err)
+	}
+
+	return nil
+}
+
+func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+	pdb := pdb(wc)
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		// Set owner reference so the PDB gets automatically deleted if the WorkloadClass is deleted
+		if err := controllerutil.SetControllerReference(wc, pdb, r.Scheme); err != nil {
+			return err
+		}
+		return syncPDBWithWorkloadClass(wc, pdb)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reconcile PDB: %w", err)
+	}
+
+	logf.FromContext(ctx).Info("Reconciled PDB", "operation", op)
+	return nil
+}
+
+func syncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget) error {
+	if wc == nil {
+		return fmt.Errorf("failed to sync PDB with WorkloadClass, WorkloadClass is nil")
+	}
+
+	// Selectors must match exactly
+	pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+
+	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget
+	policy := policyv1.IfHealthyBudget
+	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
+
+	var open = intstr.IntOrString{
+		Type:   1, // Type 1 is a string
+		StrVal: "100%",
+	}
+	var closed = intstr.IntOrString{
+		Type:   0, // Type 0 is an int
+		IntVal: 0,
+	}
+
+	maxUnavailableMap := map[workloadsv1.MaintenanceReadiness]*intstr.IntOrString{
+		workloadsv1.ReadinessReady:    &open,
+		workloadsv1.ReadinessNotReady: &closed,
+		workloadsv1.ReadinessOverdue:  &open,
+	}
+
+	// Set MaxUnavailable based on the WorkloadClass' MaintenanceReadiness
+	pdb.Spec.MaxUnavailable = maxUnavailableMap[wc.Status.MaintenanceReadiness]
+
+	return nil
+}
+
+func pdb(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("workload-%s", wc.Name),
+			Namespace: wc.Namespace,
+		},
+	}
 }
 
 func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
@@ -253,14 +409,14 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 // validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.
 // If another workloadclass has the exact same PodSelector, an error is returned to be emitted as a warning.
 // If two workloadclasses match a Pod with the same specificity, the oldest workloadclass takes precedence.
-func (r *WorkloadClassReconciler) validateSelectors(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+func (r *WorkloadClassReconciler) validateSelectors(ctx context.Context, wc *workloadsv1.WorkloadClass) ([]workloadsv1.WorkloadClass, error) {
 	workloadClasses := &workloadsv1.WorkloadClassList{}
 	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
-		return fmt.Errorf("failed to fetch workloadclasses: %w", err)
+		return nil, fmt.Errorf("failed to fetch workloadclasses: %w", err)
 	}
 
 	if len(workloadClasses.Items) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var matches []workloadsv1.WorkloadClass
@@ -273,7 +429,7 @@ func (r *WorkloadClassReconciler) validateSelectors(ctx context.Context, wc *wor
 		}
 	}
 
-	return formatError(wc, matches)
+	return matches, formatError(wc, matches)
 }
 
 func formatError(wc *workloadsv1.WorkloadClass, matches []workloadsv1.WorkloadClass) error {

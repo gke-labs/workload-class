@@ -24,11 +24,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/workload-class/test/utils"
 )
@@ -81,14 +81,14 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 
 		By("Creating a dummy Pod matching the WorkloadClass selector (retrying until webhook is ready)")
 		Eventually(func() error {
-			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_pod.yaml")
+			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_deployment.yaml")
 			_, err = utils.Run(cmd)
 			return err
 		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Failed to create test pod")
 
 		By("Waiting for the Pod to be ready")
 		verifyPodReady := func(g Gomega) {
-			cmd := exec.Command("kubectl", "get", "pod", "test-pod", "-n", "sample", "-o", "jsonpath={.status.phase}")
+			cmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].status.phase}")
 			out, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("Running"))
@@ -99,8 +99,8 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
-		By("cleaning up the dummy pod")
-		cmd := exec.Command("kubectl", "delete", "pod", "test-pod", "-n", "sample", "--ignore-not-found")
+		By("cleaning up the deployment")
+		cmd := exec.Command("kubectl", "delete", "deployment", "test-deployment", "-n", "sample", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -121,6 +121,14 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 	AfterEach(func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
+			By("Fetching controller manager pod name")
+			// Depending on your kubebuilder setup, the label might be 'control-plane=controller-manager'
+			// or 'app.kubernetes.io/name=workload-class'. We grab the first matching pod name.
+			podCmd := exec.Command("kubectl", "get", "pods", "-n", namespace, "-l", "control-plane=controller-manager", "-o", "jsonpath={.items[0].metadata.name}")
+			if podOutput, err := utils.Run(podCmd); err == nil && podOutput != "" {
+				controllerPodName = strings.TrimSpace(podOutput)
+			}
+
 			By("Fetching controller manager pod logs")
 			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
 			controllerLogs, err := utils.Run(cmd)
@@ -154,16 +162,16 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		cmd := exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
 		_, _ = utils.Run(cmd)
 
-		// If test-pod was evicted, recreate it
-		By("Ensuring dummy pod exists")
-		cmd = exec.Command("kubectl", "delete", "pod", "test-pod", "-n", "sample", "--force", "--grace-period=0", "--ignore-not-found")
+		// Forcefully delete any existing pods for the deployment; the deployment controller will automatically spin up a fresh one
+		By("Ensuring a fresh dummy pod exists")
+		cmd = exec.Command("kubectl", "delete", "pods", "-n", "sample", "-l", "role=batch-processor", "--force", "--grace-period=0", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
-		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_pod.yaml")
+		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_deployment.yaml")
 		_, _ = utils.Run(cmd)
 
 		verifyPodReady := func(g Gomega) {
-			cmd := exec.Command("kubectl", "get", "pod", "test-pod", "-n", "sample", "-o", "jsonpath={.status.phase}")
+			cmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].status.phase}")
 			out, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("Running"))
@@ -190,20 +198,35 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
+			By("Validating the PDB allows disruptions")
+			Eventually(func() (string, error) {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return "", err
+				}
+				return strings.TrimSpace(output), nil
+			}, time.Minute, 2*time.Second).Should(Equal("100%"), "The PDB should allow 100% unavailable pods within the disruption window")
+
+			By("Fetching the dynamically generated pod name")
+			cmd = exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].metadata.name}")
+			podNameOutput, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to get the pod name")
+			podName := strings.TrimSpace(podNameOutput)
+			Expect(podName).NotTo(BeEmpty())
+
 			By("Attempting to evict the Pod via the eviction subresource")
-			yamlData, err := os.ReadFile("config/samples/eviction.yaml")
-			Expect(err).NotTo(HaveOccurred())
-
-			jsonData, err := yaml.YAMLToJSON(yamlData)
-			Expect(err).NotTo(HaveOccurred())
-
+			evictionURL := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", podName)
+			evictionJSON := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"sample"}}`, podName)
 			evictionFile := filepath.Join("/tmp", "eviction.json")
-			err = os.WriteFile(evictionFile, jsonData, 0644)
+			err = os.WriteFile(evictionFile, []byte(evictionJSON), 0644)
 			Expect(err).NotTo(HaveOccurred())
 
-			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile)
-			out, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Eviction should be allowed but failed: %s", out))
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile)
+				_, err := utils.Run(cmd)
+				return err
+			}, time.Minute, 2*time.Second).Should(Succeed(), "Eviction should eventually succeed within the disruption window")
 		})
 
 		It("should deny eviction of a pod because it is outside of the window", func() {
@@ -222,17 +245,18 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Attempting to evict the Pod via the eviction subresource")
-			yamlData, err := os.ReadFile("config/samples/eviction.yaml")
-			Expect(err).NotTo(HaveOccurred())
+			nameCmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].metadata.name}")
+			podNameOutput, err := utils.Run(nameCmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to fetch dynamic pod name")
+			podName := strings.TrimSpace(podNameOutput)
 
-			jsonData, err := yaml.YAMLToJSON(yamlData)
-			Expect(err).NotTo(HaveOccurred())
-
+			evictionURL := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", podName)
+			evictionJSON := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"sample"}}`, podName)
 			evictionFile := filepath.Join("/tmp", "eviction.json")
-			err = os.WriteFile(evictionFile, jsonData, 0644)
+			err = os.WriteFile(evictionFile, []byte(evictionJSON), 0644)
 			Expect(err).NotTo(HaveOccurred())
 
-			cmd = exec.Command("kubectl", "create", "--raw", "/api/v1/namespaces/sample/pods/test-pod/eviction", "-f", evictionFile)
+			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile)
 			out, err := utils.Run(cmd)
 			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the WorkloadClass policy")
 			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
