@@ -24,18 +24,21 @@ import (
 	"strings"
 	"time"
 
-	authv1 "k8s.io/api/authentication/v1"
-	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
-	"github.com/gke-labs/workload-class/internal/utils"
+	authv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // DisruptionWebhook handles Pod eviction requests.
@@ -89,17 +92,6 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		return admission.Allowed("Emergency override active")
 	}
 
-	// 4. Identity-Based Filtering
-	for _, allowedSubject := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
-		allowed, err := matchesIdentity(req.UserInfo, allowedSubject)
-		if err != nil {
-			log.Error(err, "Failed to check if UserInfo matches allowed Subject", "subject", allowedSubject)
-		}
-		if allowed {
-			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", allowedSubject))
-		}
-	}
-
 	// 5. Temporal Enforcement
 	now := time.Now().UTC()
 	inWindow, _ := utils.IsTimeInWindows(ctx, now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
@@ -110,7 +102,8 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	if !inWindow {
-		return admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", bestWC.Name))
+		// 6.1 Indentity-Based Filtering
+		return v.tryBypassWindowByIdentity(ctx, bestWC, req, pod)
 	}
 
 	// 7. Pod Lifecycle Protection (Min Initial Run)
@@ -232,6 +225,41 @@ func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, p
 	return nil
 }
 
+func (v *DisruptionWebhook) tryBypassWindowByIdentity(ctx context.Context, wc *workloadsv1.WorkloadClass, req admission.Request, pod *corev1.Pod) admission.Response {
+	for _, allowedSubject := range wc.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
+		matches, err := matchesIdentity(req.UserInfo, allowedSubject)
+		if err != nil {
+			logf.FromContext(ctx).Error(err, "Failed to check if UserInfo matches allowed Subject", "subject", allowedSubject)
+			continue
+		}
+		if matches {
+			return v.tryAcquirePDBLease(ctx, wc, pod)
+		}
+	}
+	return admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wc.Name))
+}
+
+func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) admission.Response {
+	var pdb *policyv1.PodDisruptionBudget
+	pdbName := utils.PDBName(wc.Name)
+	// If the PDB doesn't exist (not found), it will be created
+	if err := v.Client.Get(ctx, client.ObjectKey{Name: pdbName, Namespace: wc.Namespace}, pdb); err != nil && !errors.IsNotFound(err) {
+		return admission.Denied(fmt.Sprintf("Failed to get PDB %s: %s", pdbName, err))
+	}
+
+	if !utils.AllowLease(pdb) {
+		return admission.Denied(fmt.Sprintf("Disruption denied, PDB %s has an ongoing lease that expires at %s", pdb.Name, pdb.Annotations[utils.BypassExpiration]))
+	}
+
+	op, err := controllerutil.CreateOrUpdate(ctx, v.Client, pdb, func() error {
+		return utils.PDBWithLease(ctx, v.Client, pdb, wc, pod)
+	})
+	if err != nil {
+		return admission.Denied(fmt.Sprintf("Disruption denied, failed to lease PDB: %s", err))
+	}
+
+	return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user, PDB leased: %v", op))
+}
 func matchesIdentity(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
 	if subject.Name == "" {
 		return false, fmt.Errorf("subject name cannot be empty")
