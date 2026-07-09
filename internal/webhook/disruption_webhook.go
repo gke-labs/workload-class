@@ -33,7 +33,6 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -232,11 +231,10 @@ func (v *DisruptionWebhook) tryBypassWindowByIdentity(ctx context.Context, wc *w
 }
 
 func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) admission.Response {
-	var pdb *policyv1.PodDisruptionBudget
-	pdbName := utils.PDBName(wc.Name)
+	pdb := utils.PDBBase(wc)
 	// If the PDB doesn't exist (not found), it will be created
-	if err := v.Client.Get(ctx, client.ObjectKey{Name: pdbName, Namespace: wc.Namespace}, pdb); err != nil && !errors.IsNotFound(err) {
-		return admission.Denied(fmt.Sprintf("Failed to get PDB %s: %s", pdbName, err))
+	if err := v.Client.Get(ctx, client.ObjectKey{Name: pdb.Name, Namespace: wc.Namespace}, pdb); err != nil && !errors.IsNotFound(err) {
+		return admission.Denied(fmt.Sprintf("Failed to get PDB %s: %s", pdb.Name, err))
 	}
 
 	if !utils.AllowLease(pdb) {

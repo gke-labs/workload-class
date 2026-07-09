@@ -20,16 +20,23 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 	admissionv1 "k8s.io/api/admission/v1"
 	v1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -441,9 +448,14 @@ func TestHandle(t *testing.T) {
 		namespace = "namespace"
 		eviction  = "eviction"
 	)
+	torontoLoc, err := time.LoadLocation("America/Toronto")
+	if err != nil {
+		t.Fatalf("Failed to load timezone: %v", err)
+	}
+
 	var (
-		inWindowDay        = time.Now().Weekday().String()
-		outOfWindowDay     = time.Now().AddDate(0, 0, 1).Weekday().String()
+		inWindowDay        = time.Now().In(torontoLoc).Weekday().String()
+		outOfWindowDay     = time.Now().In(torontoLoc).AddDate(0, 0, 1).Weekday().String()
 		podNowCreationTime = time.Now()
 		labels             = map[string]string{"labelA": "valueA"}
 	)
@@ -482,6 +494,7 @@ func TestHandle(t *testing.T) {
 				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
 					{Name: "maintenance", DaysOfWeek: []string{outOfWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "America/Toronto"},
 				},
+				AllowedDisruptionsOutsideOfWindow: []string{"VPA"},
 			},
 		},
 	}
@@ -616,10 +629,10 @@ func TestHandle(t *testing.T) {
 			name:            "allowedUser",
 			desc:            "Allowed user, admission Allowed",
 			req:             evictionRequest,
-			getWCResp:       wc,
+			getWCResp:       wcOutOfWindow,
 			podCreationTime: podNowCreationTime,
 			readiness:       workloadsv1.ReadinessNotReady,
-			want:            admission.Allowed("Disruption allowed for authorized user: VPA"),
+			want:            admission.Allowed("Disruption allowed for authorized user, PDB leased: created"),
 		},
 		{
 			name:            "overdue",
@@ -653,6 +666,7 @@ func TestHandle(t *testing.T) {
 			name:            "inWindowNotOverduePodNotTooNew",
 			desc:            "In window, not overdue, Pod not too new, admission Allowed",
 			req:             evictionRequestNonMatchingUser,
+			getWCResp:       wc,
 			readiness:       workloadsv1.ReadinessNotReady,
 			podCreationTime: time.Now().AddDate(0, 0, -4),
 			want:            admission.Allowed("Eviction allowed by WorkloadClass policy"),
@@ -845,9 +859,193 @@ func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 			return fc.getPodError
 		}
 		fc.getPodResult.DeepCopyInto(typedObj)
+	case *policyv1.PodDisruptionBudget:
+		return k8serrors.NewNotFound(schema.GroupResource{Group: "policy", Resource: "poddisruptionbudgets"}, obj.GetName())
 	default:
 		return fmt.Errorf("unknown object type")
 	}
 
 	return nil
+}
+
+func (fc fakeClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return nil
+}
+
+func (fc fakeClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	return nil
+}
+
+func (fc fakeClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	return nil
+}
+
+func TestTryAcquirePDBLease(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = workloadsv1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	wcName := "test-wc"
+
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+	}
+
+	tests := []struct {
+		name       string
+		initObjs   []client.Object
+		wantDenied bool
+		wantMsg    string
+	}{
+		{
+			name:       "pdb_does_not_exist_successfully_creates_and_leases",
+			initObjs:   []client.Object{},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
+		{
+			name: "pdb_exists_and_lease_is_allowed_successfully_updates",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+					},
+					Spec: policyv1.PodDisruptionBudgetSpec{
+						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					},
+				},
+			},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
+		{
+			name: "pdb_exists_but_has_ongoing_lease_denied",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        "other-pod",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: true,
+			wantMsg:    "Disruption denied, PDB workload-test-wc has an ongoing lease",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.initObjs...).Build()
+			v := &DisruptionWebhook{
+				Client: fakeClient,
+			}
+
+			resp := v.tryAcquirePDBLease(context.Background(), wc, pod)
+			if resp.Allowed == tt.wantDenied {
+				t.Errorf("tryAcquirePDBLease() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
+			}
+			if !strings.HasPrefix(resp.Result.Message, tt.wantMsg) {
+				t.Errorf("tryAcquirePDBLease() msg = %v, want prefix %v", resp.Result.Message, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestTryBypassWindowByIdentity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = workloadsv1.AddToScheme(scheme)
+
+	namespace := "default"
+	podName := "test-pod"
+	wcName := "test-wc"
+
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionsOutsideOfWindow: []string{"test-user"},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+	}
+
+	tests := []struct {
+		name       string
+		username   string
+		initObjs   []client.Object
+		wantDenied bool
+		wantMsg    string
+	}{
+		{
+			name:       "user_does_not_match_identity",
+			username:   "unauthorized-user",
+			initObjs:   []client.Object{},
+			wantDenied: true,
+			wantMsg:    "Eviction blocked: currently outside of allowed disruption windows",
+		},
+		{
+			name:       "user_matches_identity_acquires_lease",
+			username:   "test-user",
+			initObjs:   []client.Object{},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
+		{
+			name:     "user_matches_identity_but_lease_denied",
+			username: "test-user",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        "other-pod",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: true,
+			wantMsg:    "Disruption denied, PDB workload-test-wc has an ongoing lease",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.initObjs...).Build()
+			v := &DisruptionWebhook{
+				Client: fakeClient,
+			}
+
+			req := admission.Request{}
+			req.UserInfo.Username = tt.username
+
+			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod)
+			if resp.Allowed == tt.wantDenied {
+				t.Errorf("tryBypassWindowByIdentity() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
+			}
+			if !strings.HasPrefix(resp.Result.Message, tt.wantMsg) {
+				t.Errorf("tryBypassWindowByIdentity() msg = %v, want prefix %v", resp.Result.Message, tt.wantMsg)
+			}
+		})
+	}
 }
