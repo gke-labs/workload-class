@@ -173,7 +173,7 @@ func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisrupt
 func PDBBase(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("workload-%s", wc.Name),
+			Name:      PDBName(wc.Name),
 			Namespace: wc.Namespace,
 		},
 	}
