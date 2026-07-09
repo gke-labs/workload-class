@@ -57,7 +57,14 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDi
 	}
 
 	if pdb == nil {
-		pdb = PDBBase(wc)
+		return fmt.Errorf("failed to sync PDB with WorkloadClass, PDB is nil")
+	}
+
+	if pdb.Name == "" {
+		pdb.Name = PDBName(wc.Name)
+	}
+	if pdb.Namespace == "" {
+		pdb.Namespace = wc.Namespace
 	}
 
 	// Selectors must match exactly
@@ -128,7 +135,14 @@ func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisrupt
 	}
 
 	if pdb == nil {
-		pdb = PDBBase(wc)
+		return fmt.Errorf("failed to update PDB with lease, PDB is nil")
+	}
+
+	if pdb.Name == "" {
+		pdb.Name = PDBName(wc.Name)
+	}
+	if pdb.Namespace == "" {
+		pdb.Namespace = wc.Namespace
 	}
 
 	// Selectors must match exactly
@@ -155,7 +169,7 @@ func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisrupt
 	return nil
 }
 
-// PDBBase returns a basic PDB, configured based on the WorkloadClass
+// PDBBase returns a basic PDB, with the name and namespace configured based on the WorkloadClass
 func PDBBase(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
