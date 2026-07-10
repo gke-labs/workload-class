@@ -881,6 +881,34 @@ spec:
   selfSigned: {}
 ---
 apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: workload-class-system/workload-class-serving-cert
+  name: workload-class-mutating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /mutate-workloads-gke-io-v1-workloadclass
+  failurePolicy: Fail
+  name: mworkloadclass-v1.kb.io
+  rules:
+  - apiGroups:
+    - workloads.gke.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workloadclasses
+  sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   annotations:
@@ -907,6 +935,26 @@ webhooks:
     resources:
     - pods
     - pods/eviction
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /validate-workloads-gke-io-v1-workloadclass
+  failurePolicy: Fail
+  name: vworkloadclass-v1.kb.io
+  rules:
+  - apiGroups:
+    - workloads.gke.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workloadclasses
   sideEffects: None
 - admissionReviewVersions:
   - v1
