@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,6 +63,10 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	wc := &workloadsv1.WorkloadClass{}
 	if err := r.Get(ctx, req.NamespacedName, wc); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if err := r.manageFinalizer(ctx, wc); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// 1. Fetch Guardrails and validate
@@ -127,6 +132,21 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{RequeueAfter: nextReconcile}, nil
 }
 
+func (r *WorkloadClassReconciler) manageFinalizer(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+	const finalizer = "workloads.gke.io/replace-namespace-default"
+
+	if wc.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The WorkloadClass is not being deleted.
+		// Add the finalizer if it does not already have it.
+		if !controllerutil.ContainsFinalizer(wc, finalizer) {
+			controllerutil.AddFinalizer(wc, finalizer)
+			return r.Update(ctx, wc)
+		}
+	}
+
+	return nil
+}
+
 func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, overlappingClasses []workloadsv1.WorkloadClass) error {
 	log := logf.FromContext(ctx)
 
@@ -142,9 +162,9 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 		return err
 	}
 
-	if namespaceDefaultWC == wc.Name {
+	if namespaceDefaultWC.Name == wc.Name {
 		return r.createOrUpdatePDB(ctx, wc)
-	} else if namespaceDefaultWC != "" {
+	} else if namespaceDefaultWC != nil {
 		// There exists a namespace default WorkloadClass, but it is not this WorkloadClass
 		return r.deletePDB(ctx, wc)
 	}
@@ -162,7 +182,7 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 	return r.deletePDB(ctx, wc)
 }
 
-func (r *WorkloadClassReconciler) namespaceDefault(ctx context.Context, wc *workloadsv1.WorkloadClass) (string, error) {
+func (r *WorkloadClassReconciler) namespaceDefault(ctx context.Context, wc *workloadsv1.WorkloadClass) (*workloadsv1.WorkloadClass, error) {
 	const defaultClassLabel = "workloads.gke.io/default-class"
 	ns := &corev1.Namespace{}
 
@@ -170,14 +190,20 @@ func (r *WorkloadClassReconciler) namespaceDefault(ctx context.Context, wc *work
 	// the Namespace field inside NamespacedName is left empty, and we just provide the Name.
 	reqKey := types.NamespacedName{Name: wc.Namespace}
 	if err := r.Get(ctx, reqKey, ns); err != nil {
-		return "", fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
+		return nil, fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
 	}
 
 	if value, ok := ns.Labels[defaultClassLabel]; ok {
-		return value, nil
+		defaultWC := &workloadsv1.WorkloadClass{}
+		key := types.NamespacedName{Name: value, Namespace: ns.Name}
+		if err := r.Get(ctx, key, defaultWC); err != nil {
+			return nil, err
+		}
+
+		return defaultWC, nil
 	}
 
-	return "", nil
+	return nil, nil
 }
 
 func oldestWorkloadClass(wc *workloadsv1.WorkloadClass, overlappingClasses []workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
@@ -426,6 +452,7 @@ func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),

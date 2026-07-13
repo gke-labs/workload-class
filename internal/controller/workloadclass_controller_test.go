@@ -1089,6 +1089,14 @@ func TestValidateSelectors(t *testing.T) {
 func TestNamespaceDefault(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = workloadsv1.AddToScheme(scheme)
+
+	criticalBatch := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "critical-batch",
+			Namespace: "test-ns",
+		},
+	}
 
 	testCases := []struct {
 		name      string
@@ -1151,7 +1159,7 @@ func TestNamespaceDefault(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
 			if tc.namespace != nil {
-				clientBuilder = clientBuilder.WithObjects(tc.namespace)
+				clientBuilder = clientBuilder.WithObjects(tc.namespace, criticalBatch)
 			}
 			fakeClient := clientBuilder.Build()
 
@@ -1164,8 +1172,11 @@ func TestNamespaceDefault(t *testing.T) {
 				t.Errorf("namespaceDefault() error = %v, wantErr %v", err, tc.wantErr)
 				return
 			}
-			if got != tc.want {
-				t.Errorf("namespaceDefault() got = %q, want %q", got, tc.want)
+			if got != nil && got.Name != tc.want {
+				t.Errorf("namespaceDefault() got = %v, want %q", got, tc.want)
+			} else if got == nil && tc.want != "" {
+				t.Errorf("namespaceDefault() got nil, want %q", tc.want)
+
 			}
 		})
 	}
