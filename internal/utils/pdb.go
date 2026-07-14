@@ -18,6 +18,7 @@ package utils
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -47,6 +48,10 @@ const (
 // PDBs made for WorkloadClasses will have the prefix `workload-`
 func PDBName(wcName string) string {
 	return PDBNamePrefix + wcName
+}
+
+func WorkloadClassNameFromPDBName(pdbName string) string {
+	return strings.TrimPrefix(pdbName, PDBNamePrefix)
 }
 
 // SyncPDBWithWorkloadClass configures the PDB to match the WorkloadClass' disruption policy
