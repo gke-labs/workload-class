@@ -598,10 +598,6 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}),
 		).
 		Watches(
-			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
-			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
-		).
-		Watches(
 			&corev1.Pod{}, // Trigger Reconcile if a Pod associated with a lease on this WorkloadClass is deleted
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassByLease),
 			builder.WithPredicates(predicate.Funcs{
