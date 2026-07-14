@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
+<<<<<<< HEAD
 	"reflect"
+=======
+>>>>>>> eab7c92 (Add logic to replace/remove PDBs when a namespace default WC is removed/added)
 	"slices"
 	"strings"
 	"testing"
@@ -742,6 +745,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			_ = k8sClient.Delete(ctx, secondaryWC)
 			_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "workload-secondary-wc", Namespace: defaultNamespace}})
 		})
+<<<<<<< HEAD
 
 		It("should trigger reconciliation for other classes when the default label is removed from the namespace", func() {
 			By("Creating a default WorkloadClass")
@@ -856,6 +860,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 			_ = k8sClient.Delete(ctx, secondaryWC)
 			_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "workload-secondary-wc-test-3", Namespace: defaultNamespace}})
 		})
+=======
+>>>>>>> eab7c92 (Add logic to replace/remove PDBs when a namespace default WC is removed/added)
 	})
 })
 
@@ -1951,6 +1957,7 @@ func TestFindNonDefaultWorkloadClasses(t *testing.T) {
 		})
 	}
 }
+<<<<<<< HEAD
 
 func TestFindWorkloadClassesByNamespace(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -2052,3 +2059,5 @@ func TestFindWorkloadClassesByNamespace(t *testing.T) {
 		})
 	}
 }
+=======
+>>>>>>> eab7c92 (Add logic to replace/remove PDBs when a namespace default WC is removed/added)
