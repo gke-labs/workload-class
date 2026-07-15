@@ -277,15 +277,23 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying the PDB is generated and blocks disruptions outside the window")
-			Eventually(func() (string, error) {
-				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable}")
+			By("Verifying the PDB is generated, fully synced by the PDB controller, and blocks disruptions outside the window")
+			Eventually(func() (bool, error) {
+				// We check both maxUnavailable and observedGeneration.
+				// In CI environments, kube-apiserver's internal informer cache might lag.
+				// Waiting for observedGeneration ensures the Kubernetes PDB controller has processed it,
+				// giving the apiserver's cache time to sync, preventing the eviction API from missing the PDB.
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable},{.status.observedGeneration}")
 				output, err := utils.Run(cmd)
 				if err != nil {
-					return "", err
+					return false, err
 				}
-				return strings.TrimSpace(output), nil
-			}, time.Minute, 2*time.Second).Should(Equal("0"), "The PDB should be generated and block disruptions (maxUnavailable=0) outside the disruption window")
+				parts := strings.Split(strings.TrimSpace(output), ",")
+				if len(parts) == 2 && parts[0] == "0" && parts[1] != "" {
+					return true, nil
+				}
+				return false, nil
+			}, time.Minute, 2*time.Second).Should(BeTrue(), "The PDB should have maxUnavailable=0 and a populated observedGeneration")
 
 
 			By("Setting up RBAC so the impersonated autoscaler has permission to call the eviction API")
