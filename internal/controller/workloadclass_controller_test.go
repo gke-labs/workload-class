@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -36,10 +35,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 type GracePeriodSeconds int64
@@ -1345,7 +1344,7 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			expectedPDB := pdb(tc.wc)
+			expectedPDB := utils.PDBBase(tc.wc)
 			if tc.pdbExists {
 				// Inject an existing, outdated, PDB into the fake cluster
 				existingPDB := &policyv1.PodDisruptionBudget{
@@ -1386,116 +1385,6 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 						t.Errorf("Expected OwnerReference UID %q, got %q", tc.wc.UID, savedPDB.OwnerReferences[0].UID)
 					}
 				}
-			}
-		})
-	}
-}
-
-func TestSyncPDBWithWorkloadClass(t *testing.T) {
-	var (
-		openVal        = intstr.FromString("100%")
-		closedVal      = intstr.FromInt(0)
-		expectedPolicy = policyv1.IfHealthyBudget
-
-		basePodSelector = &metav1.LabelSelector{
-			MatchLabels: map[string]string{"app": "my-app"},
-		}
-	)
-
-	testCases := []struct {
-		name               string
-		wc                 *workloadsv1.WorkloadClass
-		pdb                *policyv1.PodDisruptionBudget
-		wantErr            bool
-		wantMaxUnavailable *intstr.IntOrString
-	}{
-		{
-			name:               "error_when_workload_class_is_nil",
-			wc:                 nil,
-			pdb:                &policyv1.PodDisruptionBudget{},
-			wantErr:            true,
-			wantMaxUnavailable: nil,
-		},
-		{
-			name: "sets_max_unavailable_to_100_percent_when_ready",
-			wc: &workloadsv1.WorkloadClass{
-				Spec: workloadsv1.WorkloadClassSpec{
-					PodSelector: basePodSelector.DeepCopy(),
-				},
-				Status: workloadsv1.WorkloadClassStatus{
-					MaintenanceReadiness: workloadsv1.ReadinessReady,
-				},
-			},
-			pdb:                &policyv1.PodDisruptionBudget{},
-			wantErr:            false,
-			wantMaxUnavailable: &openVal,
-		},
-		{
-			name: "sets_max_unavailable_to_0_when_not_ready",
-			wc: &workloadsv1.WorkloadClass{
-				Spec: workloadsv1.WorkloadClassSpec{
-					PodSelector: basePodSelector.DeepCopy(),
-				},
-				Status: workloadsv1.WorkloadClassStatus{
-					MaintenanceReadiness: workloadsv1.ReadinessNotReady,
-				},
-			},
-			pdb:                &policyv1.PodDisruptionBudget{},
-			wantErr:            false,
-			wantMaxUnavailable: &closedVal,
-		},
-		{
-			name: "sets_max_unavailable_to_100_percent_when_overdue",
-			wc: &workloadsv1.WorkloadClass{
-				Spec: workloadsv1.WorkloadClassSpec{
-					PodSelector: basePodSelector.DeepCopy(),
-				},
-				Status: workloadsv1.WorkloadClassStatus{
-					MaintenanceReadiness: workloadsv1.ReadinessOverdue,
-				},
-			},
-			pdb:                &policyv1.PodDisruptionBudget{},
-			wantErr:            false,
-			wantMaxUnavailable: &openVal,
-		},
-		{
-			name: "sets_max_unavailable_to_nil_for_unknown_readiness",
-			wc: &workloadsv1.WorkloadClass{
-				Spec: workloadsv1.WorkloadClassSpec{
-					PodSelector: basePodSelector.DeepCopy(),
-				},
-				Status: workloadsv1.WorkloadClassStatus{
-					// Leaving it empty or setting it to an unknown value
-					MaintenanceReadiness: "",
-				},
-			},
-			pdb:                &policyv1.PodDisruptionBudget{},
-			wantErr:            false,
-			wantMaxUnavailable: nil, // map lookup returns nil for missing keys
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := syncPDBWithWorkloadClass(tc.wc, tc.pdb)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("syncPDBWithWorkloadClass() error = %v, wantErr %v", err, tc.wantErr)
-				return // Don't verify mutations if we expected an error
-			}
-
-			if tc.wantErr {
-				return
-			}
-
-			if !reflect.DeepEqual(tc.pdb.Spec.Selector, basePodSelector) {
-				t.Errorf("Expected Selector to be %v, got %v", basePodSelector, tc.pdb.Spec.Selector)
-			}
-
-			if tc.pdb.Spec.UnhealthyPodEvictionPolicy == nil || *tc.pdb.Spec.UnhealthyPodEvictionPolicy != expectedPolicy {
-				t.Errorf("Expected UnhealthyPodEvictionPolicy to be %v, got %v", expectedPolicy, tc.pdb.Spec.UnhealthyPodEvictionPolicy)
-			}
-
-			if !reflect.DeepEqual(tc.pdb.Spec.MaxUnavailable, tc.wantMaxUnavailable) {
-				t.Errorf("Expected MaxUnavailable to be %v, got %v", tc.wantMaxUnavailable, tc.pdb.Spec.MaxUnavailable)
 			}
 		})
 	}
@@ -1595,7 +1484,7 @@ func TestReconcilePDB(t *testing.T) {
 
 			// Purposefully inject a dummy PDB beforehand.
 			// If deletePDB is called, it will vanish. If createOrUpdatePDB is called, it will remain/be updated.
-			expectedPDB := pdb(tc.wc)
+			expectedPDB := utils.PDBBase(tc.wc)
 			dummyPDB := &policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace},
 			}
