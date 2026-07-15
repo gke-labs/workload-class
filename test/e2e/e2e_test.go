@@ -261,5 +261,49 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the WorkloadClass policy")
 			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
 		})
+
+		It("should allow eviction of a pod outside of the window if requested by an allowed user (currently blocked due to PDB work)", func() {
+			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+
+			By("Patching the WorkloadClass to simulate being outside a disruption window AND allowing cluster-autoscaler")
+			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"maxNonDisruptionDurationDays": 10, "minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}], "allowedDisruptionsOutsideOfWindow": [{"kind": "ServiceAccount", "name": "cluster-autoscaler", "namespace": "kube-system"}]}}}`, notToday)
+			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Patching the Guardrail to allow tomorrow")
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Setting up RBAC so the impersonated autoscaler has permission to call the eviction API")
+			rbacCmd := exec.Command("kubectl", "create", "clusterrolebinding", "test-autoscaler-admin",
+				"--clusterrole=cluster-admin",
+				"--user=system:serviceaccount:kube-system:cluster-autoscaler")
+			_ = rbacCmd.Run() // Ignore error in case the binding already exists from previous runs
+
+			By("Attempting to evict the Pod via the eviction subresource as the cluster autoscaler")
+			nameCmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].metadata.name}")
+			podNameOutput, err := utils.Run(nameCmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to fetch dynamic pod name")
+			podName := strings.TrimSpace(podNameOutput)
+
+			evictionURL := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", podName)
+			evictionJSON := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"sample"}}`, podName)
+			evictionFile := filepath.Join("/tmp", "eviction.json")
+			err = os.WriteFile(evictionFile, []byte(evictionJSON), 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Append the --as flag to impersonate the autoscaler for the raw API request
+			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as=system:serviceaccount:kube-system:cluster-autoscaler")
+			out, err := utils.Run(cmd)
+
+			// Because the cluster-autoscaler is in the allowedDisruptionsOutsideOfWindow list,
+			// the webhook should NOT block the request, and err should be nil.
+			// Expect(err).NotTo(HaveOccurred(), "Eviction should be permitted for the autoscaler despite being outside the window")
+			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the PDB")
+			Expect(string(out)).To(ContainSubstring("Cannot evict pod as it would violate the pod's disruption budget"), "Eviction should be blocked by PDB")
+		})
 	})
 })

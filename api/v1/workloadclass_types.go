@@ -28,9 +28,9 @@ type DisruptionPolicy struct {
 	// +optional
 	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
 
-	// AllowedDisruptionsOutsideOfWindow specifies identities or components that can disrupt even outside of windows. (e.g. "VPA", "ClusterAutoscaler")
+	// AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
 	// +optional
-	AllowedDisruptionsOutsideOfWindow []string `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
+	AllowedDisruptionsOutsideOfWindow []Subject `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
 
 	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
 	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
@@ -72,6 +72,28 @@ type DisruptionWindow struct {
 	// EndTime is the end time of the window in HH:MM format (e.g. 04:00) in UTC.
 	// +kubebuilder:validation:Pattern=`^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$`
 	EndTime string `json:"endTime,omitempty"`
+}
+
+// Subject defines the identity of a user, group, or service account.
+// It is used to specify who or what is granted permissions or is the target
+// of a policy. The structure aligns with standard Kubernetes RBAC subjects.
+type Subject struct {
+	// Kind can be User, Group, or ServiceAccount
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=User;Group;ServiceAccount
+	Kind string `json:"kind"`
+
+	// Name of the identity
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// Namespace of the ServiceAccount (only for ServiceAccount kind)
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // WorkloadClassSpec defines the desired state of WorkloadClass
