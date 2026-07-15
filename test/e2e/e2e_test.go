@@ -277,6 +277,17 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
+			By("Verifying the PDB is generated and blocks disruptions outside the window")
+			Eventually(func() (string, error) {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return "", err
+				}
+				return strings.TrimSpace(output), nil
+			}, time.Minute, 2*time.Second).Should(Equal("0"), "The PDB should be generated and block disruptions (maxUnavailable=0) outside the disruption window")
+
+
 			By("Setting up RBAC so the impersonated autoscaler has permission to call the eviction API")
 			rbacCmd := exec.Command("kubectl", "create", "clusterrolebinding", "test-autoscaler-admin",
 				"--clusterrole=cluster-admin",
