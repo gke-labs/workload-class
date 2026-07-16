@@ -1326,7 +1326,8 @@ func TestTryAcquirePDBLease(t *testing.T) {
 				Client: fakeClient,
 			}
 
-			resp := v.tryAcquirePDBLease(context.Background(), wc, pod)
+			s := workloadsv1.Subject{Kind: "User", Name: "admin@example.com"}
+			resp := v.tryAcquirePDBLease(context.Background(), wc, pod, s)
 			if resp.Allowed == tt.wantDenied {
 				t.Errorf("tryAcquirePDBLease() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
 			}

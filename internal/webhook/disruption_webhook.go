@@ -35,6 +35,7 @@ import (
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -232,17 +233,21 @@ func (v *DisruptionWebhook) tryBypassWindowByIdentity(ctx context.Context, wc *w
 			continue
 		}
 		if matches {
-			return v.tryAcquirePDBLease(ctx, wc, pod)
+			return v.tryAcquirePDBLease(ctx, wc, pod, allowedSubject)
 		}
 	}
 	return admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wc.Name))
 }
 
-func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) admission.Response {
+func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) admission.Response {
 	pdb := utils.PDBBase(wc)
 	// If the PDB doesn't exist (not found), it will be created
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: pdb.Name, Namespace: wc.Namespace}, pdb); err != nil && !errors.IsNotFound(err) {
 		return admission.Denied(fmt.Sprintf("Failed to get PDB %s: %s", pdb.Name, err))
+	}
+
+	if subjectAlreadyLeasing(pdb, pod, subject) {
+		return admission.Allowed("Disruption allowed for authorized user, PDB already leased for this pod")
 	}
 
 	if !utils.AllowLease(pdb) {
@@ -250,7 +255,7 @@ func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workload
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, v.Client, pdb, func() error {
-		return utils.PDBWithLease(ctx, v.Client, pdb, wc, pod)
+		return utils.PDBWithLease(ctx, v.Client, pdb, wc, pod, subject)
 	})
 	if err != nil {
 		return admission.Denied(fmt.Sprintf("Disruption denied, failed to lease PDB: %s", err))
@@ -258,6 +263,19 @@ func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workload
 
 	return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user, PDB leased: %v", op))
 }
+
+// subjectAlreadyLeasing returns true if the PDB has a lease for the same Pod, the same Subject, and it hasn't expired yet
+func subjectAlreadyLeasing(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject workloadsv1.Subject) bool {
+	if pdb.Annotations == nil {
+		return false
+	}
+
+	sameBypassPod := pdb.Annotations[utils.BypassPod] == pod.Name
+	sameBypassSubject := pdb.Annotations[utils.BypassOwner] == utils.BypassOwnerValue(subject)
+
+	return sameBypassPod && sameBypassSubject && !utils.LeaseExpired(pdb)
+}
+
 func matchesIdentity(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
 	if subject.Name == "" {
 		return false, fmt.Errorf("subject name cannot be empty")
