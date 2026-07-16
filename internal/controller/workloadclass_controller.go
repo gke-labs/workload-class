@@ -192,7 +192,6 @@ func oldestWorkloadClass(wc *workloadsv1.WorkloadClass, overlappingClasses []wor
 
 func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
 	pdb := utils.PDBBase(wc)
-
 	if err := r.Delete(ctx, pdb); err != nil {
 		// If it's already gone, that's a success for a delete operation
 		if errors.IsNotFound(err) {

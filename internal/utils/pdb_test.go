@@ -252,7 +252,8 @@ func TestPDBWithLease(t *testing.T) {
 			ctx := context.Background()
 			var c client.Client // nil client is fine since it's unused in the func body
 
-			err := PDBWithLease(ctx, c, tt.pdb, tt.wc, tt.pod)
+			s := workloadsv1.Subject{Kind: "ServiceAccount", Name: "sam", Namespace: "system"}
+			err := PDBWithLease(ctx, c, tt.pdb, tt.wc, tt.pod, s)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PDBWithLease() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -274,6 +275,10 @@ func TestPDBWithLease(t *testing.T) {
 					t.Errorf("PDBWithLease() MaxUnavailable = %v, want %v", tt.pdb.Spec.MaxUnavailable, wantMaxUnavailable)
 				}
 				// 4. Annotations should include BypassPod and BypassExpiration
+				if tt.pdb.Annotations[BypassOwner] != BypassOwnerValue(s) {
+					t.Errorf("PDBWithLease() BypassPod annotation = %v, want %v", tt.pdb.Annotations[BypassOwner], BypassOwnerValue(s))
+				}
+
 				if tt.pdb.Annotations[BypassPod] != tt.pod.Name {
 					t.Errorf("PDBWithLease() BypassPod annotation = %v, want %v", tt.pdb.Annotations[BypassPod], tt.pod.Name)
 				}

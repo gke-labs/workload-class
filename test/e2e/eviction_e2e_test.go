@@ -262,7 +262,7 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
 		})
 
-		It("should allow eviction of a pod outside of the window if requested by an allowed user (currently blocked due to PDB work)", func() {
+		It("should allow eviction of a pod outside of the window if requested by an allowed user", func() {
 			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
 
 			By("Patching the WorkloadClass to simulate being outside a disruption window AND allowing cluster-autoscaler")
@@ -276,6 +276,24 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the PDB is generated, fully synced by the PDB controller, and blocks disruptions outside the window")
+			Eventually(func() (bool, error) {
+				// We check both maxUnavailable and observedGeneration.
+				// In CI environments, kube-apiserver's internal informer cache might lag.
+				// Waiting for observedGeneration ensures the Kubernetes PDB controller has processed it,
+				// giving the apiserver's cache time to sync, preventing the eviction API from missing the PDB.
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable},{.status.observedGeneration}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return false, err
+				}
+				parts := strings.Split(strings.TrimSpace(output), ",")
+				if len(parts) == 2 && parts[0] == "0" && parts[1] != "" {
+					return true, nil
+				}
+				return false, nil
+			}, time.Minute, 2*time.Second).Should(BeTrue(), "The PDB should have maxUnavailable=0 and a populated observedGeneration")
 
 			By("Setting up RBAC so the impersonated autoscaler has permission to call the eviction API")
 			rbacCmd := exec.Command("kubectl", "create", "clusterrolebinding", "test-autoscaler-admin",
@@ -296,14 +314,13 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			// Append the --as flag to impersonate the autoscaler for the raw API request
-			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as=system:serviceaccount:kube-system:cluster-autoscaler")
-			out, err := utils.Run(cmd)
-
 			// Because the cluster-autoscaler is in the allowedDisruptionsOutsideOfWindow list,
 			// the webhook should NOT block the request, and err should be nil.
-			// Expect(err).NotTo(HaveOccurred(), "Eviction should be permitted for the autoscaler despite being outside the window")
-			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the PDB")
-			Expect(string(out)).To(ContainSubstring("Cannot evict pod as it would violate the pod's disruption budget"), "Eviction should be blocked by PDB")
+			Eventually(func() error {
+				cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as=system:serviceaccount:kube-system:cluster-autoscaler")
+				_, err := utils.Run(cmd)
+				return err
+			}, "10s", "1s").ShouldNot(HaveOccurred(), "Eviction should be permitted for the autoscaler despite being outside the window")
 		})
 	})
 })

@@ -35,6 +35,7 @@ const (
 	PDBNamePrefix    = "workload-"
 	BypassPod        = "workloads.gke.io/bypass-pod"
 	BypassExpiration = "workloads.gke.io/bypass-expiration"
+	BypassOwner      = "workloads.gke.io/bypass-owner"
 	ExpirationFormat = "2006-01-02 15:04:05.999999999 -0700 MST"
 
 	openType  = 1      // Type 1 is a string
@@ -57,7 +58,14 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDi
 	}
 
 	if pdb == nil {
-		pdb = PDBBase(wc)
+		return fmt.Errorf("failed to sync PDB with WorkloadClass, PDB is nil")
+	}
+
+	if pdb.Name == "" {
+		pdb.Name = PDBName(wc.Name)
+	}
+	if pdb.Namespace == "" {
+		pdb.Namespace = wc.Namespace
 	}
 
 	// Selectors must match exactly
@@ -100,35 +108,29 @@ func AllowLease(pdb *policyv1.PodDisruptionBudget) bool {
 		return true
 	}
 
-	_, hasBypassAnnotation := pdb.Annotations[BypassPod]
-	expirationString, hasExpirationAnnotation := pdb.Annotations[BypassExpiration]
-
-	// If an annotation is missing, there is either no lease or an ongoing lease that is invalid
-	if !hasBypassAnnotation || !hasExpirationAnnotation {
+	// If the bypass annotation is missing, there is either no lease or an ongoing lease that is invalid
+	if _, hasBypassAnnotation := pdb.Annotations[BypassPod]; !hasBypassAnnotation {
 		return true
 	}
 
-	expirationTime, err := time.Parse(ExpirationFormat, expirationString)
-	if err != nil {
-		// If the time cannot be parsed, the lease is invalid
-		return true
-	}
-
-	if time.Now().Compare(expirationTime) >= 0 {
-		return true
-	}
-
-	return false
+	return LeaseExpired(pdb)
 }
 
 // PDBWithLease configures a PDB with annotations to represent a temporary lease and sets MaxUnavailable to 100%
-func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) error {
+func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
 	if wc == nil {
 		return fmt.Errorf("failed to update PDB with lease, WorkloadClass is nil")
 	}
 
 	if pdb == nil {
-		pdb = PDBBase(wc)
+		return fmt.Errorf("failed to update PDB with lease, PDB is nil")
+	}
+
+	if pdb.Name == "" {
+		pdb.Name = PDBName(wc.Name)
+	}
+	if pdb.Namespace == "" {
+		pdb.Namespace = wc.Namespace
 	}
 
 	// Selectors must match exactly
@@ -149,17 +151,46 @@ func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisrupt
 		pdb.Annotations = map[string]string{}
 	}
 
+	pdb.Annotations[BypassOwner] = BypassOwnerValue(subject)
 	pdb.Annotations[BypassPod] = pod.Name
 	pdb.Annotations[BypassExpiration] = time.Now().Add(5 * time.Second).Format(ExpirationFormat)
 
 	return nil
 }
 
-// PDBBase returns a basic PDB, configured based on the WorkloadClass
+// BypassOwnerValue returns the value of the workloads.gke.io/bypass-owner label based on the given subject
+func BypassOwnerValue(subject workloadsv1.Subject) string {
+	if subject.Kind == "User" || subject.Kind == "Group" {
+		return subject.Name
+	}
+
+	return fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
+}
+
+// LeaseExpired returns true if the PDB's lease has expired.
+// If the PDB lacks the workloads.gke.io/bypass-expiration annotation, it returns true.
+// If the value of the workloads.gke.io/bypass-expiration cannot be parsed, it returns true.
+// The expiration time is compared against time.Now().
+func LeaseExpired(pdb *policyv1.PodDisruptionBudget) bool {
+	expirationString, hasExpirationAnnotation := pdb.Annotations[BypassExpiration]
+	if !hasExpirationAnnotation {
+		return true
+	}
+
+	expirationTime, err := time.Parse(ExpirationFormat, expirationString)
+	if err != nil {
+		// If the time cannot be parsed, the lease is invalid
+		return true
+	}
+
+	return time.Now().Compare(expirationTime) >= 0
+}
+
+// PDBBase returns a basic PDB, with the name and namespace configured based on the WorkloadClass
 func PDBBase(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("workload-%s", wc.Name),
+			Name:      PDBName(wc.Name),
 			Namespace: wc.Namespace,
 		},
 	}
