@@ -30,10 +30,7 @@ import (
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-<<<<<<< HEAD
 	rbacv1 "k8s.io/api/rbac/v1"
-=======
->>>>>>> 2e35b59 (Add tests)
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
