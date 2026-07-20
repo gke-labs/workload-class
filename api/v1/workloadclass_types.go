@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -74,6 +75,14 @@ type DisruptionWindow struct {
 	EndTime string `json:"endTime,omitempty"`
 }
 
+// PluginConfig defines the configuration structure for a plugin
+type PluginConfig struct {
+	// PluginName identifies the registered plugin controller
+	PluginName string `json:"pluginName,omitempty"`
+	// ConfigRef points to the custom resource defining the plugin configuration
+	ConfigRef *corev1.LocalObjectReference `json:"configRef,omitempty"`
+}
+
 // WorkloadClassSpec defines the desired state of WorkloadClass
 type WorkloadClassSpec struct {
 	// PodSelector matches the pods that this class applies to.
@@ -83,6 +92,10 @@ type WorkloadClassSpec struct {
 	// DisruptionPolicy specifies the policy governing pod disruptions.
 	// +optional
 	DisruptionPolicy DisruptionPolicy `json:"disruptionPolicy,omitempty"`
+
+	// Plugins defines dictionaries of plugin configurations
+	// +optional
+	Plugins map[string]PluginConfig `json:"plugins,omitempty"`
 }
 
 type MaintenanceReadiness string
