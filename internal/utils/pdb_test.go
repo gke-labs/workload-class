@@ -384,6 +384,14 @@ func TestPDBWithLease(t *testing.T) {
 					t.Errorf("PDBWithLease BypassPodUID annotation = %s, want %v", uid, tt.pod.UID)
 				}
 
+				uid, ok := tt.pdb.Annotations[BypassPodUID]
+				if !ok {
+					t.Errorf("PDBWithLease() BypassPodUID annotation is missing")
+				}
+				if uid != string(tt.pod.UID) {
+					t.Errorf("PDBWithLease BypassPodUID annotation = %s, want %v", uid, tt.pod.UID)
+				}
+
 				// 5. Existing annotations shouldn't be wiped out
 				if tt.pdb.Annotations["existing"] != "annotation" {
 					t.Errorf("PDBWithLease() failed to preserve existing annotations")
