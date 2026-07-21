@@ -43,10 +43,15 @@ import (
 )
 
 const (
+<<<<<<< HEAD
 	namespace = "default"
 	podName   = "test-pod"
 	wcName    = "test-wc"
 	podUID    = "pod-uid-1234"
+=======
+	podName = "test-pod"
+	podUID  = "pod-uid-1234"
+>>>>>>> 54b1443 (Add logic to disruption webhook to set/use the pod UID in the PDB annotations)
 )
 
 func TestGetSpecificity(t *testing.T) {
@@ -1400,6 +1405,43 @@ func TestTryAcquirePDBLease(t *testing.T) {
 							utils.BypassPod:        "other-pod",
 							utils.BypassPodUID:     "other-pod-uid",
 							utils.BypassOwner:      "other-user",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: true,
+			wantMsg:    "Disruption denied, PDB workload-test-wc has an ongoing lease",
+		},
+		{
+			name: "pdb_exists_but_has_ongoing_lease_for_same_pod",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        podName,
+							utils.BypassPodUID:     podUID,
+							utils.BypassOwner:      "admin@example.com",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: false,
+		},
+		{
+			name: "pdb_exists_but_has_ongoing_lease_for_pod_with_same_name_different_uid",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        podName,
+							utils.BypassPodUID:     "new-pod-same-name",
+							utils.BypassOwner:      "admin@example.com",
 							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
 						},
 					},
