@@ -33,6 +33,7 @@ import (
 const (
 	PDBNamePrefix    = "workload-"
 	BypassPod        = "workloads.gke.io/bypass-pod"
+	BypassPodUID     = "workloads.gke.io/bypass-pod-uid"
 	BypassExpiration = "workloads.gke.io/bypass-expiration"
 	BypassOwner      = "workloads.gke.io/bypass-owner"
 	ExpirationFormat = "2006-01-02 15:04:05.999999999 -0700 MST"
@@ -116,8 +117,11 @@ func AllowLease(pdb *policyv1.PodDisruptionBudget) bool {
 		return true
 	}
 
-	// If the bypass annotation is missing, there is either no lease or an ongoing lease that is invalid
-	if _, hasBypassAnnotation := pdb.Annotations[BypassPod]; !hasBypassAnnotation {
+	// If a bypass annotation is missing, there is either no lease or an ongoing lease that is invalid
+	_, hasBypassAnnotation := pdb.Annotations[BypassPod]
+	_, hasBypassPodUID := pdb.Annotations[BypassPodUID]
+	_, hasOwner := pdb.Annotations[BypassOwner]
+	if !hasBypassAnnotation || !hasBypassPodUID || !hasOwner {
 		return true
 	}
 
@@ -166,6 +170,7 @@ func PDBWithLease(pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadCla
 
 	pdb.Annotations[BypassOwner] = BypassOwnerValue(subject)
 	pdb.Annotations[BypassPod] = pod.Name
+	pdb.Annotations[BypassPodUID] = string(pod.UID)
 	pdb.Annotations[BypassExpiration] = time.Now().Add(5 * time.Second).Format(ExpirationFormat)
 
 	return nil
