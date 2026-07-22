@@ -55,7 +55,7 @@ func WorkloadClassNameFromPDBName(pdbName string) string {
 }
 
 // SyncPDBWithWorkloadClass configures the PDB to match the WorkloadClass' disruption policy
-func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget) error {
+func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget, namespaceDefault bool) error {
 	if wc == nil {
 		return fmt.Errorf("failed to sync PDB with WorkloadClass, WorkloadClass is nil")
 	}
@@ -71,8 +71,13 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDi
 		pdb.Namespace = wc.Namespace
 	}
 
-	// Selectors must match exactly
-	pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+	if namespaceDefault {
+		// Setting the Selector to an empty LabelSelector will target all pods in the namespace
+		pdb.Spec.Selector = &metav1.LabelSelector{}
+	} else {
+		// If this is not the namespace default PDB, selectors must match exactly
+		pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+	}
 
 	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget
 	policy := policyv1.IfHealthyBudget
@@ -120,7 +125,7 @@ func AllowLease(pdb *policyv1.PodDisruptionBudget) bool {
 }
 
 // PDBWithLease configures a PDB with annotations to represent a temporary lease and sets MaxUnavailable to 100%
-func PDBWithLease(pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
+func PDBWithLease(pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject, namespaceDefault bool) error {
 	if wc == nil {
 		return fmt.Errorf("failed to update PDB with lease, WorkloadClass is nil")
 	}
@@ -136,8 +141,13 @@ func PDBWithLease(pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadCla
 		pdb.Namespace = wc.Namespace
 	}
 
-	// Selectors must match exactly
-	pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+	if namespaceDefault {
+		// For the namespace default, an empty label selector will target all pods in the namespace
+		pdb.Spec.Selector = &metav1.LabelSelector{}
+	} else {
+		// If not the namespace default, selectors must match exactly
+		pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+	}
 
 	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget
 	policy := policyv1.IfHealthyBudget
