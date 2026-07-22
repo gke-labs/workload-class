@@ -301,7 +301,7 @@ func TestPDBWithLease(t *testing.T) {
 					Annotations: map[string]string{"existing": "annotation"},
 				},
 			},
-			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
+			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", UID: "pod-uid"}},
 			nsDefault:    true,
 			wantSelector: &metav1.LabelSelector{},
 			wantErr:      false,
