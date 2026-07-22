@@ -466,16 +466,24 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// findNonDefaultWorkloadClasses is an event handler map function that triggers reconciliation for
-// multiple WorkloadClasses when the PDB of the default WorkloadClass is modified or deleted.
-// Algorithm:
+// findNonDefaultWorkloadClasses triggers reconciliation for all non-default WorkloadClasses
+// when the namespace default PDB is created or deleted.
+//
+// PDB Management Rules:
+//   - With a Namespace Default: Its PDB uses an empty selector to target all pods. PDBs
+//     for all other WorkloadClasses in the namespace must be deleted.
+//   - Without a Namespace Default: Every WorkloadClass must generate its own PDB based on
+//     its specific pod selector.
+//
+// When the default PDB is created or deleted, this handler enqueues all other WorkloadClasses
+// in the namespace so they can correctly regenerate or delete their own PDBs to match
+// the current namespace default state.
+//
+// Algorithm for fetching WorkloadClasses to reconcile:
 //  1. Determine the WorkloadClass associated with the triggering PDB.
 //  2. Check if this WorkloadClass is currently set as the default for the namespace.
 //  3. If it is the default, list all WorkloadClasses in the namespace and enqueue
 //     requests for all of them except the default one itself.
-//
-// This means it will reconcile multiple classes in the absence of the default class
-// (e.g., when the default class or its PDB is deleted), ensuring they can update their state accordingly.
 func (r *WorkloadClassReconciler) findNonDefaultWorkloadClasses(ctx context.Context, obj client.Object) []reconcile.Request {
 	var workloadClassName string
 	pdb := obj.(*policyv1.PodDisruptionBudget)
