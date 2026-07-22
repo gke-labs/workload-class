@@ -44,6 +44,11 @@ import (
 	"github.com/gke-labs/workload-class/internal/utils"
 )
 
+const (
+	isNamespaceDefault  = true
+	notNamespaceDefault = false
+)
+
 // WorkloadClassReconciler reconciles a WorkloadClass object
 type WorkloadClassReconciler struct {
 	client.Client
@@ -154,7 +159,7 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 	}
 
 	if namespaceDefaultWC != nil && namespaceDefaultWC.Name == wc.Name {
-		return r.createOrUpdatePDB(ctx, wc)
+		return r.createOrUpdatePDB(ctx, wc, isNamespaceDefault)
 	} else if namespaceDefaultWC != nil && namespaceDefaultWC.DeletionTimestamp.IsZero() {
 		// There exists a namespace default WorkloadClass, but it is not this WorkloadClass
 		return r.deletePDB(ctx, wc)
@@ -164,12 +169,12 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 
 	// Check if other WC's have the same selector
 	if len(overlappingClasses) == 0 {
-		return r.createOrUpdatePDB(ctx, wc)
+		return r.createOrUpdatePDB(ctx, wc, notNamespaceDefault)
 	}
 
 	// Check if the current WorkloadClass is the oldest one with these selectors
 	if oldestWorkloadClass(wc, overlappingClasses).Name == wc.Name {
-		return r.createOrUpdatePDB(ctx, wc)
+		return r.createOrUpdatePDB(ctx, wc, notNamespaceDefault)
 	}
 
 	return r.deletePDB(ctx, wc)
@@ -226,14 +231,14 @@ func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1
 	return nil
 }
 
-func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *workloadsv1.WorkloadClass, namespaceDefault bool) error {
 	pdb := utils.PDBBase(wc)
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
 		// Set owner reference so the PDB gets automatically deleted if the WorkloadClass is deleted
 		if err := controllerutil.SetControllerReference(wc, pdb, r.Scheme); err != nil {
 			return err
 		}
-		return utils.SyncPDBWithWorkloadClass(wc, pdb)
+		return utils.SyncPDBWithWorkloadClass(wc, pdb, namespaceDefault)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to reconcile PDB: %w", err)

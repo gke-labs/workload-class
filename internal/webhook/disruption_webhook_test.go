@@ -377,15 +377,17 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 		getWCError    error
 		getWCResult   *workloadsv1.WorkloadClass
 		wantBestMatch *workloadsv1.WorkloadClass
+		wantNSDefault bool
 		wantErr       bool
 	}{
 		{
-			name:         "error_listing_wcs",
-			desc:         "Error listing WorkloadClasses, expect nil result and error",
-			listWCError:  fmt.Errorf("error listing WorkloadClasses"),
-			listWCResult: &workloadsv1.WorkloadClassList{},
-			getNSResult:  nsNoDefault,
-			wantErr:      true,
+			name:          "error_listing_wcs",
+			desc:          "Error listing WorkloadClasses, expect nil result and error",
+			listWCError:   fmt.Errorf("error listing WorkloadClasses"),
+			listWCResult:  &workloadsv1.WorkloadClassList{},
+			getNSResult:   nsNoDefault,
+			wantNSDefault: false,
+			wantErr:       true,
 		},
 		{
 			name: "success_getting_namespace_default",
@@ -396,6 +398,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			getNSResult:   nsWithDefault,
 			getWCResult:   &wcDefault,
 			wantBestMatch: &wcDefault,
+			wantNSDefault: true,
 			wantErr:       false,
 		},
 		{
@@ -406,6 +409,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			},
 			getNSResult:   nsNoDefault,
 			wantBestMatch: &wc,
+			wantNSDefault: false,
 			wantErr:       false,
 		},
 	}
@@ -422,12 +426,15 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			v := &DisruptionWebhook{
 				Client: client,
 			}
-			gotBestMatch, err := v.bestMatchWorkloadClass(ctx, req, pod)
+			gotBestMatch, gotNSDefault, err := v.bestMatchWorkloadClass(ctx, req, pod)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("bestMatchWorkloadClass returned unexpected error, got: %v, wantErr: %v", err, tc.wantErr)
 			}
 			if err != nil {
 				return
+			}
+			if gotNSDefault != tc.wantNSDefault {
+				t.Errorf("bestMatchWorkloadClass() returned an unexpected result for namespaceDefault, got %v, want %v", gotNSDefault, tc.wantNSDefault)
 			}
 			if (gotBestMatch != nil) != (tc.wantBestMatch != nil) {
 				t.Errorf("bestMatchWorkloadClass() returned an unexpected result, got: %v, want: %v", gotBestMatch, tc.wantBestMatch)
@@ -778,12 +785,15 @@ func TestBestMatchWorkloadClass_EmitEvent(t *testing.T) {
 	}
 
 	t.Run("validate_event_emitted", func(t *testing.T) {
-		gotBestMatch, err := v.bestMatchWorkloadClass(ctx, req, pod)
+		gotBestMatch, nsDefault, err := v.bestMatchWorkloadClass(ctx, req, pod)
 		if err != nil {
 			t.Fatalf("bestMatchWorkloadClass returned unexpected error: %v", err)
 		}
 		if gotBestMatch.Name != "wc1" {
 			t.Errorf("Expected wc1 to be best match, got: %s", gotBestMatch.Name)
+		}
+		if nsDefault {
+			t.Error("Expected wc1 to not be the namespace default")
 		}
 		// Verify that the event was emitted
 		select {
@@ -1326,7 +1336,7 @@ func TestTryAcquirePDBLease(t *testing.T) {
 			}
 
 			s := workloadsv1.Subject{Kind: "User", Name: "admin@example.com"}
-			resp := v.tryAcquirePDBLease(context.Background(), wc, pod, s)
+			resp := v.tryAcquirePDBLease(context.Background(), wc, pod, s, false)
 			if resp.Allowed == tt.wantDenied {
 				t.Errorf("tryAcquirePDBLease() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
 			}
@@ -1416,7 +1426,7 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 			req := admission.Request{}
 			req.UserInfo.Username = tt.username
 
-			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod)
+			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod, false)
 			if resp.Allowed == tt.wantDenied {
 				t.Errorf("tryBypassWindowByIdentity() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
 			}
