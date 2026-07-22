@@ -226,7 +226,6 @@ func TestUpdateBestMatch(t *testing.T) {
 }
 
 func TestNamespaceDefaultWorkloadClass(t *testing.T) {
-	const defaultClassAnnotation = "workloads.gke.io/default-class"
 	const namespace = "namespace"
 	wc := &workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{
@@ -247,7 +246,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			Name:      "namespace-default",
 			Namespace: namespace,
 			Labels: map[string]string{
-				defaultClassAnnotation: "wc",
+				workloadsv1.DefaultClassLabel: "wc",
 			},
 		},
 	}
@@ -360,7 +359,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			Name:      "namespace-with-wc",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"workloads.gke.io/default-class": "wc-default",
+				workloadsv1.DefaultClassLabel: "wc-default",
 			},
 		},
 	}
