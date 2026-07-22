@@ -44,6 +44,11 @@ import (
 	"github.com/gke-labs/workload-class/internal/utils"
 )
 
+const (
+	isNamespaceDefault  = true
+	notNamespaceDefault = false
+)
+
 // WorkloadClassReconciler reconciles a WorkloadClass object
 type WorkloadClassReconciler struct {
 	client.Client
