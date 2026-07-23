@@ -36,18 +36,21 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 		name               string
 		wc                 *workloadsv1.WorkloadClass
 		pdb                *policyv1.PodDisruptionBudget
+		nsDefault          bool
 		wantErr            bool
+		wantSelector       *metav1.LabelSelector
 		wantMaxUnavailable *intstr.IntOrString
 		wantUnhealthyEvict *policyv1.UnhealthyPodEvictionPolicyType
 	}{
 		{
-			name:    "workload_class_is_nil",
-			wc:      nil,
-			pdb:     &policyv1.PodDisruptionBudget{},
-			wantErr: true,
+			name:      "workload_class_is_nil",
+			wc:        nil,
+			pdb:       &policyv1.PodDisruptionBudget{},
+			nsDefault: false,
+			wantErr:   true,
 		},
 		{
-			name: "maintenance_readiness_ready",
+			name: "maintenance_readiness_ready_not_default",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -58,7 +61,9 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 				},
 			},
 			pdb:                &policyv1.PodDisruptionBudget{},
+			nsDefault:          false,
 			wantErr:            false,
+			wantSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
 			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
 			wantUnhealthyEvict: func() *policyv1.UnhealthyPodEvictionPolicyType {
 				policy := policyv1.IfHealthyBudget
@@ -66,7 +71,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			}(),
 		},
 		{
-			name: "maintenance_readiness_not_ready",
+			name: "maintenance_readiness_not_ready_not_default",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -77,7 +82,9 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 				},
 			},
 			pdb:                &policyv1.PodDisruptionBudget{},
+			nsDefault:          false,
 			wantErr:            false,
+			wantSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
 			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 0},
 			wantUnhealthyEvict: func() *policyv1.UnhealthyPodEvictionPolicyType {
 				policy := policyv1.IfHealthyBudget
@@ -85,7 +92,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			}(),
 		},
 		{
-			name: "maintenance_readiness_overdue",
+			name: "maintenance_readiness_overdue_not_default",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -96,7 +103,30 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 				},
 			},
 			pdb:                &policyv1.PodDisruptionBudget{},
+			nsDefault:          false,
 			wantErr:            false,
+			wantSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
+			wantUnhealthyEvict: func() *policyv1.UnhealthyPodEvictionPolicyType {
+				policy := policyv1.IfHealthyBudget
+				return &policy
+			}(),
+		},
+		{
+			name: "maintenance_readiness_overdue_is_default",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					MaintenanceReadiness: workloadsv1.ReadinessOverdue,
+				},
+			},
+			pdb:                &policyv1.PodDisruptionBudget{},
+			nsDefault:          true,
+			wantErr:            false,
+			wantSelector:       &metav1.LabelSelector{}, // Empty label selector targets all pods in the namespace
 			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
 			wantUnhealthyEvict: func() *policyv1.UnhealthyPodEvictionPolicyType {
 				policy := policyv1.IfHealthyBudget
@@ -107,7 +137,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := SyncPDBWithWorkloadClass(tt.wc, tt.pdb)
+			err := SyncPDBWithWorkloadClass(tt.wc, tt.pdb, tt.nsDefault)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("SyncPDBWithWorkloadClass() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -119,7 +149,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 				if !reflect.DeepEqual(tt.pdb.Spec.UnhealthyPodEvictionPolicy, tt.wantUnhealthyEvict) {
 					t.Errorf("SyncPDBWithWorkloadClass() UnhealthyPodEvictionPolicy = %v, want %v", tt.pdb.Spec.UnhealthyPodEvictionPolicy, tt.wantUnhealthyEvict)
 				}
-				if !reflect.DeepEqual(tt.pdb.Spec.Selector, tt.wc.Spec.PodSelector) {
+				if !reflect.DeepEqual(tt.pdb.Spec.Selector, tt.wantSelector) {
 					t.Errorf("SyncPDBWithWorkloadClass() Selector = %v, want %v", tt.pdb.Spec.Selector, tt.wc.Spec.PodSelector)
 				}
 			}
@@ -216,21 +246,24 @@ func TestAllowLease(t *testing.T) {
 
 func TestPDBWithLease(t *testing.T) {
 	tests := []struct {
-		name    string
-		wc      *workloadsv1.WorkloadClass
-		pdb     *policyv1.PodDisruptionBudget
-		pod     *corev1.Pod
-		wantErr bool
+		name         string
+		wc           *workloadsv1.WorkloadClass
+		pdb          *policyv1.PodDisruptionBudget
+		pod          *corev1.Pod
+		nsDefault    bool
+		wantSelector *metav1.LabelSelector
+		wantErr      bool
 	}{
 		{
-			name:    "workload_class_is_nil",
-			wc:      nil,
-			pdb:     &policyv1.PodDisruptionBudget{},
-			pod:     &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
-			wantErr: true,
+			name:      "workload_class_is_nil",
+			wc:        nil,
+			pdb:       &policyv1.PodDisruptionBudget{},
+			pod:       &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
+			nsDefault: false,
+			wantErr:   true,
 		},
 		{
-			name: "successfully_configures_pdb",
+			name: "successfully_configures_pdb_not_default",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -242,8 +275,28 @@ func TestPDBWithLease(t *testing.T) {
 					Annotations: map[string]string{"existing": "annotation"},
 				},
 			},
-			pod:     &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
-			wantErr: false,
+			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
+			nsDefault:    false,
+			wantSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			wantErr:      false,
+		},
+		{
+			name: "successfully_configures_pdb_is_default",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+				},
+			},
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"existing": "annotation"},
+				},
+			},
+			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
+			nsDefault:    true,
+			wantSelector: &metav1.LabelSelector{},
+			wantErr:      false,
 		},
 	}
 
@@ -253,7 +306,7 @@ func TestPDBWithLease(t *testing.T) {
 			var c client.Client // nil client is fine since it's unused in the func body
 
 			s := workloadsv1.Subject{Kind: "ServiceAccount", Name: "sam", Namespace: "system"}
-			err := PDBWithLease(ctx, c, tt.pdb, tt.wc, tt.pod, s)
+			err := PDBWithLease(ctx, c, tt.pdb, tt.wc, tt.pod, s, tt.nsDefault)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PDBWithLease() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -261,7 +314,7 @@ func TestPDBWithLease(t *testing.T) {
 
 			if !tt.wantErr {
 				// 1. Selector should match wc
-				if !reflect.DeepEqual(tt.pdb.Spec.Selector, tt.wc.Spec.PodSelector) {
+				if !reflect.DeepEqual(tt.pdb.Spec.Selector, tt.wantSelector) {
 					t.Errorf("PDBWithLease() Selector = %v, want %v", tt.pdb.Spec.Selector, tt.wc.Spec.PodSelector)
 				}
 				// 2. UnhealthyPodEvictionPolicy should be IfHealthyBudget

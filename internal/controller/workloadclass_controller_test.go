@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1402,14 +1403,17 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 	_ = workloadsv1.AddToScheme(scheme)
 
 	testCases := []struct {
-		name      string
-		pdbExists bool
-		wc        *workloadsv1.WorkloadClass
-		wantErr   bool
+		name         string
+		pdbExists    bool
+		nsDefault    bool
+		wantSelector *metav1.LabelSelector
+		wc           *workloadsv1.WorkloadClass
+		wantErr      bool
 	}{
 		{
 			name:      "creates_pdb_when_missing",
 			pdbExists: false,
+			nsDefault: false,
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-wc",
@@ -1422,6 +1426,7 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 		{
 			name:      "updates_existing_pdb",
 			pdbExists: true,
+			nsDefault: false,
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-wc",
@@ -1430,6 +1435,23 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 				},
 			},
 			wantErr: false,
+		},
+		{
+			name:      "updates_existing_namespace_default_pdb",
+			pdbExists: true,
+			nsDefault: true,
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-wc",
+					Namespace: "default",
+					UID:       "fake-uid-123",
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"labelA": "valueA"}},
+				},
+			},
+			wantSelector: &metav1.LabelSelector{},
+			wantErr:      false,
 		},
 	}
 	for _, tc := range testCases {
@@ -1452,7 +1474,7 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 				Scheme: scheme,
 			}
 
-			err := reconciler.createOrUpdatePDB(context.Background(), tc.wc)
+			err := reconciler.createOrUpdatePDB(context.Background(), tc.wc, tc.nsDefault)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("createOrUpdatePDB() error = %v, wantErr %v", err, tc.wantErr)
 				return
@@ -1474,6 +1496,12 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 				} else {
 					if savedPDB.OwnerReferences[0].UID != tc.wc.UID {
 						t.Errorf("Expected OwnerReference UID %q, got %q", tc.wc.UID, savedPDB.OwnerReferences[0].UID)
+					}
+				}
+
+				if tc.nsDefault {
+					if !reflect.DeepEqual(savedPDB.Spec.Selector, tc.wantSelector) {
+						t.Errorf("PDBWithLease() Selector = %v, want %v", savedPDB.Spec.Selector, tc.wantSelector)
 					}
 				}
 			}

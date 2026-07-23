@@ -322,5 +322,167 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 				return err
 			}, "10s", "1s").ShouldNot(HaveOccurred(), "Eviction should be permitted for the autoscaler despite being outside the window")
 		})
+
+		It("should protect all pods in a namespace if a default WorkloadClass is configured", func() {
+			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+
+			By("Creating a second non-default WorkloadClass")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(`
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: non-default-batch
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      role: non-default-processor
+  disruptionPolicy:
+    minInitialRunDurationDays: 0
+    maxNonDisruptionDurationDays: 10
+    allowedDisruptionWindows:
+      - name: weekend-maintenance
+        daysOfWeek:
+          - ` + notToday + `
+        startTime: "00:00"
+        endTime: "23:59"
+        timeZone: "Etc/UTC"
+`)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			defer func() {
+				By("Cleaning up the second WorkloadClass")
+				cleanupCmd := exec.Command("kubectl", "delete", "workloadclass", "non-default-batch", "-n", "sample", "--ignore-not-found")
+				_, _ = utils.Run(cleanupCmd)
+			}()
+
+			By("Patching the original WorkloadClass to simulate being outside a disruption window")
+			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"maxNonDisruptionDurationDays": 10, "minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
+			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Labeling the namespace to make critical-batch the default WorkloadClass")
+			cmd = exec.Command("kubectl", "label", "namespace", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			defer func() {
+				By("Cleaning up the namespace label")
+				cleanupCmd := exec.Command("kubectl", "label", "namespace", "sample", "workloads.gke.io/default-class-", "--overwrite")
+				_, _ = utils.Run(cleanupCmd)
+			}()
+
+			By("Patching the Guardrail to allow tomorrow")
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Validating that ONLY the PDB for the default WorkloadClass exists")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-non-default-batch", "-n", "sample")
+				_, err := utils.Run(cmd)
+				if err == nil {
+					return fmt.Errorf("PDB workload-non-default-batch still exists")
+				}
+				return nil
+			}, time.Minute, 2*time.Second).Should(Succeed(), "The non-default WorkloadClass PDB should be deleted")
+
+			By("Validating that the default WorkloadClass PDB has no label selectors and maxUnavailable is 0")
+			Eventually(func() (bool, error) {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.selector},{.spec.maxUnavailable},{.status.observedGeneration}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return false, err
+				}
+				parts := strings.Split(strings.TrimSpace(output), ",")
+				if len(parts) == 3 && parts[0] == "{}" && parts[1] == "0" && parts[2] != "" {
+					return true, nil
+				}
+				return false, nil
+			}, time.Minute, 2*time.Second).Should(BeTrue(), "The default WorkloadClass PDB should have an empty label selector and maxUnavailable=0")
+
+			By("Attempting to evict a Pod that matches the original critical-batch WorkloadClass")
+			nameCmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].metadata.name}")
+			podNameOutput, err := utils.Run(nameCmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to fetch dynamic pod name")
+			podName := strings.TrimSpace(podNameOutput)
+
+			evictionURL := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", podName)
+			evictionJSON := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"sample"}}`, podName)
+			evictionFile := filepath.Join("/tmp", "eviction.json")
+			err = os.WriteFile(evictionFile, []byte(evictionJSON), 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile)
+			out, err := utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the default WorkloadClass policy")
+			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
+
+			By("Creating a new Pod that matches the non-default WorkloadClass")
+			cmd = exec.Command("kubectl", "create", "deployment", "non-default-pod", "-n", "sample", "--image=nginx", "--replicas=1")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// add the role label to the deployment's pod template
+			cmd = exec.Command("kubectl", "patch", "deployment", "non-default-pod", "-n", "sample", "-p", `{"spec": {"template": {"metadata": {"labels": {"role": "non-default-processor"}}}}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			defer func() {
+				By("Cleaning up the non-default deployment")
+				cleanupCmd := exec.Command("kubectl", "delete", "deployment", "non-default-pod", "-n", "sample", "--ignore-not-found")
+				_, _ = utils.Run(cleanupCmd)
+			}()
+
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=non-default-processor", "-o", "jsonpath={.items[0].status.phase}")
+				out, err := utils.Run(cmd)
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(out) != "Running" {
+					return fmt.Errorf("Pod not running yet")
+				}
+				return nil
+			}, time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Validating that the PDB status updates to cover both pods in the namespace")
+			Eventually(func() (string, error) {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.status.expectedPods}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return "", err
+				}
+				val := strings.TrimSpace(output)
+				if val != "2" {
+					fmt.Printf("DEBUG: expectedPods is %s. Current pods:\n", val)
+					utils.Run(exec.Command("kubectl", "get", "pods", "-n", "sample"))
+					utils.Run(exec.Command("kubectl", "get", "deployments", "-n", "sample"))
+					utils.Run(exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "yaml"))
+				}
+				return val, nil
+			}, time.Minute, 2*time.Second).Should(Equal("2"), "The PDB should report 2 expected pods, proving it protects all pods in the namespace")
+
+			By("Attempting to evict the non-default Pod")
+			nameCmd = exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=non-default-processor", "-o", "jsonpath={.items[0].metadata.name}")
+			podNameOutput, err = utils.Run(nameCmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to fetch dynamic non-default pod name")
+			nonDefaultPodName := strings.TrimSpace(podNameOutput)
+
+			evictionURL2 := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", nonDefaultPodName)
+			evictionJSON2 := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"sample"}}`, nonDefaultPodName)
+			evictionFile2 := filepath.Join("/tmp", "eviction2.json")
+			err = os.WriteFile(evictionFile2, []byte(evictionJSON2), 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			cmd = exec.Command("kubectl", "create", "--raw", evictionURL2, "-f", evictionFile2)
+			out, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the default WorkloadClass policy (it covers all pods)")
+			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
+		})
 	})
 })

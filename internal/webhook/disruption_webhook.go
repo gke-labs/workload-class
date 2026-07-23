@@ -66,7 +66,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 2. Find matching WorkloadClasses
-	bestWC, err := v.bestMatchWorkloadClass(ctx, req, pod)
+	bestWC, isNamespaceDefault, err := v.bestMatchWorkloadClass(ctx, req, pod)
 	if err != nil {
 		log.Error(err, "failed to get WorkloadClass for Pod", "pod", pod)
 		return admission.Allowed("Failed to get WorkloadClass matches this pod or namespace")
@@ -103,7 +103,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	if !inWindow {
 		// 6.1 Indentity-Based Filtering
-		return v.tryBypassWindowByIdentity(ctx, bestWC, req, pod)
+		return v.tryBypassWindowByIdentity(ctx, bestWC, req, pod, isNamespaceDefault)
 	}
 
 	// 7. Pod Lifecycle Protection (Min Initial Run)
@@ -127,15 +127,15 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 // WorkloadClass takes precedence.
 //
 // If no specific or default WorkloadClass is found, it returns nil.
-func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, namespaceDefault bool, err error) {
 	// Use the namespace's default workload class if it exists
 	if bestMatch = v.namespaceDefaultWorkloadClass(ctx, pod); bestMatch != nil {
-		return bestMatch, nil
+		return bestMatch, true, nil
 	}
 
 	wcs := &workloadsv1.WorkloadClassList{}
 	if err := v.Client.List(ctx, wcs); err != nil {
-		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
+		return nil, false, fmt.Errorf("failed to list WorkloadClasses: %v", err)
 	}
 
 	// Keep track of all other matches to emit a warning message
@@ -155,7 +155,7 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admi
 	// Emit warning message for WorkloadClasses that matched, but are ignored
 	v.emitWarning(ctx, req, pod, bestMatch, otherMatches, maxSpecificity)
 
-	return bestMatch, nil
+	return bestMatch, false, nil
 }
 
 func (v *DisruptionWebhook) emitWarning(ctx context.Context, req admission.Request, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass, matches map[string]int, maxSpecificity int) {
@@ -224,7 +224,7 @@ func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, p
 	return nil
 }
 
-func (v *DisruptionWebhook) tryBypassWindowByIdentity(ctx context.Context, wc *workloadsv1.WorkloadClass, req admission.Request, pod *corev1.Pod) admission.Response {
+func (v *DisruptionWebhook) tryBypassWindowByIdentity(ctx context.Context, wc *workloadsv1.WorkloadClass, req admission.Request, pod *corev1.Pod, namespaceDefault bool) admission.Response {
 	for _, allowedSubject := range wc.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
 		matches, err := matchesIdentity(req.UserInfo, allowedSubject)
 		if err != nil {
@@ -232,13 +232,13 @@ func (v *DisruptionWebhook) tryBypassWindowByIdentity(ctx context.Context, wc *w
 			continue
 		}
 		if matches {
-			return v.tryAcquirePDBLease(ctx, wc, pod, allowedSubject)
+			return v.tryAcquirePDBLease(ctx, wc, pod, allowedSubject, namespaceDefault)
 		}
 	}
 	return admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wc.Name))
 }
 
-func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) admission.Response {
+func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject, namespaceDefault bool) admission.Response {
 	pdb := utils.PDBBase(wc)
 	// If the PDB doesn't exist (not found), it will be created
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: pdb.Name, Namespace: wc.Namespace}, pdb); err != nil && !errors.IsNotFound(err) {
@@ -254,7 +254,7 @@ func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workload
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, v.Client, pdb, func() error {
-		return utils.PDBWithLease(ctx, v.Client, pdb, wc, pod, subject)
+		return utils.PDBWithLease(ctx, v.Client, pdb, wc, pod, subject, namespaceDefault)
 	})
 	if err != nil {
 		return admission.Denied(fmt.Sprintf("Disruption denied, failed to lease PDB: %s", err))
