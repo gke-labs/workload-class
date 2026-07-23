@@ -269,10 +269,11 @@ func subjectAlreadyLeasing(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, s
 		return false
 	}
 
-	sameBypassPod := pdb.Annotations[utils.BypassPod] == pod.Name
+	samePodName := pdb.Annotations[utils.BypassPod] == pod.Name
+	samePodUID := pdb.Annotations[utils.BypassPodUID] == string(pod.UID)
 	sameBypassSubject := pdb.Annotations[utils.BypassOwner] == utils.BypassOwnerValue(subject)
 
-	return sameBypassPod && sameBypassSubject && !utils.LeaseExpired(pdb)
+	return samePodName && samePodUID && sameBypassSubject && !utils.LeaseExpired(pdb)
 }
 
 func matchesIdentity(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {

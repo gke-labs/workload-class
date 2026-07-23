@@ -35,10 +35,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+const (
+	podName = "test-pod"
+	podUID  = "pod-uid-1234"
 )
 
 func TestGetSpecificity(t *testing.T) {
@@ -467,6 +473,8 @@ func TestHandle(t *testing.T) {
 		outOfWindowDay     = time.Now().In(torontoLoc).AddDate(0, 0, 1).Weekday().String()
 		podNowCreationTime = time.Now()
 		labels             = map[string]string{"labelA": "valueA"}
+		expirationStr      = time.Now().Add(time.Hour).Format(utils.ExpirationFormat)
+		podUID             = "pod-uid-1234"
 	)
 
 	wc := &workloadsv1.WorkloadClass{
@@ -542,6 +550,7 @@ func TestHandle(t *testing.T) {
 	pod.Namespace = namespace
 	pod.Labels = labels
 	pod.Name = podName
+	pod.UID = types.UID(podUID)
 
 	evictionRequest := admissionv1.AdmissionRequest{
 		Name:        podName,
@@ -576,6 +585,7 @@ func TestHandle(t *testing.T) {
 		overdue           bool
 		podCreationTime   time.Time
 		readiness         workloadsv1.MaintenanceReadiness
+		getPdbResp        *policyv1.PodDisruptionBudget
 		want              admission.Response
 	}{
 		{
@@ -645,6 +655,69 @@ func TestHandle(t *testing.T) {
 			want:            admission.Allowed("Disruption allowed for authorized user, PDB leased: created"),
 		},
 		{
+			name:            "allowedUserPDBAlreadyLeased",
+			desc:            "Allowed user, PDB already leased for this pod, admission Allowed",
+			req:             evictionRequest,
+			getWCResp:       wcOutOfWindow,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			getPdbResp: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      utils.PDBName(wcOutOfWindow.Name),
+					Namespace: namespace,
+					Annotations: map[string]string{
+						utils.BypassPod:        podName,
+						utils.BypassPodUID:     podUID,
+						utils.BypassOwner:      adminUsername,
+						utils.BypassExpiration: expirationStr,
+					},
+				},
+			},
+			want: admission.Allowed("Disruption allowed for authorized user, PDB already leased for this pod"),
+		},
+		{
+			name:            "allowedUserPDBLeaseForDeletedPod",
+			desc:            "Allowed user, PDB is leased for a pod with the same name and namespace, but different UID, admission Denied",
+			req:             evictionRequest,
+			getWCResp:       wcOutOfWindow,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			getPdbResp: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      utils.PDBName(wcOutOfWindow.Name),
+					Namespace: namespace,
+					Annotations: map[string]string{
+						utils.BypassPod:        podName,
+						utils.BypassPodUID:     "new-pod-same-name",
+						utils.BypassOwner:      adminUsername,
+						utils.BypassExpiration: expirationStr,
+					},
+				},
+			},
+			want: admission.Denied(fmt.Sprintf("Disruption denied, PDB %s has an ongoing lease that expires at %s", utils.PDBName(wcOutOfWindow.Name), expirationStr)),
+		},
+		{
+			name:            "allowedUserPDBOngoingLease",
+			desc:            "Allowed user, PDB has an ongoing lease from someone else, admission Denied",
+			req:             evictionRequest,
+			getWCResp:       wcOutOfWindow,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			getPdbResp: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      utils.PDBName(wcOutOfWindow.Name),
+					Namespace: namespace,
+					Annotations: map[string]string{
+						utils.BypassPod:        "other-pod",
+						utils.BypassPodUID:     "other-uid",
+						utils.BypassOwner:      "other-user",
+						utils.BypassExpiration: expirationStr,
+					},
+				},
+			},
+			want: admission.Denied(fmt.Sprintf("Disruption denied, PDB %s has an ongoing lease that expires at %s", utils.PDBName(wcOutOfWindow.Name), expirationStr)),
+		},
+		{
 			name:            "overdue",
 			desc:            "Overdue, admission Allowed",
 			req:             evictionRequestNonMatchingUser,
@@ -701,6 +774,9 @@ func TestHandle(t *testing.T) {
 			}
 
 			client := createClient(nil, tc.getWCErr, tc.listWCErr, tc.getPodErr, nsNoAnnotation, tc.getWCResp, listResp, pod)
+			if tc.getPdbResp != nil {
+				client.getPdbResult = tc.getPdbResp
+			}
 			v := &DisruptionWebhook{
 				Client: client,
 			}
@@ -1203,6 +1279,8 @@ type fakeClient struct {
 
 	getWorkloadClassError  error
 	getWorkloadClassResult *workloadsv1.WorkloadClass
+
+	getPdbResult *policyv1.PodDisruptionBudget
 }
 
 func createClient(getNSErr, getWCErr, listWCErr, getPodErr error, getNSResult *corev1.Namespace, getWCResult *workloadsv1.WorkloadClass, listWCResult *workloadsv1.WorkloadClassList, getPodResult *corev1.Pod) fakeClient {
@@ -1241,6 +1319,10 @@ func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 		}
 		fc.getPodResult.DeepCopyInto(typedObj)
 	case *policyv1.PodDisruptionBudget:
+		if fc.getPdbResult != nil {
+			fc.getPdbResult.DeepCopyInto(typedObj)
+			return nil
+		}
 		return k8serrors.NewNotFound(schema.GroupResource{Group: "policy", Resource: "poddisruptionbudgets"}, obj.GetName())
 	default:
 		return fmt.Errorf("unknown object type")
@@ -1268,7 +1350,6 @@ func TestTryAcquirePDBLease(t *testing.T) {
 	_ = workloadsv1.AddToScheme(scheme)
 
 	namespace := "default"
-	podName := "test-pod"
 	wcName := "test-wc"
 
 	wc := &workloadsv1.WorkloadClass{
@@ -1278,7 +1359,7 @@ func TestTryAcquirePDBLease(t *testing.T) {
 		},
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace, UID: types.UID(podUID)},
 	}
 
 	tests := []struct {
@@ -1318,6 +1399,45 @@ func TestTryAcquirePDBLease(t *testing.T) {
 						Namespace: namespace,
 						Annotations: map[string]string{
 							utils.BypassPod:        "other-pod",
+							utils.BypassPodUID:     "other-pod-uid",
+							utils.BypassOwner:      "other-user",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: true,
+			wantMsg:    "Disruption denied, PDB workload-test-wc has an ongoing lease",
+		},
+		{
+			name: "pdb_exists_but_has_ongoing_lease_for_same_pod",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        podName,
+							utils.BypassPodUID:     podUID,
+							utils.BypassOwner:      "admin@example.com",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: false,
+		},
+		{
+			name: "pdb_exists_but_has_ongoing_lease_for_pod_with_same_name_different_uid",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        podName,
+							utils.BypassPodUID:     "new-pod-same-name",
+							utils.BypassOwner:      "admin@example.com",
 							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
 						},
 					},
@@ -1354,7 +1474,6 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 	_ = workloadsv1.AddToScheme(scheme)
 
 	namespace := "default"
-	podName := "test-pod"
 	wcName := "test-wc"
 
 	testSubject := workloadsv1.Subject{
@@ -1372,7 +1491,7 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 		},
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace, UID: types.UID(podUID)},
 	}
 
 	tests := []struct {
@@ -1397,6 +1516,13 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 			wantMsg:    "Disruption allowed for authorized user, PDB leased",
 		},
 		{
+			name:       "user_matches_identity_current_lease_invalid_acquires_lease",
+			username:   "test-user",
+			initObjs:   []client.Object{},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
+		{
 			name:     "user_matches_identity_but_lease_denied",
 			username: "test-user",
 			initObjs: []client.Object{
@@ -1406,6 +1532,28 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 						Namespace: namespace,
 						Annotations: map[string]string{
 							utils.BypassPod:        "other-pod",
+							utils.BypassPodUID:     "other-uid",
+							utils.BypassOwner:      "test-user",
+							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+				},
+			},
+			wantDenied: true,
+			wantMsg:    "Disruption denied, PDB workload-test-wc has an ongoing lease",
+		},
+		{
+			name:     "user_matches_identity_and_pod_name_matches_but_lease_denied",
+			username: "test-user",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        podName,
+							utils.BypassPodUID:     "other-uid",
+							utils.BypassOwner:      "test-user",
 							utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
 						},
 					},
@@ -1432,6 +1580,107 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 			}
 			if !strings.HasPrefix(resp.Result.Message, tt.wantMsg) {
 				t.Errorf("tryBypassWindowByIdentity() msg = %v, want prefix %v", resp.Result.Message, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestSubjectAlreadyLeasing(t *testing.T) {
+	subject := workloadsv1.Subject{Kind: "User", Name: "admin@example.com"}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName,
+			UID:  types.UID(podUID),
+		},
+	}
+
+	tests := []struct {
+		name string
+		pdb  *policyv1.PodDisruptionBudget
+		want bool
+	}{
+		{
+			name: "nil_annotations",
+			pdb:  &policyv1.PodDisruptionBudget{},
+			want: false,
+		},
+		{
+			name: "different_pod_name",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						utils.BypassPod:        "different-pod",
+						utils.BypassPodUID:     podUID,
+						utils.BypassOwner:      "admin@example.com",
+						utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "different_pod_uid",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						utils.BypassPod:        podName,
+						utils.BypassPodUID:     "different-uid",
+						utils.BypassOwner:      "admin@example.com",
+						utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "different_subject",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						utils.BypassPod:        podName,
+						utils.BypassPodUID:     podUID,
+						utils.BypassOwner:      "someone-else",
+						utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "expired_lease",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						utils.BypassPod:        podName,
+						utils.BypassPodUID:     podUID,
+						utils.BypassOwner:      "admin@example.com",
+						utils.BypassExpiration: time.Now().Add(-1 * time.Hour).Format(utils.ExpirationFormat),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "exact_match",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						utils.BypassPod:        podName,
+						utils.BypassPodUID:     podUID,
+						utils.BypassOwner:      "admin@example.com",
+						utils.BypassExpiration: time.Now().Add(time.Hour).Format(utils.ExpirationFormat),
+					},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subjectAlreadyLeasing(tt.pdb, pod, subject); got != tt.want {
+				t.Errorf("subjectAlreadyLeasing() = %v, want %v", got, tt.want)
 			}
 		})
 	}
