@@ -44,11 +44,6 @@ import (
 	"github.com/gke-labs/workload-class/internal/utils"
 )
 
-const (
-	isNamespaceDefault  = true
-	notNamespaceDefault = false
-)
-
 // WorkloadClassReconciler reconciles a WorkloadClass object
 type WorkloadClassReconciler struct {
 	client.Client
@@ -159,7 +154,7 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 	}
 
 	if namespaceDefaultWC != nil && namespaceDefaultWC.Name == wc.Name {
-		return r.createOrUpdatePDB(ctx, wc, isNamespaceDefault)
+		return r.createOrUpdatePDB(ctx, wc, true)
 	} else if namespaceDefaultWC != nil && namespaceDefaultWC.DeletionTimestamp.IsZero() {
 		// There exists a namespace default WorkloadClass, but it is not this WorkloadClass
 		return r.deletePDB(ctx, wc)
@@ -169,12 +164,12 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 
 	// Check if other WC's have the same selector
 	if len(overlappingClasses) == 0 {
-		return r.createOrUpdatePDB(ctx, wc, notNamespaceDefault)
+		return r.createOrUpdatePDB(ctx, wc, false)
 	}
 
 	// Check if the current WorkloadClass is the oldest one with these selectors
 	if oldestWorkloadClass(wc, overlappingClasses).Name == wc.Name {
-		return r.createOrUpdatePDB(ctx, wc, notNamespaceDefault)
+		return r.createOrUpdatePDB(ctx, wc, false)
 	}
 
 	return r.deletePDB(ctx, wc)
