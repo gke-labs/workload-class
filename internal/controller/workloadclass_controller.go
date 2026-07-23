@@ -458,12 +458,52 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				DeleteFunc:  func(e event.DeleteEvent) bool { return true },
 			}),
 		).
+		Watches(&corev1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesByNamespace),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					// Trigger if namespace is created with the label
+					_, hasLabel := e.Object.GetLabels()[workloadsv1.DefaultClassLabel]
+					return hasLabel
+				},
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					// Trigger ONLY if the DefaultClassLabel was added, removed, or modified
+					oldValue, oldHas := e.ObjectOld.GetLabels()[workloadsv1.DefaultClassLabel]
+					newValue, newHas := e.ObjectNew.GetLabels()[workloadsv1.DefaultClassLabel]
+					return oldHas != newHas || oldValue != newValue
+				},
+				DeleteFunc: func(e event.DeleteEvent) bool {
+					// Trigger if namespace is deleted and it had the label
+					_, hasLabel := e.Object.GetLabels()[workloadsv1.DefaultClassLabel]
+					return hasLabel
+				},
+				GenericFunc: func(e event.GenericEvent) bool { return false },
+			}),
+		).
 		Watches(
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
 		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassesByNamespace(ctx context.Context, ns client.Object) []reconcile.Request {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses, client.InNamespace(ns.GetName())); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(workloadClasses.Items))
+	for i, item := range workloadClasses.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      item.GetName(),
+				Namespace: item.GetNamespace(),
+			},
+		}
+	}
+	return requests
 }
 
 // findNonDefaultWorkloadClasses triggers reconciliation for all non-default WorkloadClasses
