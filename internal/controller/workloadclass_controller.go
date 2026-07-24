@@ -119,7 +119,27 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// 4. Reconcile the PDB
+	// 4. Check if there is an ongoing lease
+	ongoingLease, timeUntilExpiry, err := r.leaseCheck(ctx, wc)
+	if err != nil {
+		// If there is an error, emit an event and continue to PDB reconciliation
+		r.Recorder.Eventf(
+			wc,
+			nil,
+			corev1.EventTypeWarning,
+			"PDBLeaseCheckFailed",
+			"Checking for PodDisruptionBudget Lease",
+			"Failed to check for lease on PDB: %s",
+			err.Error(),
+		)
+	}
+
+	if ongoingLease {
+		log.Info("PDB has an ongoing lease, requeuing Reconcile", "PDB", utils.PDBName(wc.Name), "TimeUntilLeaseExpiry", timeUntilExpiry)
+		return ctrl.Result{RequeueAfter: timeUntilExpiry}, nil
+	}
+
+	// 5. Reconcile the PDB
 	err = r.reconcilePDB(ctx, wc, validationCond, overlappingClasses)
 	if err != nil {
 		r.Recorder.Eventf(
@@ -134,6 +154,98 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	return ctrl.Result{RequeueAfter: nextReconcile}, nil
+}
+
+// leaseCheck checks the target Pod and the WorkloadClass' PDB to determine if there is an ongoing lease.
+// A lease is ongoing if all of the following are true:
+// - The PDB has annotations denoting a lease
+// - The current time does not exceed the bypass-expiration timestamp
+// - The pod is still running without a deletion timestamp
+func (r *WorkloadClassReconciler) leaseCheck(ctx context.Context, wc *workloadsv1.WorkloadClass) (bool, time.Duration, error) {
+	log := logf.FromContext(ctx)
+
+	// Get the PDB and the Pod
+	pdb, err := r.getPDB(ctx, wc)
+	if err != nil {
+		log.Error(err, "error getting PDB for WorkloadClass", "WorkloadClass", wc.Name, "Namespace", wc.Namespace)
+		return false, 0, err
+	}
+
+	var (
+		leasePod, hasPodName           = pdb.Annotations[utils.BypassPod]
+		leasePodUID, hasPodUID         = pdb.Annotations[utils.BypassPodUID]
+		_, hasOwner                    = pdb.Annotations[utils.BypassOwner]
+		leaseExpiration, hasExpiration = pdb.Annotations[utils.BypassExpiration]
+	)
+
+	// The PDB should have all lease annotations for the lease to be valid
+	if pdb.Annotations == nil || !hasPodName || !hasPodUID || !hasOwner || !hasExpiration {
+		// No annotations, no lease
+		log.Info("PDB does not have a lease", "PDB", pdb.Name, "Namespace", wc.Namespace)
+		return false, 0, nil
+	}
+
+	// Check if the lease has expired
+	expirationTime, err := time.Parse(utils.ExpirationFormat, leaseExpiration)
+	if err != nil {
+		// Invalid lease expiration annotation
+		log.Error(err, "Lease expiration time could not be parsed", "PDB", pdb.Name, "Namespace", wc.Namespace, "Expiration", leaseExpiration)
+		return false, 0, err
+	}
+
+	if time.Now().Compare(expirationTime) >= 0 {
+		// Lease is expired
+		log.Info("Lease on PDB has expired", "PDB", pdb.Name, "Pod", leasePod, "Namespace", wc.Namespace, "Expiration", leaseExpiration)
+		return false, 0, nil
+	}
+
+	// Check if the target Pod has been deleted
+	pod, err := r.getPod(ctx, leasePod, wc.Namespace)
+	if err != nil && !errors.IsNotFound(err) {
+		log.Error(err, "error getting Pod targeted by PDB lease", "Pod", leasePod, "Namespace", wc.Namespace)
+		return false, 0, err
+	}
+	if errors.IsNotFound(err) {
+		// The Pod has been deleted, end the lease.
+		log.Info("Pod targeted by the PDB lease no longer exists", "Pod", leasePod, "Namespace", wc.Namespace)
+		return false, 0, nil
+	}
+
+	// It is possible that during the lease, the targeted Pod was deleted, and a new Pod with the same name was created.
+	// The UID must always be checked to ensure we have the correct Pod.
+	if string(pod.UID) != leasePodUID {
+		// A new Pod was created with the same name, end the lease.
+		return false, 0, nil
+	}
+
+	if pod.DeletionTimestamp.IsZero() {
+		// The eviction may not have started yet, the lease should continue.
+		log.Info("Pod does not have a deletion timestamp, eviction may be ongoing", "Pod", pod.Name, "Namespace", pod.Namespace)
+		return true, time.Until(expirationTime), nil
+	}
+
+	log.Info("Pod has deletion timestamp, lease can safely conclude", "Pod", pod.Name, "Namespace", pod.Namespace, "DeletionTimestamp", pod.DeletionTimestamp)
+	return false, 0, nil
+}
+
+func (r *WorkloadClassReconciler) getPDB(ctx context.Context, wc *workloadsv1.WorkloadClass) (*policyv1.PodDisruptionBudget, error) {
+	pdb := &policyv1.PodDisruptionBudget{}
+	reqKey := types.NamespacedName{
+		Name:      utils.PDBName(wc.Name),
+		Namespace: wc.Namespace,
+	}
+	err := r.Get(ctx, reqKey, pdb)
+	return pdb, err
+}
+
+func (r *WorkloadClassReconciler) getPod(ctx context.Context, name, namespace string) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	podKey := types.NamespacedName{
+		Name:      name,
+		Namespace: namespace,
+	}
+	err := r.Get(ctx, podKey, pod)
+	return pod, err
 }
 
 func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, overlappingClasses []workloadsv1.WorkloadClass) error {
