@@ -65,6 +65,13 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDi
 		return fmt.Errorf("failed to sync PDB with WorkloadClass, PDB is nil")
 	}
 
+	if pdb.Annotations != nil {
+		delete(pdb.Annotations, BypassPod)
+		delete(pdb.Annotations, BypassPodUID)
+		delete(pdb.Annotations, BypassOwner)
+		delete(pdb.Annotations, BypassExpiration)
+	}
+
 	if pdb.Name == "" {
 		pdb.Name = PDBName(wc.Name)
 	}
