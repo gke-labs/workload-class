@@ -51,6 +51,14 @@ spec:
                         description: AllowedDisruptionDays specifies days on which
                           disruption can happen (Monday-Sunday).
                         items:
+                          enum:
+                          - Monday
+                          - Tuesday
+                          - Wednesday
+                          - Thursday
+                          - Friday
+                          - Saturday
+                          - Sunday
                           type: string
                         type: array
                       emergencyOverride:

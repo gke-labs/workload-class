@@ -32,6 +32,7 @@ type Constraints struct {
 type Disruption struct {
 	// AllowedDisruptionDays specifies days on which disruption can happen (Monday-Sunday).
 	// +optional
+	// +kubebuilder:validation:items:Enum=Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday
 	AllowedDisruptionDays []string `json:"allowedDisruptionDays,omitempty"`
 
 	// MaxAllowedWindows sets the limit of how many windows workload owners can set.

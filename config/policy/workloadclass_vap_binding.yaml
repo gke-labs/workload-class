@@ -1,0 +1,12 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: workload-class-guardrail-system-binding
+spec:
+  policyName: workload-class-guardrail-system
+  validationActions: [Deny]
+  paramRef:
+    selector: {}
+    parameterNotFoundAction: Allow
+  matchResources:
+    namespaceSelector: {} # Apply cluster-wide

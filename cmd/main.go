@@ -40,7 +40,6 @@ import (
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/controller"
 	internalwebhook "github.com/gke-labs/workload-class/internal/webhook"
-	webhookv1 "github.com/gke-labs/workload-class/internal/webhook/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -206,13 +205,6 @@ func main() {
 		},
 	})
 
-	// nolint:goconst
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhookv1.SetupWorkloadClassGuardrailWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to create webhook", "webhook", "WorkloadClassGuardrail")
-			os.Exit(1)
-		}
-	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
