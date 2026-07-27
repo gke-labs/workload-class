@@ -166,9 +166,13 @@ func (r *WorkloadClassReconciler) leaseCheck(ctx context.Context, wc *workloadsv
 
 	// Get the PDB and the Pod
 	pdb, err := r.getPDB(ctx, wc)
-	if err != nil {
+	if err != nil && !errors.IsNotFound(err) {
 		log.Error(err, "error getting PDB for WorkloadClass", "WorkloadClass", wc.Name, "Namespace", wc.Namespace)
 		return false, 0, err
+	}
+	if errors.IsNotFound(err) {
+		log.Info("WorkloadClass does not have a PDB", "WorkloadClass", wc.Name, "Namespace", wc.Namespace)
+		return false, 0, nil
 	}
 
 	var (
@@ -193,7 +197,7 @@ func (r *WorkloadClassReconciler) leaseCheck(ctx context.Context, wc *workloadsv
 		return false, 0, err
 	}
 
-	if time.Now().Compare(expirationTime) >= 0 {
+	if !time.Now().Before(expirationTime) {
 		// Lease is expired
 		log.Info("Lease on PDB has expired", "PDB", pdb.Name, "Pod", leasePod, "Namespace", wc.Namespace, "Expiration", leaseExpiration)
 		return false, 0, nil

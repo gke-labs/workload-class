@@ -582,6 +582,46 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
 		})
 
+		It("should create a PDB when when a WorkloadClass is created", func() {
+			By("Updating the namespace to remove the default WC")
+			ns := &corev1.Namespace{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)).Should(Succeed())
+			delete(ns.Labels, workloadsv1.DefaultClassLabel)
+			Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+
+			By("Creating a new WorkloadClass")
+			secondWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "second-wc", Namespace: defaultNamespace},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"unique-to": "second-wc"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, secondWC)).To(Succeed())
+
+			By("Reconciling secondary-wc and verifying it DOES create a PDB")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: secondWC.Name, Namespace: defaultNamespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the PDB was created in the API server")
+			// Get the WC and ask the helper for the exact PDB name
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			expectedPDBName := utils.PDBName(secondWC.Name)
+			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
+
+			pdb := &policyv1.PodDisruptionBudget{}
+			// Use Eventually to wait for the cache to sync!
+			Eventually(func() error {
+				return k8sClient.Get(ctx, pdbKey, pdb)
+			}, "10s", "1s").Should(Succeed(), "Failed to find PDB with name %s", expectedPDBName)
+
+			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+		})
+
 		It("should delete the PDB if validation fails", func() {
 			By("First reconciling to ensure PDB is created initially")
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -2378,6 +2418,12 @@ func TestLeaseCheck(t *testing.T) {
 				},
 			},
 			wantOngoing: true,
+		},
+		{
+			name:        "pdb_does_not_exist",
+			pdb:         nil,
+			wantOngoing: false,
+			wantErr:     false,
 		},
 	}
 
