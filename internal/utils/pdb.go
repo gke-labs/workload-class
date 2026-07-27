@@ -175,10 +175,16 @@ func PDBWithLease(pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadCla
 		pdb.Annotations = map[string]string{}
 	}
 
+	// The default lease duration is 30s if the pod's DeletionGracePeriodSeconds is not set
+	leaseDuration := 30 * time.Second
+	if pod.DeletionGracePeriodSeconds != nil {
+		leaseDuration = time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
+	}
+
 	pdb.Annotations[BypassOwner] = BypassOwnerValue(subject)
 	pdb.Annotations[BypassPod] = pod.Name
 	pdb.Annotations[BypassPodUID] = string(pod.UID)
-	pdb.Annotations[BypassExpiration] = time.Now().Add(5 * time.Second).Format(ExpirationFormat)
+	pdb.Annotations[BypassExpiration] = time.Now().Add(leaseDuration).Format(ExpirationFormat)
 
 	return nil
 }
