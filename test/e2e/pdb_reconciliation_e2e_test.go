@@ -17,7 +17,9 @@ package e2e
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -448,6 +450,230 @@ spec:
 				_, err := testUtils.Run(cmd)
 				return err
 			}, 2*time.Minute, 2*time.Second).Should(HaveOccurred())
+		})
+	})
+	Context("PDB Defaults overrides and eviction leases", func() {
+		It("should demonstrate full lifecycle of PDBs, namespace defaults, and leases", func() {
+			testNs := "e2e-complex-" + fmt.Sprintf("%d", time.Now().UnixNano())
+
+			By("Creating a fresh namespace without defaults")
+			cmd := exec.Command("kubectl", "create", "ns", testNs)
+			_, err := testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				_, _ = testUtils.Run(exec.Command("kubectl", "delete", "ns", testNs, "--ignore-not-found"))
+			}()
+
+			By("Labeling the namespace")
+			cmd = exec.Command("kubectl", "label", "ns", testNs, "pod-security.kubernetes.io/enforce=restricted")
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Creating the first WorkloadClass wc-1 (no defaults)")
+			wc1Yaml := fmt.Sprintf(`
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: wc-1
+  namespace: %s
+spec:
+  podSelector:
+    matchLabels:
+      app: test-app
+  disruptionPolicy:
+    minInitialRunDurationDays: 1
+    maxNonDisruptionDurationDays: 14
+    allowedDisruptionWindows:
+      - name: "never"
+        daysOfWeek: [Saturday]
+        startTime: "00:00"
+        endTime: "00:01"
+        timeZone: "America/Toronto"
+`, testNs)
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", wc1Yaml))
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying PDB is generated for wc-1")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-wc-1", "-n", testNs)
+				_, err := testUtils.Run(cmd)
+				return err
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Creating pods manually to control their names")
+			deployYaml := fmt.Sprintf(`
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-sts
+  namespace: %s
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: test-app
+  template:
+    metadata:
+      labels:
+        app: test-app
+    spec:
+      terminationGracePeriodSeconds: 600
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+`, testNs)
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", deployYaml))
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Waiting for pods to be ready")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pods", "-n", testNs, "-l", "app=test-app", "-o", "jsonpath={.items[*].status.phase}")
+				out, err := testUtils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				phases := strings.Split(strings.TrimSpace(string(out)), " ")
+				g.Expect(len(phases)).To(Equal(2))
+				g.Expect(phases[0]).To(Equal("Running"))
+				g.Expect(phases[1]).To(Equal("Running"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("Verifying that all pods are protected by the PDB")
+			cmd = exec.Command("kubectl", "get", "pods", "-n", testNs, "-l", "app=test-app", "-o", "jsonpath={.items[0].metadata.name}")
+			out, err := testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			podToEvict := string(out)
+
+			evictionURL := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/eviction", testNs, podToEvict)
+			evictionJSON := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"%s"}}`, podToEvict, testNs)
+			evictionFile := filepath.Join("/tmp", "eviction-complex1.json")
+			_ = os.WriteFile(evictionFile, []byte(evictionJSON), 0644)
+
+			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile)
+			out, err = testUtils.Run(cmd)
+			Expect(err).To(HaveOccurred())
+			Expect(string(out)).To(ContainSubstring("admission webhook \"vpoddisruption.gke.io\" denied the request: Eviction blocked"))
+
+			By("Creating another WorkloadClass (wc-2) in the same namespace")
+			wc2Yaml := fmt.Sprintf(`
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: wc-2
+  namespace: %s
+spec:
+  podSelector:
+    matchLabels:
+      app: other-app
+  disruptionPolicy:
+    minInitialRunDurationDays: 1
+    maxNonDisruptionDurationDays: 14
+    allowedDisruptionsOutsideOfWindow:
+      - kind: ServiceAccount
+        name: cluster-autoscaler
+        namespace: kube-system
+    allowedDisruptionWindows:
+      - name: "never"
+        daysOfWeek: [Saturday]
+        startTime: "00:00"
+        endTime: "00:01"
+        timeZone: "America/Toronto"
+`, testNs)
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", wc2Yaml))
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying PDB is generated for wc-2")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-wc-2", "-n", testNs)
+				_, err := testUtils.Run(cmd)
+				return err
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Marking wc-2 as the namespace default")
+			cmd = exec.Command("kubectl", "label", "ns", testNs, "workloads.gke.io/default-class=wc-2", "--overwrite")
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying wc-1's PDB is deleted")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-wc-1", "-n", testNs)
+				_, err := testUtils.Run(cmd)
+				return err
+			}, 2*time.Minute, 2*time.Second).Should(HaveOccurred())
+
+			By("Verifying the pods are still protected (now by wc-2/default PDB)")
+			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile)
+			out, err = testUtils.Run(cmd)
+			Expect(err).To(HaveOccurred())
+			Expect(string(out)).To(ContainSubstring("admission webhook \"vpoddisruption.gke.io\" denied the request: Eviction blocked"))
+
+			By("Evicting the pod as the allowed user (cluster-autoscaler)")
+			Eventually(func() error {
+				cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as=system:serviceaccount:kube-system:cluster-autoscaler")
+				_, err = testUtils.Run(cmd)
+				return err
+			}, time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Waiting for the PDB lease to be cleaned up because the Pod is now Terminating with DeletionTimestamp")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-wc-2", "-n", testNs, "-o", "jsonpath={.metadata.annotations}")
+				anOut, err := testUtils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(anOut).NotTo(ContainSubstring(podToEvict))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Simulating full pod removal before 600s")
+			cmd = exec.Command("kubectl", "delete", "pod", podToEvict, "-n", testNs, "--force", "--grace-period=0")
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Ensure StatefulSet automatically recreates the pod and it is ready")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", podToEvict, "-n", testNs, "-o", "jsonpath={.status.phase}")
+				anOut, err := testUtils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(anOut).To(Equal("Running"))
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Attempting to evict it using someone else's lease should fail")
+			// Get the NEW Pod's UID
+			cmd = exec.Command("kubectl", "get", "pod", podToEvict, "-n", testNs, "-o", "jsonpath={.metadata.uid}")
+			newUID, _ := testUtils.Run(cmd)
+
+			// Hack the PDB to insert a lease that belongs to someone else but is for the CURRENT pod UID
+			// The controller will see it is for the current pod UID and NOT delete it.
+			// Then the webhook will see it belongs to someone else and DENY the eviction.
+			expiration := time.Now().Add(time.Hour).Format(utils.ExpirationFormat)
+			cmd = exec.Command("kubectl", "annotate", "pdb", "workload-wc-2", "-n", testNs,
+				fmt.Sprintf("%s=%s", utils.BypassPod, podToEvict),
+				fmt.Sprintf("%s=%s", utils.BypassPodUID, string(newUID)),
+				fmt.Sprintf("%s=%s", utils.BypassExpiration, expiration),
+				fmt.Sprintf("%s=%s", utils.BypassOwner, "system:serviceaccount:kube-system:someone-else"),
+				"--overwrite",
+			)
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Wait a brief moment to ensure the Webhook's informer cache synchronizes the annotation.
+			time.Sleep(3 * time.Second)
+
+			Eventually(func(g Gomega) {
+				cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as=system:serviceaccount:kube-system:cluster-autoscaler")
+				out, err := testUtils.Run(cmd)
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(string(out)).To(ContainSubstring("Disruption denied, PDB workload-wc-2 has an ongoing lease"))
+			}, 15*time.Second, 1*time.Second).Should(Succeed())
 		})
 	})
 })
