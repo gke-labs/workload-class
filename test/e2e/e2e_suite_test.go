@@ -64,10 +64,16 @@ var _ = BeforeSuite(func() {
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
 
+	By("creating ClusterRoleBindings for test service accounts")
+	exec.Command("kubectl", "create", "clusterrolebinding", "e2e-cluster-autoscaler", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:cluster-autoscaler").Run()
+	exec.Command("kubectl", "create", "clusterrolebinding", "e2e-someone-else", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:someone-else").Run()
+
 	setupCertManager()
 })
 
 var _ = AfterSuite(func() {
+	exec.Command("kubectl", "delete", "clusterrolebinding", "e2e-cluster-autoscaler", "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "clusterrolebinding", "e2e-someone-else", "--ignore-not-found").Run()
 	teardownCertManager()
 })
 
