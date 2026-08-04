@@ -367,11 +367,11 @@ func TestPDBWithLease(t *testing.T) {
 					t.Errorf("PDBWithLease() BypassExpiration annotation is not properly formatted: %v", err)
 				}
 				if tt.pod.DeletionGracePeriodSeconds != nil {
-					if time.Until(dur).Seconds() <= float64(30) {
+					if time.Until(dur).Seconds() <= defaultLeaseDuration.Seconds() {
 						t.Error("PDBWithLease() unexpectedly set default 30s lease duration")
 					}
 				} else {
-					if time.Until(dur).Seconds() > float64(30) {
+					if time.Until(dur).Seconds() > defaultLeaseDuration.Seconds() {
 						t.Errorf("PDBWithLease() set unexpected value for lease duration: %v", dur)
 					}
 				}
