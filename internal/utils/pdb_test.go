@@ -17,7 +17,6 @@ limitations under the License.
 package utils
 
 import (
-	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -26,7 +25,6 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
@@ -249,10 +247,8 @@ func TestPDBWithLease(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
-			var c client.Client // nil client is fine since it's unused in the func body
-
-			err := PDBWithLease(ctx, c, tt.pdb, tt.wc, tt.pod)
+			s := workloadsv1.Subject{Kind: "ServiceAccount", Name: "sam", Namespace: "system"}
+			err := PDBWithLease(tt.pdb, tt.wc, tt.pod, s)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PDBWithLease() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -274,6 +270,10 @@ func TestPDBWithLease(t *testing.T) {
 					t.Errorf("PDBWithLease() MaxUnavailable = %v, want %v", tt.pdb.Spec.MaxUnavailable, wantMaxUnavailable)
 				}
 				// 4. Annotations should include BypassPod and BypassExpiration
+				if tt.pdb.Annotations[BypassOwner] != BypassOwnerValue(s) {
+					t.Errorf("PDBWithLease() BypassPod annotation = %v, want %v", tt.pdb.Annotations[BypassOwner], BypassOwnerValue(s))
+				}
+
 				if tt.pdb.Annotations[BypassPod] != tt.pod.Name {
 					t.Errorf("PDBWithLease() BypassPod annotation = %v, want %v", tt.pdb.Annotations[BypassPod], tt.pod.Name)
 				}
@@ -290,6 +290,39 @@ func TestPDBWithLease(t *testing.T) {
 				if tt.pdb.Annotations["existing"] != "annotation" {
 					t.Errorf("PDBWithLease() failed to preserve existing annotations")
 				}
+			}
+		})
+	}
+}
+
+func TestBypassOwnerValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject workloadsv1.Subject
+		want    string
+	}{
+		{
+			name:    "user_kind",
+			subject: workloadsv1.Subject{Kind: "User", Name: "alice"},
+			want:    "alice",
+		},
+		{
+			name:    "group_kind",
+			subject: workloadsv1.Subject{Kind: "Group", Name: "devops"},
+			want:    "devops",
+		},
+		{
+			name:    "service_account_kind",
+			subject: workloadsv1.Subject{Kind: "ServiceAccount", Namespace: "default", Name: "my-sa"},
+			want:    "system:serviceaccount:default:my-sa",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BypassOwnerValue(tt.subject)
+			if got != tt.want {
+				t.Errorf("BypassOwnerValue() = %v, want %v", got, tt.want)
 			}
 		})
 	}
