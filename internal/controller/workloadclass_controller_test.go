@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
@@ -634,18 +636,32 @@ var _ = Describe("WorkloadClass Controller", func() {
 			}, "10s", "1s").Should(Succeed())
 
 			By("Setting another WorkloadClass as the namespace default")
+			otherWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "some-other-class",
+					Namespace: defaultNamespace,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 1,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, otherWC)).To(Succeed())
+
 			ns := &corev1.Namespace{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)).To(Succeed())
 
 			if ns.Labels == nil {
 				ns.Labels = make(map[string]string)
 			}
-			ns.Labels["workloads.gke.io/default-class"] = "some-other-class"
+			ns.Labels[workloadsv1.DefaultClassLabel] = "some-other-class"
 			Expect(k8sClient.Update(ctx, ns)).To(Succeed())
 
 			defer func() {
+				_ = k8sClient.Delete(ctx, otherWC)
 				_ = k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)
-				delete(ns.Labels, "workloads.gke.io/default-class")
+				delete(ns.Labels, workloadsv1.DefaultClassLabel)
 				_ = k8sClient.Update(ctx, ns)
 			}()
 
@@ -660,6 +676,70 @@ var _ = Describe("WorkloadClass Controller", func() {
 				err := k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
 				return errors.IsNotFound(err)
 			}, "10s", "1s").Should(BeTrue(), "Expected PDB %s to be deleted", expectedPDBName)
+		})
+
+		It("should trigger reconciliation for other classes when the default PDB is deleted", func() {
+			By("Creating a default WorkloadClass")
+			defaultWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "default-wc", Namespace: defaultNamespace},
+				Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1}},
+			}
+			Expect(k8sClient.Create(ctx, defaultWC)).To(Succeed())
+
+			By("Setting the namespace default label")
+			ns := &corev1.Namespace{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)).To(Succeed())
+			if ns.Labels == nil {
+				ns.Labels = make(map[string]string)
+			}
+			ns.Labels[workloadsv1.DefaultClassLabel] = "default-wc"
+			Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+
+			By("Creating a secondary WorkloadClass")
+			secondaryWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "secondary-wc", Namespace: defaultNamespace},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+					PodSelector:      &metav1.LabelSelector{MatchLabels: map[string]string{"a": "b"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, secondaryWC)).To(Succeed())
+
+			By("Reconciling the default WorkloadClass to create its PDB")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "default-wc", Namespace: defaultNamespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the default PDB exists")
+			defaultPDBKey := types.NamespacedName{Name: "workload-default-wc", Namespace: defaultNamespace}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, defaultPDBKey, &policyv1.PodDisruptionBudget{})
+			}, "10s", "1s").Should(Succeed())
+
+			By("Deleting the default WorkloadClass and the default PDB")
+			// We MUST delete the defaultWC first. If we delete the label, the PDB watcher
+			// won't realize this PDB belonged to the default class and will skip queueing secondary-wc.
+			Expect(k8sClient.Delete(ctx, defaultWC)).To(Succeed())
+
+			// Deleting the PDB triggers the Watches DeleteFunc and queues secondary-wc
+			// (Since envtest doesn't have GC, we simulate the GC deleting the PDB)
+			defaultPDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, defaultPDBKey, defaultPDB)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, defaultPDB)).To(Succeed())
+
+			By("Verifying secondary-wc was automatically queued and created its own PDB")
+			// We must call Reconcile manually because the test suite does not run the Manager / Watch loops
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "secondary-wc", Namespace: defaultNamespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			secondaryPDBKey := types.NamespacedName{Name: "workload-secondary-wc", Namespace: defaultNamespace}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, secondaryPDBKey, &policyv1.PodDisruptionBudget{})
+			}, "15s", "1s").Should(Succeed(), "Secondary PDB was never created, meaning it was not queued for reconciliation")
+
+			// Cleanup
+			_ = k8sClient.Delete(ctx, defaultWC)
+			_ = k8sClient.Delete(ctx, secondaryWC)
+			_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "workload-secondary-wc", Namespace: defaultNamespace}})
 		})
 	})
 })
@@ -1089,6 +1169,14 @@ func TestValidateSelectors(t *testing.T) {
 func TestNamespaceDefault(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = workloadsv1.AddToScheme(scheme)
+
+	criticalBatch := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "critical-batch",
+			Namespace: "test-ns",
+		},
+	}
 
 	testCases := []struct {
 		name      string
@@ -1103,7 +1191,7 @@ func TestNamespaceDefault(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-ns",
 					Labels: map[string]string{
-						"workloads.gke.io/default-class": "critical-batch",
+						workloadsv1.DefaultClassLabel: "critical-batch",
 					},
 				},
 			},
@@ -1151,7 +1239,7 @@ func TestNamespaceDefault(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
 			if tc.namespace != nil {
-				clientBuilder = clientBuilder.WithObjects(tc.namespace)
+				clientBuilder = clientBuilder.WithObjects(tc.namespace, criticalBatch)
 			}
 			fakeClient := clientBuilder.Build()
 
@@ -1164,8 +1252,11 @@ func TestNamespaceDefault(t *testing.T) {
 				t.Errorf("namespaceDefault() error = %v, wantErr %v", err, tc.wantErr)
 				return
 			}
-			if got != tc.want {
-				t.Errorf("namespaceDefault() got = %q, want %q", got, tc.want)
+			if got != nil && got.Name != tc.want {
+				t.Errorf("namespaceDefault() got = %v, want %q", got, tc.want)
+			} else if got == nil && tc.want != "" {
+				t.Errorf("namespaceDefault() got nil, want %q", tc.want)
+
 			}
 		})
 	}
@@ -1399,10 +1490,19 @@ func TestReconcilePDB(t *testing.T) {
 	now := metav1.Now()
 	oneHourAgo := metav1.NewTime(now.Add(-1 * time.Hour))
 
+	testWC := makeWC("test-wc", now)
+	otherWC := makeWC("some-other-wc", now)
+	oldestWC := makeWC("oldest-wc", oneHourAgo)
+	newerWC := makeWC("newer-wc", now)
+	deletingWC := makeWC("deleting-wc", oneHourAgo)
+	deletingWC.DeletionTimestamp = &now
+	controllerutil.AddFinalizer(deletingWC, "stop")
+
 	testCases := []struct {
 		name               string
 		namespace          *corev1.Namespace
 		wc                 *workloadsv1.WorkloadClass
+		wcsForClient       []*workloadsv1.WorkloadClass
 		condition          metav1.Condition
 		overlappingClasses []workloadsv1.WorkloadClass
 		wantErr            bool
@@ -1411,26 +1511,55 @@ func TestReconcilePDB(t *testing.T) {
 		{
 			name:          "deletes_pdb_if_validation_fails",
 			namespace:     &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:            makeWC("test-wc", now),
+			wc:            testWC,
+			wcsForClient:  []*workloadsv1.WorkloadClass{testWC},
 			condition:     metav1.Condition{Reason: "ValidationError"}, // Anything other than ReasonValidationPassed
 			wantPDBExists: false,                                       // Calls deletePDB
 		},
 		{
-			name:      "errors_if_namespace_missing",
-			namespace: nil, // Namespace Get will fail
-			wc:        makeWC("test-wc", now),
-			condition: metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			wantErr:   true,
+			name:         "errors_if_namespace_missing",
+			namespace:    nil, // Namespace Get will fail
+			wc:           testWC,
+			wcsForClient: []*workloadsv1.WorkloadClass{testWC},
+			condition:    metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
+			wantErr:      true,
 		},
 		{
 			name: "creates_pdb_if_this_wc_is_namespace_default",
 			namespace: &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   "default",
-					Labels: map[string]string{"workloads.gke.io/default-class": "test-wc"},
+					Labels: map[string]string{workloadsv1.DefaultClassLabel: "test-wc"},
 				},
 			},
-			wc:            makeWC("test-wc", now),
+			wc:            testWC,
+			wcsForClient:  []*workloadsv1.WorkloadClass{testWC},
+			condition:     metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
+			wantPDBExists: true,
+		},
+		{
+			name: "creates_pdb_if_the_namespace_default_does_not_exist",
+			namespace: &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "default",
+					Labels: map[string]string{workloadsv1.DefaultClassLabel: "non-existent-wc"},
+				},
+			},
+			wc:            testWC,
+			wcsForClient:  []*workloadsv1.WorkloadClass{testWC},
+			condition:     metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
+			wantPDBExists: true,
+		},
+		{
+			name: "creates_pdb_if_the_namespace_default_has_deletion_timestamp",
+			namespace: &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "default",
+					Labels: map[string]string{workloadsv1.DefaultClassLabel: "deleting-wc"},
+				},
+			},
+			wc:            testWC,
+			wcsForClient:  []*workloadsv1.WorkloadClass{testWC, deletingWC},
 			condition:     metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
 			wantPDBExists: true,
 		},
@@ -1439,38 +1568,42 @@ func TestReconcilePDB(t *testing.T) {
 			namespace: &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   "default",
-					Labels: map[string]string{"workloads.gke.io/default-class": "some-other-wc"},
+					Labels: map[string]string{workloadsv1.DefaultClassLabel: "some-other-wc"},
 				},
 			},
-			wc:            makeWC("test-wc", now),
+			wc:            testWC,
+			wcsForClient:  []*workloadsv1.WorkloadClass{testWC, otherWC},
 			condition:     metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
 			wantPDBExists: false,
 		},
 		{
 			name:               "creates_pdb_if_no_default_and_no_overlaps",
 			namespace:          &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:                 makeWC("test-wc", now),
+			wc:                 testWC,
+			wcsForClient:       []*workloadsv1.WorkloadClass{testWC},
 			condition:          metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
 			overlappingClasses: nil,
 			wantPDBExists:      true,
 		},
 		{
-			name:      "creates_pdb_if_no_default_and_this_is_oldest_overlap",
-			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:        makeWC("oldest-wc", oneHourAgo),
-			condition: metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
+			name:         "creates_pdb_if_no_default_and_this_is_oldest_overlap",
+			namespace:    &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+			wc:           oldestWC,
+			wcsForClient: []*workloadsv1.WorkloadClass{oldestWC, newerWC},
+			condition:    metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
 			overlappingClasses: []workloadsv1.WorkloadClass{
-				*makeWC("newer-wc", now),
+				*newerWC,
 			},
 			wantPDBExists: true,
 		},
 		{
-			name:      "deletes_pdb_if_no_default_and_this_is_not_oldest_overlap",
-			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:        makeWC("newer-wc", now),
-			condition: metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
+			name:         "deletes_pdb_if_no_default_and_this_is_not_oldest_overlap",
+			namespace:    &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+			wc:           newerWC,
+			wcsForClient: []*workloadsv1.WorkloadClass{oldestWC, newerWC},
+			condition:    metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
 			overlappingClasses: []workloadsv1.WorkloadClass{
-				*makeWC("oldest-wc", oneHourAgo),
+				*oldestWC,
 			},
 			wantPDBExists: false,
 		},
@@ -1489,6 +1622,9 @@ func TestReconcilePDB(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace},
 			}
 			clientBuilder = clientBuilder.WithObjects(dummyPDB)
+			for _, o := range tc.wcsForClient {
+				clientBuilder = clientBuilder.WithObjects(o)
+			}
 			fakeClient := clientBuilder.Build()
 			reconciler := &WorkloadClassReconciler{
 				Client: fakeClient,
@@ -1535,5 +1671,141 @@ func makeWC(name string, creationTime metav1.Time) *workloadsv1.WorkloadClass {
 		Status: workloadsv1.WorkloadClassStatus{
 			MaintenanceReadiness: workloadsv1.ReadinessReady,
 		},
+	}
+}
+
+func TestFindNonDefaultWorkloadClasses(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(policyv1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	testCases := []struct {
+		name         string
+		pdb          *policyv1.PodDisruptionBudget
+		namespace    *corev1.Namespace
+		existingWCs  []*workloadsv1.WorkloadClass
+		wantRequests []reconcile.Request
+	}{
+		{
+			name: "pdb_not_default_should_return_nil",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-my-wc",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "WorkloadClass", Name: "my-wc"},
+					},
+				},
+			},
+			namespace: &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "default",
+					Labels: map[string]string{
+						workloadsv1.DefaultClassLabel: "other-wc",
+					},
+				},
+			},
+			existingWCs: []*workloadsv1.WorkloadClass{
+				{ObjectMeta: metav1.ObjectMeta{Name: "my-wc", Namespace: "default"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "other-wc", Namespace: "default"}},
+			},
+			wantRequests: nil,
+		},
+		{
+			name: "pdb_is_default_should_return_other_classes",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-default-wc",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "WorkloadClass", Name: "default-wc"},
+					},
+				},
+			},
+			namespace: &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "default",
+					Labels: map[string]string{
+						workloadsv1.DefaultClassLabel: "default-wc",
+					},
+				},
+			},
+			existingWCs: []*workloadsv1.WorkloadClass{
+				{ObjectMeta: metav1.ObjectMeta{Name: "default-wc", Namespace: "default"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "other-wc", Namespace: "default"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "another-wc", Namespace: "default"}},
+			},
+			wantRequests: []reconcile.Request{
+				{NamespacedName: types.NamespacedName{Name: "other-wc", Namespace: "default"}},
+				{NamespacedName: types.NamespacedName{Name: "another-wc", Namespace: "default"}},
+			},
+		},
+		{
+			name: "pdb_without_owner_reference_uses_fallback_name",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-fallback-wc",
+					Namespace: "default",
+				},
+			},
+			namespace: &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "default",
+					Labels: map[string]string{
+						workloadsv1.DefaultClassLabel: "fallback-wc",
+					},
+				},
+			},
+			existingWCs: []*workloadsv1.WorkloadClass{
+				{ObjectMeta: metav1.ObjectMeta{Name: "fallback-wc", Namespace: "default"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "other-wc", Namespace: "default"}},
+			},
+			wantRequests: []reconcile.Request{
+				{NamespacedName: types.NamespacedName{Name: "other-wc", Namespace: "default"}},
+			},
+		},
+		{
+			name: "namespace_missing_returns_nil",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-my-wc",
+					Namespace: "missing-ns",
+				},
+			},
+			namespace:    nil,
+			wantRequests: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
+			if tc.namespace != nil {
+				clientBuilder = clientBuilder.WithObjects(tc.namespace)
+			}
+			for _, wc := range tc.existingWCs {
+				clientBuilder = clientBuilder.WithObjects(wc)
+			}
+
+			fakeClient := clientBuilder.Build()
+			reconciler := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			requests := reconciler.findNonDefaultWorkloadClasses(context.Background(), tc.pdb)
+
+			if len(requests) != len(tc.wantRequests) {
+				t.Errorf("expected %d requests, got %d", len(tc.wantRequests), len(requests))
+			}
+
+			// verify contents of requests
+			for _, wantReq := range tc.wantRequests {
+				if !slices.Contains(requests, wantReq) {
+					t.Errorf("expected request %v not found in result %v", wantReq, requests)
+				}
+			}
+		})
 	}
 }

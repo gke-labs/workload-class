@@ -22,6 +22,11 @@ import (
 
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+const (
+	// DefaultClassLabel is the label applied to Namespaces to denote the default WorkloadClass.
+	DefaultClassLabel = "workloads.gke.io/default-class"
+)
+
 // DisruptionPolicy specifies the policy governing pod disruptions.
 type DisruptionPolicy struct {
 	// AllowedDisruptionWindows defines when disruptions are allowed.
