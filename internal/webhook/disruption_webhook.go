@@ -102,7 +102,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	if !inWindow {
-		// 6.1 Indentity-Based Filtering
+		// 6.1 Identity-Based Filtering
 		return v.tryBypassWindowByIdentity(ctx, bestWC, req, pod)
 	}
 
@@ -255,7 +255,7 @@ func (v *DisruptionWebhook) tryAcquirePDBLease(ctx context.Context, wc *workload
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, v.Client, pdb, func() error {
-		return utils.PDBWithLease(ctx, v.Client, pdb, wc, pod, subject)
+		return utils.PDBWithLease(pdb, wc, pod, subject)
 	})
 	if err != nil {
 		return admission.Denied(fmt.Sprintf("Disruption denied, failed to lease PDB: %s", err))

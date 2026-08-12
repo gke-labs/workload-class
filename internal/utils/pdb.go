@@ -17,12 +17,10 @@ limitations under the License.
 package utils
 
 import (
-	"context"
 	"fmt"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -117,7 +115,7 @@ func AllowLease(pdb *policyv1.PodDisruptionBudget) bool {
 }
 
 // PDBWithLease configures a PDB with annotations to represent a temporary lease and sets MaxUnavailable to 100%
-func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
+func PDBWithLease(pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
 	if wc == nil {
 		return fmt.Errorf("failed to update PDB with lease, WorkloadClass is nil")
 	}
@@ -158,7 +156,7 @@ func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisrupt
 	return nil
 }
 
-// BypassOwnerValue returns the value of the workloads.gke.io/bypass-owner label based on the given subject
+// BypassOwnerValue returns the value of the workloads.gke.io/bypass-owner annotation based on the given subject
 func BypassOwnerValue(subject workloadsv1.Subject) string {
 	if subject.Kind == "User" || subject.Kind == "Group" {
 		return subject.Name

@@ -114,6 +114,10 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 		By("removing manager namespace")
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
 		_, _ = utils.Run(cmd)
+
+		By("removing test-autoscaler-admin clusterolebinding")
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", "test-autoscaler-admin")
+		_, _ = utils.Run(cmd)
 	})
 
 	// After each test, check for failures and collect logs, events,

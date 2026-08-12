@@ -41,6 +41,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
+const (
+	namespace = "default"
+	podName   = "test-pod"
+	wcName    = "test-wc"
+)
+
 func TestGetSpecificity(t *testing.T) {
 	testCases := []struct {
 		name             string
@@ -1258,10 +1264,6 @@ func TestTryAcquirePDBLease(t *testing.T) {
 	_ = policyv1.AddToScheme(scheme)
 	_ = workloadsv1.AddToScheme(scheme)
 
-	namespace := "default"
-	podName := "test-pod"
-	wcName := "test-wc"
-
 	wc := &workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
 		Spec: workloadsv1.WorkloadClassSpec{
@@ -1317,6 +1319,48 @@ func TestTryAcquirePDBLease(t *testing.T) {
 			wantDenied: true,
 			wantMsg:    "Disruption denied, PDB workload-test-wc has an ongoing lease",
 		},
+		{
+			name: "subject_already_leasing_succeeds_without_overwriting_expiration",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        podName,
+							utils.BypassOwner:      "admin@example.com",
+							utils.BypassExpiration: "2099-01-01 00:00:00.000000000 +0000 UTC",
+						},
+					},
+					Spec: policyv1.PodDisruptionBudgetSpec{
+						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					},
+				},
+			},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB already leased for this pod",
+		},
+		{
+			name: "pdb_exists_with_expired_lease_successfully_transitions_to_new_lease",
+			initObjs: []client.Object{
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      utils.PDBName(wcName),
+						Namespace: namespace,
+						Annotations: map[string]string{
+							utils.BypassPod:        "old-pod",
+							utils.BypassOwner:      "old-user",
+							utils.BypassExpiration: time.Now().Add(-1 * time.Hour).Format(utils.ExpirationFormat),
+						},
+					},
+					Spec: policyv1.PodDisruptionBudgetSpec{
+						Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					},
+				},
+			},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1334,6 +1378,16 @@ func TestTryAcquirePDBLease(t *testing.T) {
 			if !strings.HasPrefix(resp.Result.Message, tt.wantMsg) {
 				t.Errorf("tryAcquirePDBLease() msg = %v, want prefix %v", resp.Result.Message, tt.wantMsg)
 			}
+
+			if tt.name == "subject_already_leasing_succeeds_without_overwriting_expiration" {
+				updatedPDB := &policyv1.PodDisruptionBudget{}
+				err := fakeClient.Get(context.Background(), client.ObjectKey{Name: utils.PDBName(wcName), Namespace: namespace}, updatedPDB)
+				if err == nil {
+					if updatedPDB.Annotations[utils.BypassExpiration] != "2099-01-01 00:00:00.000000000 +0000 UTC" {
+						t.Errorf("Expiration was modified/overwritten: got %s, want 2099-01-01 00:00:00.000000000 +0000 UTC", updatedPDB.Annotations[utils.BypassExpiration])
+					}
+				}
+			}
 		})
 	}
 }
@@ -1343,10 +1397,6 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = policyv1.AddToScheme(scheme)
 	_ = workloadsv1.AddToScheme(scheme)
-
-	namespace := "default"
-	podName := "test-pod"
-	wcName := "test-wc"
 
 	testSubject := workloadsv1.Subject{
 		Kind: "User",
@@ -1416,6 +1466,94 @@ func TestTryBypassWindowByIdentity(t *testing.T) {
 
 			req := admission.Request{}
 			req.UserInfo.Username = tt.username
+
+			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod)
+			if resp.Allowed == tt.wantDenied {
+				t.Errorf("tryBypassWindowByIdentity() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
+			}
+			if !strings.HasPrefix(resp.Result.Message, tt.wantMsg) {
+				t.Errorf("tryBypassWindowByIdentity() msg = %v, want prefix %v", resp.Result.Message, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestTryBypassWindowByIdentity_SubjectKinds(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = workloadsv1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+	}
+
+	tests := []struct {
+		name       string
+		subject    workloadsv1.Subject
+		userInfo   authv1.UserInfo
+		wantDenied bool
+		wantMsg    string
+	}{
+		{
+			name:    "group_subject_matches_and_leases",
+			subject: workloadsv1.Subject{Kind: rbacv1.GroupKind, Name: "developers"},
+			userInfo: authv1.UserInfo{
+				Username: "dev1@example.com",
+				Groups:   []string{"system:authenticated", "developers"},
+			},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
+		{
+			name:    "group_subject_mismatch_denied",
+			subject: workloadsv1.Subject{Kind: rbacv1.GroupKind, Name: "operators"},
+			userInfo: authv1.UserInfo{
+				Username: "dev1@example.com",
+				Groups:   []string{"system:authenticated", "developers"},
+			},
+			wantDenied: true,
+			wantMsg:    "Eviction blocked: currently outside of allowed disruption windows",
+		},
+		{
+			name:    "service_account_subject_matches_and_leases",
+			subject: workloadsv1.Subject{Kind: rbacv1.ServiceAccountKind, Namespace: "default", Name: "app-sa"},
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:default:app-sa",
+			},
+			wantDenied: false,
+			wantMsg:    "Disruption allowed for authorized user, PDB leased",
+		},
+		{
+			name:    "service_account_subject_mismatch_denied",
+			subject: workloadsv1.Subject{Kind: rbacv1.ServiceAccountKind, Namespace: "kube-system", Name: "app-sa"},
+			userInfo: authv1.UserInfo{
+				Username: "system:serviceaccount:default:app-sa",
+			},
+			wantDenied: true,
+			wantMsg:    "Eviction blocked: currently outside of allowed disruption windows",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{tt.subject},
+					},
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			v := &DisruptionWebhook{
+				Client: fakeClient,
+			}
+
+			req := admission.Request{}
+			req.UserInfo = tt.userInfo
 
 			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod)
 			if resp.Allowed == tt.wantDenied {
