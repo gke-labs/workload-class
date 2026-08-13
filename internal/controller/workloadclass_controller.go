@@ -44,11 +44,6 @@ import (
 	"github.com/gke-labs/workload-class/internal/utils"
 )
 
-const (
-	isNamespaceDefault  = true
-	notNamespaceDefault = false
-)
-
 // WorkloadClassReconciler reconciles a WorkloadClass object
 type WorkloadClassReconciler struct {
 	client.Client
@@ -601,6 +596,10 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				},
 				GenericFunc: func(e event.GenericEvent) bool { return false },
 			}),
+		).
+		Watches(
+			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
 		).
 		Watches(
 			&corev1.Pod{}, // Trigger Reconcile if a Pod associated with a lease on this WorkloadClass is deleted

@@ -43,15 +43,10 @@ import (
 )
 
 const (
-<<<<<<< HEAD
 	namespace = "default"
 	podName   = "test-pod"
 	wcName    = "test-wc"
 	podUID    = "pod-uid-1234"
-=======
-	podName = "test-pod"
-	podUID  = "pod-uid-1234"
->>>>>>> 54b1443 (Add logic to disruption webhook to set/use the pod UID in the PDB annotations)
 )
 
 func TestGetSpecificity(t *testing.T) {
