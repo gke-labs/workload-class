@@ -18,14 +18,7 @@ package controller
 
 import (
 	"context"
-<<<<<<< HEAD
-<<<<<<< HEAD
 	"reflect"
-=======
->>>>>>> eab7c92 (Add logic to replace/remove PDBs when a namespace default WC is removed/added)
-=======
-	"reflect"
->>>>>>> 3ee93aa (Set empty label selector for namespace default PDB)
 	"slices"
 	"strings"
 	"testing"
