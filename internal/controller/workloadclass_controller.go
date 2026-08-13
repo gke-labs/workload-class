@@ -601,8 +601,61 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
 		).
+		Watches(
+			&corev1.Pod{}, // Trigger Reconcile if a Pod associated with a lease on this WorkloadClass is deleted
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassByLease),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(e event.CreateEvent) bool { return false },
+				GenericFunc: func(e event.GenericEvent) bool { return false },
+				DeleteFunc:  func(e event.DeleteEvent) bool { return true },
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					// Reconcile only when the pod transitions into a deleting state
+					wasNotDeleting := e.ObjectOld.GetDeletionTimestamp().IsZero()
+					isNowDeleting := !e.ObjectNew.GetDeletionTimestamp().IsZero()
+
+					return wasNotDeleting && isNowDeleting
+				},
+			}),
+		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassByLease(ctx context.Context, pod client.Object) []reconcile.Request {
+	pdbs := &policyv1.PodDisruptionBudgetList{}
+	if err := r.List(ctx, pdbs, client.InNamespace(pod.GetNamespace())); err != nil {
+		return nil
+	}
+
+	requests := []reconcile.Request{}
+	for _, pdb := range pdbs.Items {
+		requests = append(requests, extractWorkloadClassRequest(pod, &pdb)...)
+	}
+
+	return requests
+}
+
+// extractWorkloadClassRequest checks if the PDB holds a lease for the given Pod,
+// and if so, returns a reconcile request for the PDB's owning WorkloadClass.
+func extractWorkloadClassRequest(pod client.Object, pdb *policyv1.PodDisruptionBudget) []reconcile.Request {
+	uid, ok := pdb.Annotations[utils.BypassPodUID]
+	if !ok || string(pod.GetUID()) != uid {
+		return nil
+	}
+
+	owner := metav1.GetControllerOf(pdb)
+	if owner == nil || owner.Kind != "WorkloadClass" {
+		return nil
+	}
+
+	return []reconcile.Request{
+		{
+			NamespacedName: client.ObjectKey{
+				Name:      owner.Name,
+				Namespace: pod.GetNamespace(),
+			},
+		},
+	}
 }
 
 func (r *WorkloadClassReconciler) findWorkloadClassesByNamespace(ctx context.Context, ns client.Object) []reconcile.Request {
