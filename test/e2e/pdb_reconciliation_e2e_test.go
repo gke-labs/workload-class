@@ -21,7 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gke-labs/workload-class/test/utils"
+	utils "github.com/gke-labs/workload-class/internal/utils"
+	testUtils "github.com/gke-labs/workload-class/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -33,53 +34,53 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 	BeforeAll(func() {
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
+		_, err := testUtils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
 		By("labeling the namespace to enforce the restricted security policy")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
 			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
+		_, err = testUtils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 
 		By("installing CRDs")
 		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
+		_, err = testUtils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
+		_, err = testUtils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
 		By("Applying a namespace")
 		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/sample_namespace.yaml")
-		_, err = utils.Run(cmd)
+		_, err = testUtils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply Namespace")
 
 		By("Applying the WorkloadClassGuardrail sample (retrying until webhook is ready)")
 		Eventually(func() error {
 			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclassguardrail.yaml")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			return err
 		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Failed to apply WorkloadClassGuardrail")
 
 		By("Applying the WorkloadClass sample")
 		cmd = exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
-		_, err = utils.Run(cmd)
+		_, err = testUtils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply WorkloadClass")
 
 		By("Creating a dummy Deployment matching the WorkloadClass selector (retrying until webhook is ready)")
 		Eventually(func() error {
 			cmd = exec.Command("kubectl", "apply", "-f", "config/samples/dummy_deployment.yaml")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			return err
 		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "Failed to create test deployment")
 
 		By("Waiting for the Pod to be ready")
 		verifyPodReady := func(g Gomega) {
 			cmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].status.phase}")
-			out, err := utils.Run(cmd)
+			out, err := testUtils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("Running"))
 		}
@@ -89,23 +90,23 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 	AfterAll(func() {
 		By("cleaning up the clusterrolebinding")
 		cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
+		_, _ = testUtils.Run(cmd)
 
 		By("cleaning up the deployment")
 		cmd = exec.Command("kubectl", "delete", "deployment", "test-deployment", "-n", "sample", "--ignore-not-found")
-		_, _ = utils.Run(cmd)
+		_, _ = testUtils.Run(cmd)
 
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
+		_, _ = testUtils.Run(cmd)
 
 		By("uninstalling CRDs")
 		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
+		_, _ = testUtils.Run(cmd)
 
 		By("removing manager namespace")
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		_, _ = testUtils.Run(cmd)
 	})
 
 	AfterEach(func() {
@@ -113,14 +114,14 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 		if specReport.Failed() {
 			By("Fetching controller manager pod name")
 			podCmd := exec.Command("kubectl", "get", "pods", "-n", namespace, "-l", "control-plane=controller-manager", "-o", "jsonpath={.items[0].metadata.name}")
-			if podOutput, err := utils.Run(podCmd); err == nil && podOutput != "" {
+			if podOutput, err := testUtils.Run(podCmd); err == nil && podOutput != "" {
 				controllerPodName = strings.TrimSpace(podOutput)
 			}
 
 			By("Fetching controller manager pod logs")
 			// Now that we have the name, this will succeed
 			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
+			controllerLogs, err := testUtils.Run(cmd)
 			if err == nil {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
 			} else {
@@ -129,7 +130,7 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 
 			By("Fetching Kubernetes events")
 			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
+			eventsOutput, err := testUtils.Run(cmd)
 			if err == nil {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
 			} else {
@@ -137,7 +138,7 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 			}
 			By("Fetching controller manager pod description")
 			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
+			podDescription, err := testUtils.Run(cmd)
 			if err == nil {
 				fmt.Println("Pod description:\n", podDescription)
 			} else {
@@ -147,7 +148,7 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 		// Reset the WorkloadClass so the next test may make its own modifications
 		By("Resetting the WorkloadClass")
 		cmd := exec.Command("kubectl", "apply", "-f", "config/samples/workloads_v1_workloadclass.yaml")
-		_, _ = utils.Run(cmd)
+		_, _ = testUtils.Run(cmd)
 	})
 	SetDefaultEventuallyTimeout(2 * time.Minute)
 	SetDefaultEventuallyPollingInterval(time.Second)
@@ -158,7 +159,7 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 			verifyPDBExists := func(g Gomega) {
 				pdbName := "workload-critical-batch"
 				cmd := exec.Command("kubectl", "get", "pdb", pdbName, "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 			}
 			Eventually(verifyPDBExists, 2*time.Minute, 2*time.Second).Should(Succeed())
@@ -167,12 +168,12 @@ var _ = Describe("WorkloadClass PDB Reconciliation", Ordered, func() {
 		It("should not create PDBs for other WorkloadClasses in the same namespace when there exists a namespace default", func() {
 			By("Verifying that the namespace default WC exists")
 			cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample")
-			_, err := utils.Run(cmd)
+			_, err := testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that the namespace default PDB exists")
 			cmd = exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Creating other WCs in the same namespace")
@@ -190,16 +191,16 @@ spec:
     minInitialRunDurationDays: 1
 `
 			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", yaml))
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
-				_, _ = utils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-1", "-n", "sample", "--ignore-not-found"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-1", "-n", "sample", "--ignore-not-found"))
 			}()
 
 			By("Verifying that PDBs were not generated for the new WCs")
 			Consistently(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-1", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 10*time.Second, 2*time.Second).Should(HaveOccurred())
 		})
@@ -207,12 +208,12 @@ spec:
 		It("should create PDBs for all other WorkloadClasses in a namespace when the namespace default WC is deleted", func() {
 			By("Verifying that the namespace default WC exists")
 			cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample")
-			_, err := utils.Run(cmd)
+			_, err := testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that the namespace default PDB exists")
 			cmd = exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Creating other WCs in the same namespace")
@@ -230,28 +231,28 @@ spec:
     minInitialRunDurationDays: 1
 `
 			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", yaml))
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
-				_, _ = utils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-2", "-n", "sample", "--ignore-not-found"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-2", "-n", "sample", "--ignore-not-found"))
 			}()
 
 			By("Verifying that PDBs were not generated for the new WCs")
 			Consistently(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-2", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 10*time.Second, 2*time.Second).Should(HaveOccurred())
 
 			By("Deleting the default WC")
 			cmd = exec.Command("kubectl", "delete", "workloadclass", "critical-batch", "-n", "sample")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that PDBs are eventually generated for the other WCs in the namespace")
 			Eventually(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-2", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
@@ -260,12 +261,12 @@ spec:
 		It("should create PDBs for all WorkloadClasses in a namespace when the default label is removed from the namespace", func() {
 			By("Verifying that the namespace default WC exists")
 			cmd := exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample")
-			_, err := utils.Run(cmd)
+			_, err := testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that the namespace default PDB exists")
 			cmd = exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Creating other WCs in the same namespace")
@@ -283,29 +284,29 @@ spec:
     minInitialRunDurationDays: 1
 `
 			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", yaml))
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
-				_, _ = utils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-3", "-n", "sample", "--ignore-not-found"))
-				_, _ = utils.Run(exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-3", "-n", "sample", "--ignore-not-found"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite"))
 			}()
 
 			By("Verifying that PDBs were not generated for the new WCs")
 			Consistently(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-3", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 10*time.Second, 2*time.Second).Should(HaveOccurred())
 
 			By("Update the namespace, removing the default label")
 			cmd = exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class-")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that PDBs are eventually generated for the other WCs in the namespace")
 			Eventually(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-3", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
@@ -313,16 +314,16 @@ spec:
 		It("should delete PDBs when the namespace declares a default", func() {
 			By("Update the namespace, removing the default label")
 			cmd := exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class-")
-			_, err := utils.Run(cmd)
+			_, err := testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
-				_, _ = utils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-4", "-n", "sample", "--ignore-not-found"))
-				_, _ = utils.Run(exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "delete", "workloadclass", "secondary-wc-e2e-4", "-n", "sample", "--ignore-not-found"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite"))
 			}()
 
 			By("Verifying that the namespace default WC exists")
 			cmd = exec.Command("kubectl", "get", "workloadclass", "critical-batch", "-n", "sample")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Creating other WCs in the same namespace")
@@ -340,25 +341,111 @@ spec:
     minInitialRunDurationDays: 1
 `
 			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", yaml))
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that PDBs WERE generated for the new WCs")
 			Eventually(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-4", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
 			By("Update the namespace, adding the default label and setting the value to an existing WC")
 			cmd = exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite")
-			_, err = utils.Run(cmd)
+			_, err = testUtils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying that PDBs are eventually deleted for the other WCs in the namespace")
 			Eventually(func() error {
 				cmd := exec.Command("kubectl", "get", "pdb", "workload-secondary-wc-e2e-4", "-n", "sample")
-				_, err := utils.Run(cmd)
+				_, err := testUtils.Run(cmd)
+				return err
+			}, 2*time.Minute, 2*time.Second).Should(HaveOccurred())
+		})
+
+		It("should not delete a PDB if it has an active lease and should delete upon expiration", func() {
+			By("Update the namespace, removing the default label")
+			cmd := exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class-")
+			_, err := testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				_, _ = testUtils.Run(exec.Command("kubectl", "delete", "workloadclass", "lease-wc-e2e-1", "-n", "sample", "--ignore-not-found"))
+				_, _ = testUtils.Run(exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite"))
+			}()
+
+			By("Creating a WC in the namespace")
+			yaml := `
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: lease-wc-e2e-1
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      role: unique-lease-role
+  disruptionPolicy:
+    minInitialRunDurationDays: 1
+`
+			cmd = exec.Command("sh", "-c", fmt.Sprintf("echo '%s' | kubectl apply -f -", yaml))
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying that PDB WAS generated for the new WC")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-lease-wc-e2e-1", "-n", "sample")
+				_, err := testUtils.Run(cmd)
+				return err
+			}, 2*time.Minute, 2*time.Second).Should(Succeed())
+
+			By("Getting target Pod name and UID")
+			cmd = exec.Command("kubectl", "get", "pod", "-l", "role=batch-processor", "-n", "sample", "-o", "jsonpath={.items[0].metadata.name}")
+			podNameOut, err := testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			podName := strings.TrimSpace(podNameOut)
+
+			cmd = exec.Command("kubectl", "get", "pod", "-l", "role=batch-processor", "-n", "sample", "-o", "jsonpath={.items[0].metadata.uid}")
+			podUIDOut, err := testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			podUID := strings.TrimSpace(podUIDOut)
+
+			By("Annotating the PDB with a valid lease")
+			expiration := time.Now().Add(time.Hour).Format(utils.ExpirationFormat)
+			cmd = exec.Command("kubectl", "annotate", "pdb", "workload-lease-wc-e2e-1", "-n", "sample",
+				fmt.Sprintf("%s=%s", utils.BypassPod, podName),
+				fmt.Sprintf("%s=%s", utils.BypassPodUID, podUID),
+				fmt.Sprintf("%s=%s", utils.BypassOwner, "e2e-test"),
+				fmt.Sprintf("%s=%s", utils.BypassExpiration, expiration),
+			)
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Update the namespace, adding the default label and setting the value to an existing WC (should trigger PDB deletion for all other WCs)")
+			cmd = exec.Command("kubectl", "label", "ns", "sample", "workloads.gke.io/default-class=critical-batch", "--overwrite")
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying that the PDB is NOT deleted because of the active lease")
+			Consistently(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-lease-wc-e2e-1", "-n", "sample")
+				_, err := testUtils.Run(cmd)
+				return err
+			}, 20*time.Second, 2*time.Second).Should(Succeed())
+
+			By("Expiring the lease to verify the PDB gets deleted")
+			expirationExpired := time.Now().Add(-time.Hour).Format(utils.ExpirationFormat)
+			cmd = exec.Command("kubectl", "annotate", "pdb", "workload-lease-wc-e2e-1", "-n", "sample",
+				fmt.Sprintf("%s=%s", utils.BypassExpiration, expirationExpired),
+				"--overwrite",
+			)
+			_, err = testUtils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying that PDB is eventually deleted now that the lease is expired")
+			Eventually(func() error {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-lease-wc-e2e-1", "-n", "sample")
+				_, err := testUtils.Run(cmd)
 				return err
 			}, 2*time.Minute, 2*time.Second).Should(HaveOccurred())
 		})

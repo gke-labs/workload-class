@@ -565,6 +565,7 @@ func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&policyv1.PodDisruptionBudget{},
 			handler.EnqueueRequestsFromMapFunc(r.findNonDefaultWorkloadClasses),
 			builder.WithPredicates(predicate.Funcs{
