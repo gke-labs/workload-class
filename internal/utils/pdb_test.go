@@ -189,7 +189,9 @@ func TestAllowLease(t *testing.T) {
 			pdb: &policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						BypassPod: "test-pod",
+						BypassPod:    "test-pod",
+						BypassPodUID: "pod-uid-1234",
+						BypassOwner:  "test-user",
 					},
 				},
 			},
@@ -201,6 +203,8 @@ func TestAllowLease(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
 						BypassPod:        "test-pod",
+						BypassPodUID:     "pod-uid-1234",
+						BypassOwner:      "test-user",
 						BypassExpiration: "not-a-valid-time",
 					},
 				},
@@ -213,6 +217,8 @@ func TestAllowLease(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
 						BypassPod:        "test-pod",
+						BypassPodUID:     "pod-uid-1234",
+						BypassOwner:      "test-user",
 						BypassExpiration: time.Now().Add(-1 * time.Hour).Format(ExpirationFormat),
 					},
 				},
@@ -225,6 +231,8 @@ func TestAllowLease(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
 						BypassPod:        "test-pod",
+						BypassPodUID:     "pod-uid-1234",
+						BypassOwner:      "test-user",
 						BypassExpiration: time.Now().Add(1 * time.Hour).Format(ExpirationFormat),
 					},
 				},
@@ -273,7 +281,7 @@ func TestPDBWithLease(t *testing.T) {
 					Annotations: map[string]string{"existing": "annotation"},
 				},
 			},
-			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
+			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", UID: "pod-uid"}},
 			nsDefault:    false,
 			wantSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
 			wantErr:      false,
@@ -291,7 +299,7 @@ func TestPDBWithLease(t *testing.T) {
 					Annotations: map[string]string{"existing": "annotation"},
 				},
 			},
-			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod"}},
+			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", UID: "pod-uid"}},
 			nsDefault:    true,
 			wantSelector: &metav1.LabelSelector{},
 			wantErr:      false,
@@ -337,6 +345,14 @@ func TestPDBWithLease(t *testing.T) {
 				}
 				if _, err := time.Parse(ExpirationFormat, expirationStr); err != nil {
 					t.Errorf("PDBWithLease() BypassExpiration annotation is not properly formatted: %v", err)
+				}
+
+				uid, ok := tt.pdb.Annotations[BypassPodUID]
+				if !ok {
+					t.Errorf("PDBWithLease() BypassPodUID annotation is missing")
+				}
+				if uid != string(tt.pod.UID) {
+					t.Errorf("PDBWithLease BypassPodUID annotation = %s, want %v", uid, tt.pod.UID)
 				}
 
 				// 5. Existing annotations shouldn't be wiped out
