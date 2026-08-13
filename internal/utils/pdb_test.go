@@ -251,6 +251,7 @@ func TestAllowLease(t *testing.T) {
 }
 
 func TestPDBWithLease(t *testing.T) {
+	var deletionGrace int64 = 600
 	tests := []struct {
 		name         string
 		wc           *workloadsv1.WorkloadClass
@@ -287,7 +288,7 @@ func TestPDBWithLease(t *testing.T) {
 			wantErr:      false,
 		},
 		{
-			name: "successfully_configures_pdb_is_default",
+			name: "successfully_configures_pdb_is_default_without_grace",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -300,6 +301,24 @@ func TestPDBWithLease(t *testing.T) {
 				},
 			},
 			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", UID: "pod-uid"}},
+			nsDefault:    true,
+			wantSelector: &metav1.LabelSelector{},
+			wantErr:      false,
+		},
+		{
+			name: "successfully_configures_pdb_is_default_with_grace",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+				},
+			},
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"existing": "annotation"},
+				},
+			},
+			pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", UID: "pod-uid", DeletionGracePeriodSeconds: &deletionGrace}},
 			nsDefault:    true,
 			wantSelector: &metav1.LabelSelector{},
 			wantErr:      false,
@@ -343,8 +362,18 @@ func TestPDBWithLease(t *testing.T) {
 				if !ok {
 					t.Errorf("PDBWithLease() BypassExpiration annotation is missing")
 				}
-				if _, err := time.Parse(ExpirationFormat, expirationStr); err != nil {
+				dur, err := time.Parse(ExpirationFormat, expirationStr)
+				if err != nil {
 					t.Errorf("PDBWithLease() BypassExpiration annotation is not properly formatted: %v", err)
+				}
+				if tt.pod.DeletionGracePeriodSeconds != nil {
+					if time.Until(dur).Seconds() <= defaultLeaseDuration.Seconds() {
+						t.Error("PDBWithLease() unexpectedly set default 30s lease duration")
+					}
+				} else {
+					if time.Until(dur).Seconds() > defaultLeaseDuration.Seconds() {
+						t.Errorf("PDBWithLease() set unexpected value for lease duration: %v", dur)
+					}
 				}
 
 				uid, ok := tt.pdb.Annotations[BypassPodUID]
