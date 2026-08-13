@@ -1564,7 +1564,7 @@ func TestTryBypassWindowByIdentity_SubjectKinds(t *testing.T) {
 			req := admission.Request{}
 			req.UserInfo = tt.userInfo
 
-			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod)
+			resp := v.tryBypassWindowByIdentity(context.Background(), wc, req, pod, false)
 			if resp.Allowed == tt.wantDenied {
 				t.Errorf("tryBypassWindowByIdentity() allowed = %v, wantDenied %v", resp.Allowed, tt.wantDenied)
 			}

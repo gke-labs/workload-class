@@ -301,7 +301,7 @@ func TestPDBWithLease(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := workloadsv1.Subject{Kind: "ServiceAccount", Name: "sam", Namespace: "system"}
-			err := PDBWithLease(tt.pdb, tt.wc, tt.pod, s)
+			err := PDBWithLease(tt.pdb, tt.wc, tt.pod, s, tt.nsDefault)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PDBWithLease() error = %v, wantErr %v", err, tt.wantErr)
 				return
