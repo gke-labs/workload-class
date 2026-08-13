@@ -55,10 +55,11 @@ var _ = Describe("WorkloadClass Controller", func() {
 	Context("When reconciling a resource", func() {
 		ctx := context.Background()
 		const (
-			workloadClassName = "test-resource"
-			guardrailName     = "test-guardrail"
-			podName           = "silly-goose-pod"
-			defaultNamespace  = "default"
+			workloadClassName   = "test-resource"
+			guardrailName       = "test-guardrail"
+			podName             = "silly-goose-pod"
+			defaultNamespace    = "default"
+			testControllerOwner = "test-controller"
 		)
 
 		podLabels := map[string]string{
@@ -326,10 +327,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling")
-			controllerReconciler := &WorkloadClassReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -573,6 +570,46 @@ var _ = Describe("WorkloadClass Controller", func() {
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			expectedPDBName := "workload-" + wc.Name
+			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
+
+			pdb := &policyv1.PodDisruptionBudget{}
+			// Use Eventually to wait for the cache to sync!
+			Eventually(func() error {
+				return k8sClient.Get(ctx, pdbKey, pdb)
+			}, "10s", "1s").Should(Succeed(), "Failed to find PDB with name %s", expectedPDBName)
+
+			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+		})
+
+		It("should create a PDB when when a WorkloadClass is created", func() {
+			By("Updating the namespace to remove the default WC")
+			ns := &corev1.Namespace{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)).Should(Succeed())
+			delete(ns.Labels, workloadsv1.DefaultClassLabel)
+			Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+
+			By("Creating a new WorkloadClass")
+			secondWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "second-wc", Namespace: defaultNamespace},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"unique-to": "second-wc"},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, secondWC)).To(Succeed())
+
+			By("Reconciling secondary-wc and verifying it DOES create a PDB")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: secondWC.Name, Namespace: defaultNamespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the PDB was created in the API server")
+			// Get the WC and ask the helper for the exact PDB name
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			expectedPDBName := utils.PDBName(secondWC.Name)
 			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
 
 			pdb := &policyv1.PodDisruptionBudget{}
@@ -855,6 +892,190 @@ var _ = Describe("WorkloadClass Controller", func() {
 			_ = k8sClient.Delete(ctx, defaultWC)
 			_ = k8sClient.Delete(ctx, secondaryWC)
 			_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "workload-secondary-wc-test-3", Namespace: defaultNamespace}})
+		})
+
+		It("should skip PDB reconciliation and requeue if a lease is ongoing", func() {
+			By("First reconciling to ensure PDB is created initially")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			expectedPDBName := utils.PDBName(wc.Name)
+			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
+
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, pdbKey, pdb)
+			}, "10s", "1s").Should(Succeed())
+
+			By("Setting lease annotations on the PDB")
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNamePod, pod)).To(Succeed())
+			if pdb.Annotations == nil {
+				pdb.Annotations = make(map[string]string)
+			}
+			pdb.Annotations[utils.BypassPod] = pod.Name
+			pdb.Annotations[utils.BypassPodUID] = string(pod.UID)
+			pdb.Annotations[utils.BypassOwner] = testControllerOwner
+			pdb.Annotations[utils.BypassExpiration] = time.Now().Add(time.Hour).Format(utils.ExpirationFormat)
+			Expect(k8sClient.Update(ctx, pdb)).To(Succeed())
+
+			By("Reconciling and checking resulting ctrl.Result")
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "Expected reconcile to requeue after a duration")
+
+			By("Modifying the WorkloadClass to be invalid")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Break validation
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling and checking resulting ctrl.Result ignores deletion because of lease")
+			result2, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result2.RequeueAfter).To(BeNumerically(">", 0), "Expected reconcile to requeue after a duration")
+
+			By("Confirming PDB is not deleted despite WC being invalid")
+			Expect(k8sClient.Get(ctx, pdbKey, pdb)).To(Succeed())
+		})
+
+		It("should reconcile the PDB if a new pod with the same name is created after the lease expires", func() {
+			By("First reconciling to ensure PDB is created initially")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			expectedPDBName := "workload-" + wc.Name
+			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
+
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, pdbKey, pdb)
+			}, "10s", "1s").Should(Succeed())
+
+			By("Setting EXPIRED lease annotations on the PDB")
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNamePod, pod)).To(Succeed())
+			if pdb.Annotations == nil {
+				pdb.Annotations = make(map[string]string)
+			}
+			pdb.Annotations[utils.BypassPod] = pod.Name
+			pdb.Annotations[utils.BypassPodUID] = string(pod.UID)
+			pdb.Annotations[utils.BypassOwner] = testControllerOwner
+			pdb.Annotations[utils.BypassExpiration] = time.Now().Add(-1 * time.Hour).Format(utils.ExpirationFormat)
+			Expect(k8sClient.Update(ctx, pdb)).To(Succeed())
+
+			By("Deleting the original pod and creating a new one with a different UID")
+			// Fake client immediately deletes objects without finalizers
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+			newPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      pod.Name,
+					Namespace: pod.Namespace,
+					Labels:    pod.Labels,
+				},
+				Spec: pod.Spec,
+			}
+			Expect(k8sClient.Create(ctx, newPod)).To(Succeed())
+
+			// Wait for the new pod to be completely created with a new UID
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedNamePod, newPod)
+				return err == nil && newPod.UID != pod.UID && newPod.UID != ""
+			}, "10s", "1s").Should(BeTrue())
+
+			By("Modifying the WorkloadClass to be invalid")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Break validation
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling and checking resulting ctrl.Result processes deletion of the PDB")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Confirming PDB is deleted because the lease was expired")
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+				return errors.IsNotFound(err)
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should reconcile the PDB if a new pod with the same name is created before the lease expires", func() {
+			By("First reconciling to ensure PDB is created initially")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			expectedPDBName := "workload-" + wc.Name
+			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
+
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, pdbKey, pdb)
+			}, "10s", "1s").Should(Succeed())
+
+			By("Setting ONGOING lease annotations on the PDB")
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNamePod, pod)).To(Succeed())
+			if pdb.Annotations == nil {
+				pdb.Annotations = make(map[string]string)
+			}
+			pdb.Annotations[utils.BypassPod] = pod.Name
+			pdb.Annotations[utils.BypassPodUID] = string(pod.UID)
+			pdb.Annotations[utils.BypassOwner] = testControllerOwner
+			pdb.Annotations[utils.BypassExpiration] = time.Now().Add(time.Hour).Format(utils.ExpirationFormat)
+			Expect(k8sClient.Update(ctx, pdb)).To(Succeed())
+
+			By("Deleting the original pod and creating a new one with a different UID")
+			// Fake client immediately deletes objects without finalizers
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+			newPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      pod.Name,
+					Namespace: pod.Namespace,
+					Labels:    pod.Labels,
+				},
+				Spec: pod.Spec,
+			}
+			Expect(k8sClient.Create(ctx, newPod)).To(Succeed())
+
+			// Wait for the new pod to be completely created with a new UID
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedNamePod, newPod)
+				return err == nil && newPod.UID != pod.UID && newPod.UID != ""
+			}, "10s", "1s").Should(BeTrue())
+
+			By("Modifying the WorkloadClass to be invalid")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Break validation
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling and checking resulting ctrl.Result processes deletion of the PDB")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Confirming PDB is deleted because the lease was broken by the new Pod's UID")
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+				return errors.IsNotFound(err)
+			}, "10s", "1s").Should(BeTrue())
 		})
 	})
 })
@@ -2048,6 +2269,185 @@ func TestFindWorkloadClassesByNamespace(t *testing.T) {
 				if !slices.Contains(requests, wantReq) {
 					t.Errorf("expected request %v not found in result %v", wantReq, requests)
 				}
+			}
+		})
+	}
+}
+
+func TestLeaseCheck(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = policyv1.AddToScheme(scheme)
+	_ = workloadsv1.AddToScheme(scheme)
+
+	now := time.Now()
+	expiredTime := now.Add(-time.Hour).Format(utils.ExpirationFormat)
+	validTime := now.Add(time.Hour).Format(utils.ExpirationFormat)
+
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+	}
+
+	testCases := []struct {
+		name        string
+		pdb         *policyv1.PodDisruptionBudget
+		pod         *corev1.Pod
+		wantOngoing bool
+		wantErr     bool
+	}{
+		{
+			name: "no_lease_annotations",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{Name: "workload-test-wc", Namespace: "default"},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default", UID: "123"},
+			},
+			wantOngoing: false,
+			wantErr:     false,
+		},
+		{
+			name: "missing_some_annotations",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-test-wc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						utils.BypassPod: "test-pod",
+					},
+				},
+			},
+			wantOngoing: false,
+		},
+		{
+			name: "lease_expired",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-test-wc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						utils.BypassPod:        "test-pod",
+						utils.BypassPodUID:     "123",
+						utils.BypassOwner:      "someone",
+						utils.BypassExpiration: expiredTime,
+					},
+				},
+			},
+			wantOngoing: false,
+		},
+		{
+			name: "pod_not_found",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-test-wc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						utils.BypassPod:        "non-existent-pod",
+						utils.BypassPodUID:     "123",
+						utils.BypassOwner:      "someone",
+						utils.BypassExpiration: validTime,
+					},
+				},
+			},
+			// no pod
+			wantOngoing: false,
+		},
+		{
+			name: "pod_uid_mismatch",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-test-wc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						utils.BypassPod:        "test-pod",
+						utils.BypassPodUID:     "123",
+						utils.BypassOwner:      "someone",
+						utils.BypassExpiration: validTime,
+					},
+				},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default", UID: "456"}, // different UID
+			},
+			wantOngoing: false,
+		},
+		{
+			name: "pod_deletion_timestamp_set",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-test-wc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						utils.BypassPod:        "test-pod",
+						utils.BypassPodUID:     "123",
+						utils.BypassOwner:      "someone",
+						utils.BypassExpiration: validTime,
+					},
+				},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "test-pod",
+					Namespace:         "default",
+					UID:               "123",
+					DeletionTimestamp: &metav1.Time{Time: now},
+					Finalizers:        []string{"fake-finalizer"},
+				},
+			},
+			wantOngoing: false,
+		},
+		{
+			name: "ongoing_lease",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workload-test-wc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						utils.BypassPod:        "test-pod",
+						utils.BypassPodUID:     "123",
+						utils.BypassOwner:      "someone",
+						utils.BypassExpiration: validTime,
+					},
+				},
+			},
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					UID:       "123",
+				},
+			},
+			wantOngoing: true,
+		},
+		{
+			name:        "pdb_does_not_exist",
+			pdb:         nil,
+			wantOngoing: false,
+			wantErr:     false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc)
+			if tc.pdb != nil {
+				clientBuilder = clientBuilder.WithObjects(tc.pdb)
+			}
+			if tc.pod != nil {
+				clientBuilder = clientBuilder.WithObjects(tc.pod)
+			}
+			fakeClient := clientBuilder.Build()
+			reconciler := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			gotOngoing, _, err := reconciler.leaseCheck(context.Background(), wc)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("leaseCheck() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if gotOngoing != tc.wantOngoing {
+				t.Errorf("leaseCheck() gotOngoing = %v, want %v", gotOngoing, tc.wantOngoing)
 			}
 		})
 	}
