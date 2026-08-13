@@ -1454,6 +1454,7 @@ func TestTryAcquirePDBLease(t *testing.T) {
 						Namespace: namespace,
 						Annotations: map[string]string{
 							utils.BypassPod:        podName,
+							utils.BypassPodUID:     string(pod.UID),
 							utils.BypassOwner:      "admin@example.com",
 							utils.BypassExpiration: "2099-01-01 00:00:00.000000000 +0000 UTC",
 						},
@@ -1475,6 +1476,7 @@ func TestTryAcquirePDBLease(t *testing.T) {
 						Namespace: namespace,
 						Annotations: map[string]string{
 							utils.BypassPod:        "old-pod",
+							utils.BypassPodUID:     "old-pod-uid",
 							utils.BypassOwner:      "old-user",
 							utils.BypassExpiration: time.Now().Add(-1 * time.Hour).Format(utils.ExpirationFormat),
 						},
