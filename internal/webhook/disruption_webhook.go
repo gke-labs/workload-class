@@ -216,7 +216,7 @@ func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, p
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
 		if defaultClass, ok := ns.Labels[workloadsv1.DefaultClassLabel]; ok {
 			wc := &workloadsv1.WorkloadClass{}
-			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
+			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err == nil {
 				return wc
 			}
 		}

@@ -64,10 +64,22 @@ var _ = BeforeSuite(func() {
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
 
+	By("creating ClusterRoleBindings for test service accounts")
+	// Make it idempotent for persistent local KinD environments
+	_ = exec.Command("kubectl", "delete", "clusterrolebinding", "e2e-cluster-autoscaler", "e2e-someone-else", "--ignore-not-found").Run()
+
+	err = exec.Command("kubectl", "create", "clusterrolebinding", "e2e-cluster-autoscaler", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:cluster-autoscaler").Run()
+	Expect(err).NotTo(HaveOccurred(), "Failed to create e2e-cluster-autoscaler binding")
+
+	err = exec.Command("kubectl", "create", "clusterrolebinding", "e2e-someone-else", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:someone-else").Run()
+	Expect(err).NotTo(HaveOccurred(), "Failed to create e2e-someone-else binding")
+
 	setupCertManager()
 })
 
 var _ = AfterSuite(func() {
+	exec.Command("kubectl", "delete", "clusterrolebinding", "e2e-cluster-autoscaler", "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "clusterrolebinding", "e2e-someone-else", "--ignore-not-found").Run()
 	teardownCertManager()
 })
 
