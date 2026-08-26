@@ -127,6 +127,15 @@ const (
 	ReasonNoGuardrails = "NoGuardrails"
 )
 
+// PDBLease contains Pod information that will be used when leasing a PDB for Pod eviction
+type PDBLease struct {
+	// PodUID is the UID of the Pod that the lease will apply to
+	PodUID string `json:"podUID"`
+
+	// PodName is the name of the Pod that the lease will apply to
+	PodName string `json:"podName"`
+}
+
 // WorkloadClassStatus defines the observed state of WorkloadClass.
 type WorkloadClassStatus struct {
 	// MaintenanceReadiness indicates if the workload is currently ready for maintenance.
@@ -142,6 +151,13 @@ type WorkloadClassStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// PendingPDBLeases represent a list of leases that have not begun.
+	// After a lease is applied to a PDB, it is removed from this list.
+	// +listType=map
+	// +listMapKey=podUID
+	// +optional
+	PendingPDBLeases []PDBLease `json:"pendingPDBLeases,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -251,6 +251,30 @@ spec:
                 description: MaintenanceReadiness indicates if the workload is currently
                   ready for maintenance.
                 type: string
+              pendingPDBLeases:
+                description: |-
+                  PendingPDBLeases represent a list of leases that have not begun.
+                  After a lease is applied to a PDB, it is removed from this list.
+                items:
+                  description: PDBLease contains Pod information that will be used
+                    when leasing a PDB for Pod eviction
+                  properties:
+                    podName:
+                      description: PodName is the name of the Pod that the lease will
+                        apply to
+                      type: string
+                    podUID:
+                      description: PodUID is the UID of the Pod that the lease will
+                        apply to
+                      type: string
+                  required:
+                  - podName
+                  - podUID
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - podUID
+                x-kubernetes-list-type: map
             type: object
         required:
         - spec
