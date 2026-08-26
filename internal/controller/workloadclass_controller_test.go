@@ -30,6 +30,8 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
@@ -1535,5 +1537,33 @@ func makeWC(name string, creationTime metav1.Time) *workloadsv1.WorkloadClass {
 		Status: workloadsv1.WorkloadClassStatus{
 			MaintenanceReadiness: workloadsv1.ReadinessReady,
 		},
+	}
+}
+
+func TestGenerationChangedPredicate(t *testing.T) {
+	pred := predicate.GenerationChangedPredicate{}
+
+	oldWC := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Generation: 1,
+		},
+	}
+	newWCStatusOnly := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Generation: 1,
+		},
+	}
+	newWCSpecChanged := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Generation: 2,
+		},
+	}
+
+	if pred.Update(event.UpdateEvent{ObjectOld: oldWC, ObjectNew: newWCStatusOnly}) {
+		t.Errorf("Expected GenerationChangedPredicate Update to return false when generation is unchanged (status update)")
+	}
+
+	if !pred.Update(event.UpdateEvent{ObjectOld: oldWC, ObjectNew: newWCSpecChanged}) {
+		t.Errorf("Expected GenerationChangedPredicate Update to return true when generation changes (spec update)")
 	}
 }

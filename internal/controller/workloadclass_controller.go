@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,10 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -426,7 +429,11 @@ func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&workloadsv1.WorkloadClass{}).
+		For(
+			&workloadsv1.WorkloadClass{},
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
