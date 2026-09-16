@@ -109,7 +109,7 @@ spec:
                               allowFallbackToOnDemand:
                                 default: true
                                 description: AllowFallbackToOnDemand specifies if
-                                  workload owners are wllowed to fallback to On-Demand.
+                                  workload owners are allowed to fall back to On-Demand.
                                 type: boolean
                               maxFallbackRatio:
                                 anyOf:
@@ -156,11 +156,23 @@ spec:
                                 - None
                                 type: string
                             type: object
+                            x-kubernetes-validations:
+                            - message: maxFallbackDuration cannot be set when requiredReversionAction
+                                is None
+                              rule: '!has(self.requiredReversionAction) || self.requiredReversionAction
+                                != ''None'' || !has(self.maxFallbackDuration)'
                         type: object
                         x-kubernetes-validations:
                         - message: minSpotRatio cannot be set when enforcementMode
                             is Forbidden
                           rule: self.enforcementMode != 'Forbidden' || !has(self.minSpotRatio)
+                        - message: reversion cannot be set when enforcementMode is
+                            Forbidden
+                          rule: self.enforcementMode != 'Forbidden' || !has(self.reversion)
+                        - message: reversion cannot be set when allowFallbackToOnDemand
+                            is false
+                          rule: '!has(self.fallback) || !has(self.fallback.allowFallbackToOnDemand)
+                            || self.fallback.allowFallbackToOnDemand || !has(self.reversion)'
                     type: object
                 required:
                 - disruption

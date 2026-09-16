@@ -59,7 +59,7 @@ type Constraints struct {
 	// Placement specifies compute capacity and scheduling guardrails for workloads.
 	// +optional
 	// +kubebuilder:default={}
-	Placement Placement `json:"placement"`
+	Placement Placement `json:"placement,omitempty"`
 }
 
 // Disruption defines the constraints within which WorkloadClasses can set disruption policies.
@@ -94,13 +94,13 @@ type Placement struct {
 	// SpotPlacement defines guardrails and lifecycle rules for Spot capacity usage.
 	// +optional
 	// +kubebuilder:default={}
-	SpotPlacement SpotPlacement `json:"spotPlacement"`
+	SpotPlacement SpotPlacement `json:"spotPlacement,omitempty"`
 }
 
 // Fallback controls On-Demand fallback behavior when Spot capacity is unavailable.
 // +kubebuilder:validation:XValidation:rule="self.allowFallbackToOnDemand || !has(self.maxFallbackRatio)",message="maxFallbackRatio cannot be set when allowFallbackToOnDemand is false"
 type Fallback struct {
-	// AllowFallbackToOnDemand specifies if workload owners are wllowed to fallback to On-Demand.
+	// AllowFallbackToOnDemand specifies if workload owners are allowed to fall back to On-Demand.
 	// +optional
 	// +kubebuilder:default=true
 	AllowFallbackToOnDemand *bool `json:"allowFallbackToOnDemand,omitempty"`
@@ -114,6 +114,7 @@ type Fallback struct {
 }
 
 // Reversion controls the transition of fallback workloads back to Spot capacity.
+// +kubebuilder:validation:XValidation:rule="!has(self.requiredReversionAction) || self.requiredReversionAction != 'None' || !has(self.maxFallbackDuration)",message="maxFallbackDuration cannot be set when requiredReversionAction is None"
 type Reversion struct {
 	// RequiredReversionAction enforces a reversion strategy, e.g., must be `Active`.
 	// +optional
@@ -131,13 +132,14 @@ type Reversion struct {
 // Spot capacity, including minimum Spot allocation requirements, On-Demand
 // fallback limits, and reversion behavior.
 // +kubebuilder:validation:XValidation:rule="self.enforcementMode != 'Forbidden' || !has(self.minSpotRatio)",message="minSpotRatio cannot be set when enforcementMode is Forbidden"
+// +kubebuilder:validation:XValidation:rule="self.enforcementMode != 'Forbidden' || !has(self.reversion)",message="reversion cannot be set when enforcementMode is Forbidden"
+// +kubebuilder:validation:XValidation:rule="!has(self.fallback) || !has(self.fallback.allowFallbackToOnDemand) || self.fallback.allowFallbackToOnDemand || !has(self.reversion)",message="reversion cannot be set when allowFallbackToOnDemand is false"
 type SpotPlacement struct {
 	// EnforcementMode enforces Spot usage. Required forces Spot. Forbidden blocks Spot.
 	// Allowed lets workload choose.
 	// +optional
-	// +kubebuilder:validation:Enum=Allowed;Required;Forbidden
 	// +kubebuilder:default="Allowed"
-	EnforcementMode string `json:"enforcementMode,omitempty"`
+	EnforcementMode Enforcement `json:"enforcementMode,omitempty"`
 
 	// MinSpotRatio is the minimum allowed Spot ratio (e.g., "50%").
 	// Prevents workload owners from configuring too low Spot ratios.
@@ -148,11 +150,11 @@ type SpotPlacement struct {
 	// Fallback controls On-Demand fallback behavior when Spot capacity is unavailable.
 	// +optional
 	// +kubebuilder:default={allowFallbackToOnDemand: true}
-	Fallback Fallback `json:"fallback"`
+	Fallback Fallback `json:"fallback,omitempty"`
 
 	// Reversion controls the transition of fallback workloads back to Spot capacity.
 	// +optional
-	Reversion *Reversion `json:"reversion"`
+	Reversion *Reversion `json:"reversion,omitempty"`
 }
 
 // WorkloadClassGuardrailSpec defines the desired state of WorkloadClassGuardrail
