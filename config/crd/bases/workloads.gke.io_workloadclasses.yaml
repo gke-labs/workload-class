@@ -130,6 +130,82 @@ spec:
                     minimum: 0
                     type: integer
                 type: object
+              placementPolicy:
+                description: PlacementPolicy defines compute capacity and scheduling
+                  placement intents for a WorkloadClass.
+                properties:
+                  spotPlacement:
+                    default: {}
+                    description: |-
+                      SpotPlacement specifies the desired Spot capacity allocation, stockout fallback,
+                      and reversion behavior for pods in this WorkloadClass.
+                    properties:
+                      fallback:
+                        default: {}
+                        description: Fallback configures pod scheduling behavior when
+                          Spot capacity is unavailable (stockout).
+                        properties:
+                          action:
+                            default: Fail
+                            description: |-
+                              Action specifies the action to take on Spot stockout:
+                              - Fail: Keeps pods Pending (default).
+                              - FallbackToOnDemand: Schedules pods on On-Demand VMs.
+                            enum:
+                            - Fail
+                            - FallbackToOnDemand
+                            type: string
+                          allowedMachineFamilies:
+                            description: |-
+                              AllowedMachineFamilies is an optional allowlist of GCE machine families
+                              (e.g., ["n2d", "t2d"]) permitted for On-Demand fallback VMs to control costs.
+                              If empty, all machine families are allowed.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      reversion:
+                        default: {}
+                        description: Reversion configures how and when workloads return
+                          to Spot once capacity is restored.
+                        properties:
+                          action:
+                            default: None
+                            description: |-
+                              Action specifies the reversion strategy once Spot capacity returns:
+                              - Active: Proactively evicts pods on On-Demand to migrate them to Spot (respecting PDBs).
+                              - Lazy: Migrates to Spot only when pods are naturally recreated.
+                              - None: Stays on On-Demand permanently after fallback (default).
+                            enum:
+                            - Active
+                            - Lazy
+                            - None
+                            type: string
+                          minDurationOnFallback:
+                            default: 0s
+                            description: |-
+                              MinDurationOnFallback sets the minimum duration a pod must run on On-Demand fallback VMs
+                              before becoming eligible for Active reversion (e.g., "4h"), dampening churn when Spot capacity is unstable.
+                            type: string
+                            x-kubernetes-validations:
+                            - message: minDurationOnFallback must be non-negative
+                              rule: duration(self) >= duration('0s')
+                        type: object
+                      spotRatio:
+                        default: 100%
+                        description: |-
+                          SpotRatio specifies the target percentage of Spot VMs for this workload
+                          (e.g., "80%" Spot, 20% On-Demand), enforced via Pod Topology Spread Constraints.
+                        pattern: ^(100|[1-9]?[0-9])%$
+                        type: string
+                      type:
+                        default: Spot
+                        description: |-
+                          Type specifies the desired provisioning model: Spot (default) or OnDemand
+                          (to opt out if the default is Spot).
+                        type: string
+                    type: object
+                type: object
               podSelector:
                 description: PodSelector matches the pods that this class applies
                   to.
