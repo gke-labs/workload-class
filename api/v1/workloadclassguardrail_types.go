@@ -37,12 +37,18 @@ const (
 )
 
 // ReversionAction specifies the strategy for moving fallback workloads back to Spot capacity.
-// +kubebuilder:validation:Enum=Active
+// +kubebuilder:validation:Enum=Active;Lazy;None
 type ReversionAction string
 
 const (
-	// ReversionActionActive actively evicts/disrupts fallback pods to reschedule them onto Spot capacity.
+	// ReversionActionActive proactively evicts pods on On-Demand to migrate them to Spot (respecting disruption budgets).
 	ReversionActionActive ReversionAction = "Active"
+
+	// ReversionActionLazy migrates to Spot only when pods are naturally recreated (may cause mixed-state deployments).
+	ReversionActionLazy ReversionAction = "Lazy"
+
+	// ReversionActionNone stays on On-Demand permanently after fallback, ensuring stability and avoiding mixed-state.
+	ReversionActionNone ReversionAction = "None"
 )
 
 // Constraints defines the guardrails for WorkloadClasses.

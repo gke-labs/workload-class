@@ -152,6 +152,8 @@ spec:
                                   strategy, e.g., must be `Active`.
                                 enum:
                                 - Active
+                                - Lazy
+                                - None
                                 type: string
                             type: object
                         type: object
