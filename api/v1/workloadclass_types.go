@@ -20,7 +20,99 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// SpotPlacementType specifies the desired compute provisioning model for a workload.
+// +kubebuilder:validation:Enum=Spot;OnDemand
+type SpotPlacementType string
+
+const (
+	// SpotPlacementTypeSpot specifies Spot VMs as the desired provisioning model (default).
+	SpotPlacementTypeSpot SpotPlacementType = "Spot"
+
+	// SpotPlacementTypeOnDemand specifies On-Demand VMs as the desired provisioning model,
+	// allowing workloads to opt out when the cluster/namespace default is Spot.
+	SpotPlacementTypeOnDemand SpotPlacementType = "OnDemand"
+)
+
+// FallbackAction defines the action to take when Spot capacity is unavailable (stockout).
+// +kubebuilder:validation:Enum=Fail;FallbackToOnDemand
+type FallbackAction string
+
+const (
+	// FallbackActionFail keeps pods Pending when Spot capacity is unavailable (default).
+	FallbackActionFail FallbackAction = "Fail"
+
+	// FallbackActionFallbackToOnDemand schedules pods onto On-Demand VMs during Spot stockouts.
+	FallbackActionFallbackToOnDemand FallbackAction = "FallbackToOnDemand"
+)
+
+// PlacementPolicy defines compute capacity and scheduling placement intents for a WorkloadClass.
+type PlacementPolicy struct {
+	// SpotPlacement specifies the desired Spot capacity allocation, stockout fallback,
+	// and reversion behavior for pods in this WorkloadClass.
+	// +optional
+	// +kubebuilder:default={}
+	SpotPlacement SpotPlacementPolicy `json:"spotPlacement,omitempty"`
+}
+
+// SpotPlacementPolicy defines the desired Spot provisioning state, target Spot ratio,
+// stockout fallback strategy, and reversion policy for a WorkloadClass.
+type SpotPlacementPolicy struct {
+	// Type specifies the desired provisioning model: Spot (default) or OnDemand
+	// (to opt out if the default is Spot).
+	// +optional
+	// +kubebuilder:default="Spot"
+	Type SpotPlacementType `json:"type,omitempty"`
+
+	// SpotRatio specifies the target percentage of Spot VMs for this workload
+	// (e.g., "80%" Spot, 20% On-Demand), enforced via Pod Topology Spread Constraints.
+	// +optional
+	// +kubebuilder:default="100%"
+	// +kubebuilder:validation:Pattern=`^(100|[1-9]?[0-9])%$`
+	SpotRatio string `json:"spotRatio,omitempty"`
+
+	// Fallback configures pod scheduling behavior when Spot capacity is unavailable (stockout).
+	// +optional
+	// +kubebuilder:default={}
+	Fallback SpotFallbackPolicy `json:"fallback,omitempty"`
+
+	// Reversion configures how and when workloads return to Spot once capacity is restored.
+	// +optional
+	// +kubebuilder:default={}
+	Reversion SpotReversionPolicy `json:"reversion,omitempty"`
+}
+
+// SpotFallbackPolicy configures fallback behavior when Spot capacity is exhausted.
+type SpotFallbackPolicy struct {
+	// Action specifies the action to take on Spot stockout:
+	// - Fail: Keeps pods Pending (default).
+	// - FallbackToOnDemand: Schedules pods on On-Demand VMs.
+	// +optional
+	// +kubebuilder:default="Fail"
+	Action FallbackAction `json:"action,omitempty"`
+	// AllowedMachineFamilies is an optional allowlist of GCE machine families
+	// (e.g., ["n2d", "t2d"]) permitted for On-Demand fallback VMs to control costs.
+	// If empty, all machine families are allowed.
+	// +optional
+	AllowedMachineFamilies []string `json:"allowedMachineFamilies,omitempty"`
+}
+
+// SpotReversionPolicy configures the policy for returning workloads to Spot once capacity returns.
+type SpotReversionPolicy struct {
+	// Action specifies the reversion strategy once Spot capacity returns:
+	// - Active: Proactively evicts pods on On-Demand to migrate them to Spot (respecting PDBs).
+	// - Lazy: Migrates to Spot only when pods are naturally recreated.
+	// - None: Stays on On-Demand permanently after fallback (default).
+	// +optional
+	// +kubebuilder:default="None"
+	Action ReversionAction `json:"action,omitempty"`
+	// MinDurationOnFallback sets the minimum duration a pod must run on On-Demand fallback VMs
+	// before becoming eligible for Active reversion (e.g., "4h"), dampening churn when Spot capacity is unstable.
+	// +optional
+	// +kubebuilder:default="0s"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="minDurationOnFallback must be non-negative"
+	MinDurationOnFallback *metav1.Duration `json:"minDurationOnFallback,omitempty"`
+}
 
 // DisruptionPolicy specifies the policy governing pod disruptions.
 type DisruptionPolicy struct {
@@ -105,6 +197,10 @@ type WorkloadClassSpec struct {
 	// DisruptionPolicy specifies the policy governing pod disruptions.
 	// +optional
 	DisruptionPolicy DisruptionPolicy `json:"disruptionPolicy,omitempty"`
+
+	// PlacementPolicy defines compute capacity and scheduling placement intents for a WorkloadClass.
+	// +optional
+	PlacementPolicy PlacementPolicy `json:"placementPolicy,omitempty"`
 }
 
 type MaintenanceReadiness string

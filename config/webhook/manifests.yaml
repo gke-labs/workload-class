@@ -31,6 +31,26 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-workloads-gke-io-v1-workloadclass
+  failurePolicy: Fail
+  name: vworkloadclass-v1.kb.io
+  rules:
+  - apiGroups:
+    - workloads.gke.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workloadclasses
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-workloads-gke-io-v1-workloadclassguardrail
   failurePolicy: Fail
   name: vworkloadclassguardrail-v1.kb.io
