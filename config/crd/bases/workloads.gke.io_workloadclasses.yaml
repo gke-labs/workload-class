@@ -203,6 +203,9 @@ spec:
                         description: |-
                           Type specifies the desired provisioning model: Spot (default) or OnDemand
                           (to opt out if the default is Spot).
+                        enum:
+                        - Spot
+                        - OnDemand
                         type: string
                     type: object
                 type: object

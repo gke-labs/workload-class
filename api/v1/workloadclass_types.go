@@ -61,7 +61,7 @@ type SpotPlacementPolicy struct {
 	// (to opt out if the default is Spot).
 	// +optional
 	// +kubebuilder:default="Spot"
-	Type string `json:"type"`
+	Type SpotPlacementType `json:"type,omitempty"`
 
 	// SpotRatio specifies the target percentage of Spot VMs for this workload
 	// (e.g., "80%" Spot, 20% On-Demand), enforced via Pod Topology Spread Constraints.
