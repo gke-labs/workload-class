@@ -35,11 +35,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
 )
+
+func boolPtr(b bool) *bool {
+	return &b
+}
 
 type GracePeriodSeconds int64
 
@@ -306,6 +311,145 @@ var _ = Describe("WorkloadClass Controller", func() {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
 							strings.Contains(cond.Message, "maxNonDisruptionDurationDays 4 exceeds guardrail limit")
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should pass validation when placement policy adheres to guardrail placement constraints", func() {
+			By("updating Guardrail with placement constraints")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Placement.SpotPlacement = workloadsv1.SpotPlacement{
+				EnforcementMode: workloadsv1.EnforcementRequired,
+				MinSpotRatio:    "80%",
+				Fallback: workloadsv1.Fallback{
+					AllowFallbackToOnDemand: boolPtr(true),
+				},
+				Reversion: &workloadsv1.Reversion{
+					RequiredReversionAction: workloadsv1.ReversionActionActive,
+					MaxFallbackDuration:     &metav1.Duration{Duration: 2 * time.Hour},
+				},
+			}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			By("updating WorkloadClass with compliant placement policy")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PlacementPolicy.SpotPlacement = workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "90%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action:                workloadsv1.ReversionActionActive,
+					MinDurationOnFallback: &metav1.Duration{Duration: 1 * time.Hour},
+				},
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking Status")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, updatedWC)
+				if err != nil {
+					return false
+				}
+				for _, cond := range updatedWC.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionTrue &&
+							cond.Reason == workloadsv1.ReasonValidationPassed
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should fail validation if guardrail enforcementMode is Required and WorkloadClass specifies OnDemand", func() {
+			By("updating Guardrail with EnforcementRequired")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Placement.SpotPlacement = workloadsv1.SpotPlacement{
+				EnforcementMode: workloadsv1.EnforcementRequired,
+			}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			By("updating WorkloadClass with OnDemand")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PlacementPolicy.SpotPlacement = workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking Status")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, updatedWC)
+				if err != nil {
+					return false
+				}
+				for _, cond := range updatedWC.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionFalse &&
+							cond.Reason == workloadsv1.ReasonValidationFailed &&
+							strings.Contains(cond.Message, "spotPlacement type OnDemand is not allowed when guardrail enforcementMode is Required")
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should fail validation if WorkloadClass spotRatio is less than guardrail minSpotRatio", func() {
+			By("updating Guardrail with MinSpotRatio 80%")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Placement.SpotPlacement = workloadsv1.SpotPlacement{
+				MinSpotRatio: "80%",
+			}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			By("updating WorkloadClass with SpotRatio 50%")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PlacementPolicy.SpotPlacement = workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "50%",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking Status")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, updatedWC)
+				if err != nil {
+					return false
+				}
+				for _, cond := range updatedWC.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionFalse &&
+							cond.Reason == workloadsv1.ReasonValidationFailed &&
+							strings.Contains(cond.Message, "spotRatio 50% is less than guardrail minSpotRatio 80%")
 					}
 				}
 				return false
@@ -1535,5 +1679,293 @@ func makeWC(name string, creationTime metav1.Time) *workloadsv1.WorkloadClass {
 		Status: workloadsv1.WorkloadClassStatus{
 			MaintenanceReadiness: workloadsv1.ReadinessReady,
 		},
+	}
+}
+
+func TestValidatePlacementAgainstGuardrails(t *testing.T) {
+	intZero := intstr.FromInt(0)
+	strZeroPct := intstr.FromString("0%")
+	dur1h := metav1.Duration{Duration: 1 * time.Hour}
+	dur2h := metav1.Duration{Duration: 2 * time.Hour}
+
+	tests := []struct {
+		name           string
+		wcSpot         workloadsv1.SpotPlacementPolicy
+		guardrailSpots []workloadsv1.SpotPlacement
+		wantViolations []string
+	}{
+		{
+			name:   "default empty policy against default empty guardrail passes",
+			wcSpot: workloadsv1.SpotPlacementPolicy{},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{},
+			},
+			wantViolations: nil,
+		},
+		{
+			name: "Required enforcement passes with Spot and 100%",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{EnforcementMode: workloadsv1.EnforcementRequired},
+			},
+			wantViolations: nil,
+		},
+		{
+			name: "Required enforcement fails with OnDemand",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{EnforcementMode: workloadsv1.EnforcementRequired},
+			},
+			wantViolations: []string{
+				"spotPlacement type OnDemand is not allowed when guardrail enforcementMode is Required",
+			},
+		},
+		{
+			name: "Required enforcement fails with Spot 0%",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "0%",
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{EnforcementMode: workloadsv1.EnforcementRequired},
+			},
+			wantViolations: []string{
+				"spotRatio cannot be 0% when guardrail enforcementMode is Required",
+			},
+		},
+		{
+			name: "Forbidden enforcement fails with Spot",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeSpot,
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{EnforcementMode: workloadsv1.EnforcementForbidden},
+			},
+			wantViolations: []string{
+				"spotPlacement type Spot is not allowed when guardrail enforcementMode is Forbidden",
+			},
+		},
+		{
+			name: "Forbidden enforcement passes with OnDemand",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{EnforcementMode: workloadsv1.EnforcementForbidden},
+			},
+			wantViolations: nil,
+		},
+		{
+			name: "minSpotRatio fails when spotRatio is lower",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "60%",
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{MinSpotRatio: "80%"},
+			},
+			wantViolations: []string{
+				"spotRatio 60% is less than guardrail minSpotRatio 80%",
+			},
+		},
+		{
+			name: "minSpotRatio fails when type is OnDemand (effective 0%)",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{MinSpotRatio: "50%"},
+			},
+			wantViolations: []string{
+				"spotRatio 0% is less than guardrail minSpotRatio 50%",
+			},
+		},
+		{
+			name: "allowFallbackToOnDemand false fails with FallbackToOnDemand",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Fallback: workloadsv1.Fallback{
+						AllowFallbackToOnDemand: boolPtr(false),
+					},
+				},
+			},
+			wantViolations: []string{
+				"fallback action FallbackToOnDemand is not allowed when guardrail allowFallbackToOnDemand is false",
+			},
+		},
+		{
+			name: "maxFallbackRatio 0 int fails with FallbackToOnDemand",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Fallback: workloadsv1.Fallback{
+						MaxFallbackRatio: &intZero,
+					},
+				},
+			},
+			wantViolations: []string{
+				"fallback action FallbackToOnDemand is not allowed when guardrail maxFallbackRatio is 0",
+			},
+		},
+		{
+			name: "maxFallbackRatio 0% string fails with FallbackToOnDemand",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Fallback: workloadsv1.Fallback{
+						MaxFallbackRatio: &strZeroPct,
+					},
+				},
+			},
+			wantViolations: []string{
+				"fallback action FallbackToOnDemand is not allowed when guardrail maxFallbackRatio is 0",
+			},
+		},
+		{
+			name: "requiredReversionAction passes when fallback is Fail and reversion is None",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFail,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Reversion: &workloadsv1.Reversion{
+						RequiredReversionAction: workloadsv1.ReversionActionActive,
+					},
+				},
+			},
+			wantViolations: nil,
+		},
+		{
+			name: "requiredReversionAction fails when fallback is FallbackToOnDemand and reversion mismatches",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionLazy,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Reversion: &workloadsv1.Reversion{
+						RequiredReversionAction: workloadsv1.ReversionActionActive,
+					},
+				},
+			},
+			wantViolations: []string{
+				"reversion action Lazy does not match guardrail requiredReversionAction Active",
+			},
+		},
+		{
+			name: "maxFallbackDuration fails when fallback is FallbackToOnDemand and reversion is None",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionNone,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Reversion: &workloadsv1.Reversion{
+						MaxFallbackDuration: &dur2h,
+					},
+				},
+			},
+			wantViolations: []string{
+				"reversion action cannot be None when fallback action is FallbackToOnDemand and guardrail specifies maxFallbackDuration",
+			},
+		},
+		{
+			name: "maxFallbackDuration fails when minDurationOnFallback exceeds it",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action:                workloadsv1.ReversionActionActive,
+					MinDurationOnFallback: &dur2h,
+				},
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{
+					Reversion: &workloadsv1.Reversion{
+						MaxFallbackDuration: &dur1h,
+					},
+				},
+			},
+			wantViolations: []string{
+				"minDurationOnFallback 2h0m0s exceeds guardrail maxFallbackDuration 1h0m0s",
+			},
+		},
+		{
+			name: "multiple guardrails deduplicate identical violations and combine distinct ones",
+			wcSpot: workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			},
+			guardrailSpots: []workloadsv1.SpotPlacement{
+				{EnforcementMode: workloadsv1.EnforcementRequired},
+				{EnforcementMode: workloadsv1.EnforcementRequired, MinSpotRatio: "80%"},
+			},
+			wantViolations: []string{
+				"spotPlacement type OnDemand is not allowed when guardrail enforcementMode is Required",
+				"spotRatio 0% is less than guardrail minSpotRatio 80%",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := &workloadsv1.WorkloadClass{
+				Spec: workloadsv1.WorkloadClassSpec{
+					PlacementPolicy: workloadsv1.PlacementPolicy{
+						SpotPlacement: tc.wcSpot,
+					},
+				},
+			}
+			guardrails := make([]workloadsv1.WorkloadClassGuardrail, len(tc.guardrailSpots))
+			for i, guardrailSpot := range tc.guardrailSpots {
+				guardrails[i] = workloadsv1.WorkloadClassGuardrail{
+					Spec: workloadsv1.WorkloadClassGuardrailSpec{
+						Constraints: workloadsv1.Constraints{
+							Placement: workloadsv1.Placement{
+								SpotPlacement: guardrailSpot,
+							},
+						},
+					},
+				}
+			}
+
+			got := validatePlacementAgainstGuardrails(wc, guardrails)
+			if len(got) != len(tc.wantViolations) {
+				t.Fatalf("got %d violations (%v), want %d (%v)", len(got), got, len(tc.wantViolations), tc.wantViolations)
+			}
+			for i := range got {
+				if got[i] != tc.wantViolations[i] {
+					t.Errorf("violation[%d] = %q, want %q", i, got[i], tc.wantViolations[i])
+				}
+			}
+		})
 	}
 }
