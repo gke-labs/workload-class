@@ -265,5 +265,7 @@ func (v *WorkloadClassGuardrailCustomValidator) violatesGuardrail(wc *workloadsv
 		violations = append(violations, fmt.Sprintf("guardrail limits MaxNonDisruptionDurationDays to %d, but existing WorkloadClass '%s' requires %d", maxNonDisruptionDurationDays, wc.Name, wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays))
 	}
 
+	violations = append(violations, utils.ValidatePlacementAgainstGuardrail(wc, g)...)
+
 	return violations
 }

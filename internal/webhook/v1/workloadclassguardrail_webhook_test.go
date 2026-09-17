@@ -446,5 +446,200 @@ var _ = Describe("WorkloadClassGuardrail Webhook", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("maxFallbackDuration must be greater than 0"))
 		})
+
+		It("Should deny creation if existing WorkloadClass violates guardrail EnforcementMode Required", func() {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ondemand-wc",
+					Namespace: "default",
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PlacementPolicy: workloadsv1.PlacementPolicy{
+						SpotPlacement: workloadsv1.SpotPlacementPolicy{
+							Type: workloadsv1.SpotPlacementTypeOnDemand,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wc) }()
+
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "require-spot-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Placement: workloadsv1.Placement{
+							SpotPlacement: workloadsv1.SpotPlacement{
+								EnforcementMode: workloadsv1.EnforcementRequired,
+							},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("guardrail is too restrictive"))
+			Expect(err.Error()).To(ContainSubstring("spotPlacement type OnDemand is not allowed when guardrail enforcementMode is Required"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny creation if existing WorkloadClass violates guardrail EnforcementMode Forbidden", func() {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "spot-wc",
+					Namespace: "default",
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PlacementPolicy: workloadsv1.PlacementPolicy{
+						SpotPlacement: workloadsv1.SpotPlacementPolicy{
+							Type: workloadsv1.SpotPlacementTypeSpot,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wc) }()
+
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "forbid-spot-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Placement: workloadsv1.Placement{
+							SpotPlacement: workloadsv1.SpotPlacement{
+								EnforcementMode: workloadsv1.EnforcementForbidden,
+							},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("guardrail is too restrictive"))
+			Expect(err.Error()).To(ContainSubstring("spotPlacement type Spot is not allowed when guardrail enforcementMode is Forbidden"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny creation if existing WorkloadClass violates guardrail MinSpotRatio", func() {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "low-ratio-wc",
+					Namespace: "default",
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PlacementPolicy: workloadsv1.PlacementPolicy{
+						SpotPlacement: workloadsv1.SpotPlacementPolicy{
+							Type:      workloadsv1.SpotPlacementTypeSpot,
+							SpotRatio: "50%",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wc) }()
+
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "high-ratio-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Placement: workloadsv1.Placement{
+							SpotPlacement: workloadsv1.SpotPlacement{
+								MinSpotRatio: "80%",
+							},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("spotRatio 50% is less than guardrail minSpotRatio 80%"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny creation if existing WorkloadClass violates guardrail AllowFallbackToOnDemand", func() {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fallback-wc",
+					Namespace: "default",
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PlacementPolicy: workloadsv1.PlacementPolicy{
+						SpotPlacement: workloadsv1.SpotPlacementPolicy{
+							Type: workloadsv1.SpotPlacementTypeSpot,
+							Fallback: workloadsv1.SpotFallbackPolicy{
+								Action: workloadsv1.FallbackActionFallbackToOnDemand,
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wc) }()
+
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "no-fallback-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Placement: workloadsv1.Placement{
+							SpotPlacement: workloadsv1.SpotPlacement{
+								Fallback: workloadsv1.Fallback{
+									AllowFallbackToOnDemand: boolPtr(false),
+								},
+							},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("fallback action FallbackToOnDemand is not allowed when guardrail allowFallbackToOnDemand is false"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny update if updated guardrail invalidates existing WorkloadClass placement policy", func() {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "lazy-reversion-wc",
+					Namespace: "default",
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PlacementPolicy: workloadsv1.PlacementPolicy{
+						SpotPlacement: workloadsv1.SpotPlacementPolicy{
+							Type: workloadsv1.SpotPlacementTypeSpot,
+							Fallback: workloadsv1.SpotFallbackPolicy{
+								Action: workloadsv1.FallbackActionFallbackToOnDemand,
+							},
+							Reversion: workloadsv1.SpotReversionPolicy{
+								Action: workloadsv1.ReversionActionLazy,
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wc) }()
+
+			oldGuardrail := &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "reversion-guardrail"},
+			}
+			newGuardrail := &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "reversion-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Placement: workloadsv1.Placement{
+							SpotPlacement: workloadsv1.SpotPlacement{
+								Reversion: &workloadsv1.Reversion{
+									RequiredReversionAction: workloadsv1.ReversionActionActive,
+								},
+							},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateUpdate(ctx, oldGuardrail, newGuardrail)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("guardrail is too restrictive"))
+			Expect(err.Error()).To(ContainSubstring("reversion action Lazy does not match guardrail requiredReversionAction Active"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
 	})
 })
