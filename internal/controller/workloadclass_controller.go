@@ -803,8 +803,30 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&corev1.ConfigMap{}, // Re-trigger when kube-system/cluster-autoscaler-status updates
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
 		).
+		Watches(
+			&corev1.Pod{}, // Re-trigger when Pods in the namespace are created or scheduled
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesInNamespace),
+		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassesInNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(workloadClasses.Items))
+	for i, item := range workloadClasses.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name:      item.GetName(),
+				Namespace: item.GetNamespace(),
+			},
+		}
+	}
+	return requests
 }
 
 func (r *WorkloadClassReconciler) findWorkloadClassesForClusterAutoscalerStatus(ctx context.Context, obj client.Object) []reconcile.Request {

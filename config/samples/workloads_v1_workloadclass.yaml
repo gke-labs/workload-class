@@ -25,3 +25,6 @@ spec:
       - kind: ServiceAccount
         name: cluster-autoscaler
         namespace: kube-system
+  placementPolicy:
+    spotPlacement:
+      type: OnDemand
