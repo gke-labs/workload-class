@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
@@ -1891,5 +1892,241 @@ func TestFindWorkloadClassesForClusterAutoscalerStatus(t *testing.T) {
 	}
 	if reqs := reconciler.findWorkloadClassesForClusterAutoscalerStatus(context.Background(), otherCM); len(reqs) != 0 {
 		t.Errorf("expected 0 reconcile requests for unrelated ConfigMap, got %d", len(reqs))
+	}
+}
+
+func newScheduledPod(name, nodeName string, startTime time.Time) *corev1.Pod {
+	t := metav1.NewTime(startTime)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			Labels:            map[string]string{"app": "test"},
+			CreationTimestamp: t,
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodRunning,
+			StartTime: &t,
+		},
+	}
+}
+
+func TestReconcileSpotReversion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(policyv1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	now := time.Date(2026, 9, 18, 15, 0, 0, 0, time.UTC)
+	spotNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "spot-node-1",
+			Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue},
+		},
+	}
+	onDemandNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "ondemand-node-1",
+			Labels: map[string]string{},
+		},
+	}
+
+	testCases := []struct {
+		name               string
+		spotPlacement      workloadsv1.SpotPlacementPolicy
+		windows            []workloadsv1.DisruptionWindow
+		throttleEvictions  bool
+		pods               []client.Object
+		wantRemaining      []string
+		wantRequeueWait    time.Duration
+		wantEvictAttempts  int
+		checkEvictAttempts bool
+	}{
+		{
+			name: "Active reversion with 100% spotRatio evicts OnDemand pods and keeps Spot pods",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("spot-pod-1", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"spot-pod-1"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "Active reversion respects MinDurationOnFallback and returns remaining wait time",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action:                workloadsv1.ReversionActionActive,
+					MinDurationOnFallback: &metav1.Duration{Duration: 30 * time.Minute},
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("young-ondemand-pod", "ondemand-node-1", now.Add(-10*time.Minute)),
+				newScheduledPod("mature-ondemand-pod", "ondemand-node-1", now.Add(-45*time.Minute)),
+			},
+			wantRemaining:   []string{"young-ondemand-pod"},
+			wantRequeueWait: 20 * time.Minute,
+		},
+		{
+			name: "Active reversion with 80% spotRatio evicts only enough OnDemand pods to reach 80%",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "80%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("spot-pod-1", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("spot-pod-2", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("spot-pod-3", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-2", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"ondemand-pod-2", "spot-pod-1", "spot-pod-2", "spot-pod-3"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "Lazy reversion does not proactively evict OnDemand pods",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionLazy,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"ondemand-pod-1"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "Active reversion when TooManyRequests during closed disruption window stops evicting and requeues for nextWindow",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			windows: []workloadsv1.DisruptionWindow{
+				{
+					Name:       "evening-window",
+					DaysOfWeek: []string{"Friday"},
+					TimeZone:   "Etc/UTC",
+					StartTime:  "22:00",
+					EndTime:    "23:59",
+				},
+			},
+			throttleEvictions: true,
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-2", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:      []string{"ondemand-pod-1", "ondemand-pod-2"},
+			wantRequeueWait:    7 * time.Hour,
+			wantEvictAttempts:  1,
+			checkEvictAttempts: true,
+		},
+		{
+			name: "Active reversion when TooManyRequests during open disruption window retries after pdbRetryRequeueDelay",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			windows: []workloadsv1.DisruptionWindow{
+				{
+					Name:       "afternoon-window",
+					DaysOfWeek: []string{"Friday"},
+					TimeZone:   "Etc/UTC",
+					StartTime:  "14:00",
+					EndTime:    "18:00",
+				},
+			},
+			throttleEvictions: true,
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-2", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:      []string{"ondemand-pod-1", "ondemand-pod-2"},
+			wantRequeueWait:    pdbRetryRequeueDelay,
+			wantEvictAttempts:  2,
+			checkEvictAttempts: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := makeWC("reversion-wc", metav1.NewTime(now.Add(-2*time.Hour)))
+			wc.Spec.PlacementPolicy.SpotPlacement = tc.spotPlacement
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = tc.windows
+
+			evictAttempts := 0
+			objects := append([]client.Object{spotNode, onDemandNode, wc}, tc.pods...)
+			builder := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...)
+			if tc.throttleEvictions {
+				builder = builder.WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+						if subResourceName == "eviction" {
+							evictAttempts++
+							return errors.NewTooManyRequestsError("Cannot evict pod as it would violate the pod's disruption budget.")
+						}
+						return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+					},
+				})
+			}
+			fakeClient := builder.Build()
+
+			reconciler := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			requeueWait, err := reconciler.reconcileSpotReversion(context.Background(), wc, now)
+			if err != nil {
+				t.Fatalf("reconcileSpotReversion() unexpected error: %v", err)
+			}
+			if requeueWait != tc.wantRequeueWait {
+				t.Errorf("reconcileSpotReversion() requeueWait = %v, want %v", requeueWait, tc.wantRequeueWait)
+			}
+			if tc.checkEvictAttempts && evictAttempts != tc.wantEvictAttempts {
+				t.Errorf("evictAttempts = %d, want %d", evictAttempts, tc.wantEvictAttempts)
+			}
+
+			podList := &corev1.PodList{}
+			if err := fakeClient.List(context.Background(), podList, client.InNamespace("default")); err != nil {
+				t.Fatalf("failed to list remaining pods: %v", err)
+			}
+
+			gotNames := make([]string, 0, len(podList.Items))
+			for _, p := range podList.Items {
+				gotNames = append(gotNames, p.Name)
+			}
+			if len(gotNames) != len(tc.wantRemaining) {
+				t.Fatalf("remaining pods = %v, want %v", gotNames, tc.wantRemaining)
+			}
+			for i := range gotNames {
+				if gotNames[i] != tc.wantRemaining[i] {
+					t.Errorf("remaining pods[%d] = %q, want %q", i, gotNames[i], tc.wantRemaining[i])
+				}
+			}
+		})
 	}
 }

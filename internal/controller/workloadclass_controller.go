@@ -19,10 +19,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,10 +37,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
-	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -46,6 +48,7 @@ const (
 	clusterAutoscalerStatusName      = "cluster-autoscaler-status"
 	spotNodeLabelKey                 = "cloud.google.com/gke-spot"
 	spotNodeLabelValue               = "true"
+	pdbRetryRequeueDelay             = 10 * time.Second
 )
 
 type clusterAutoscalerStatus struct {
@@ -84,6 +87,7 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/finalizers,verbs=update
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods;namespaces;configmaps;nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
@@ -142,13 +146,24 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// 5. Check Spot capacity availability
+	// 5. Check Spot capacity availability and perform Active reversion if applicable
 	spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
 	if err != nil {
 		log.Error(err, "Failed to check Spot capacity")
 		return ctrl.Result{}, err
 	}
 	log.Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
+
+	if spotCapacityAvailable && validationCond.Status == metav1.ConditionTrue {
+		reversionRequeue, err := r.reconcileSpotReversion(ctx, wc, time.Now().UTC())
+		if err != nil {
+			log.Error(err, "Failed to reconcile Spot reversion")
+			return ctrl.Result{}, err
+		}
+		if reversionRequeue > 0 && (nextReconcile == 0 || reversionRequeue < nextReconcile) {
+			nextReconcile = reversionRequeue
+		}
+	}
 
 	// 6. Reconcile the PDB
 	err = r.reconcilePDB(ctx, wc, validationCond, overlappingClasses)
@@ -533,6 +548,151 @@ func (r *WorkloadClassReconciler) hasReadySpotNodes(ctx context.Context) (bool, 
 		}
 	}
 	return false, nil
+}
+
+// reconcileSpotReversion proactively evicts Pods running on On-Demand fallback nodes
+// when Spot capacity is available and the WorkloadClass specifies ReversionActionActive.
+func (r *WorkloadClassReconciler) reconcileSpotReversion(ctx context.Context, wc *workloadsv1.WorkloadClass, now time.Time) (time.Duration, error) {
+	sp := wc.Spec.PlacementPolicy.SpotPlacement
+	if sp.Type == workloadsv1.SpotPlacementTypeOnDemand || sp.Reversion.Action != workloadsv1.ReversionActionActive {
+		return 0, nil
+	}
+
+	spotRatio := 100
+	if sp.SpotRatio != "" {
+		if parsed, err := strconv.Atoi(strings.TrimSuffix(sp.SpotRatio, "%")); err == nil {
+			spotRatio = parsed
+		}
+	}
+	if spotRatio <= 0 {
+		return 0, nil
+	}
+
+	spotNodes, err := r.listSpotNodeNames(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	spotPods, onDemandPods, totalActivePods, err := r.classifyWorkloadClassPodsForReversion(ctx, wc, spotNodes)
+	if err != nil {
+		return 0, err
+	}
+
+	var minDuration time.Duration
+	if sp.Reversion.MinDurationOnFallback != nil {
+		minDuration = sp.Reversion.MinDurationOnFallback.Duration
+	}
+
+	var minRequeue time.Duration
+	for i := range onDemandPods {
+		if spotPods*100 >= totalActivePods*spotRatio {
+			break
+		}
+
+		pod := &onDemandPods[i]
+		if minDuration > 0 {
+			elapsed := now.Sub(podFallbackStartTime(pod))
+			if elapsed < minDuration {
+				remaining := minDuration - elapsed
+				if minRequeue == 0 || remaining < minRequeue {
+					minRequeue = remaining
+				}
+				continue
+			}
+		}
+
+		eviction := &policyv1.Eviction{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+			},
+		}
+		if err := r.SubResource("eviction").Create(ctx, pod, eviction); err != nil {
+			if errors.IsTooManyRequests(err) || errors.IsForbidden(err) {
+				inWindow, nextWindow := utils.IsTimeInWindows(ctx, now, wc.Spec.DisruptionPolicy.AllowedDisruptionWindows)
+				if !inWindow {
+					if nextWindow > 0 && (minRequeue == 0 || nextWindow < minRequeue) {
+						minRequeue = nextWindow
+					}
+					break
+				}
+				if minRequeue == 0 || pdbRetryRequeueDelay < minRequeue {
+					minRequeue = pdbRetryRequeueDelay
+				}
+				continue
+			}
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return 0, fmt.Errorf("failed to evict pod %s/%s for Spot reversion: %w", pod.Namespace, pod.Name, err)
+		}
+
+		spotPods++
+	}
+
+	return minRequeue, nil
+}
+
+func (r *WorkloadClassReconciler) listSpotNodeNames(ctx context.Context) (map[string]bool, error) {
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes, client.MatchingLabels{spotNodeLabelKey: spotNodeLabelValue}); err != nil {
+		return nil, fmt.Errorf("failed to list Spot nodes: %w", err)
+	}
+
+	spotNodes := make(map[string]bool, len(nodes.Items))
+	for i := range nodes.Items {
+		spotNodes[nodes.Items[i].Name] = true
+	}
+	return spotNodes, nil
+}
+
+func (r *WorkloadClassReconciler) classifyWorkloadClassPodsForReversion(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	spotNodes map[string]bool,
+) (spotPods int, onDemandPods []corev1.Pod, totalActivePods int, err error) {
+	selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return 0, nil, 0, err
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+
+		totalActivePods++
+		if pod.Spec.NodeName == "" {
+			continue
+		}
+		if spotNodes[pod.Spec.NodeName] {
+			spotPods++
+		} else {
+			onDemandPods = append(onDemandPods, *pod)
+		}
+	}
+
+	return spotPods, onDemandPods, totalActivePods, nil
+}
+
+func podFallbackStartTime(pod *corev1.Pod) time.Time {
+	if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
+		return pod.Status.StartTime.Time
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionTrue && !cond.LastTransitionTime.IsZero() {
+			return cond.LastTransitionTime.Time
+		}
+	}
+	return pod.CreationTimestamp.Time
 }
 
 // SetupWithManager sets up the controller with the Manager.
