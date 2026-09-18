@@ -135,13 +135,17 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 //
 // If no specific or default WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+	return findBestMatchWorkloadClass(ctx, v.Client, v.Recorder, req, pod)
+}
+
+func findBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder events.EventRecorder, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
 	// Use the namespace's default workload class if it exists
-	if bestMatch = v.namespaceDefaultWorkloadClass(ctx, pod); bestMatch != nil {
+	if bestMatch = getNamespaceDefaultWorkloadClass(ctx, c, pod); bestMatch != nil {
 		return bestMatch, nil
 	}
 
 	wcs := &workloadsv1.WorkloadClassList{}
-	if err := v.Client.List(ctx, wcs); err != nil {
+	if err := c.List(ctx, wcs); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
 	}
 
@@ -150,6 +154,9 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admi
 	maxSpecificity := -1
 
 	for _, wc := range wcs.Items {
+		if wc.Namespace != "" && pod.Namespace != "" && wc.Namespace != pod.Namespace {
+			continue
+		}
 		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
 		if err != nil {
 			continue
@@ -160,12 +167,12 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admi
 	}
 
 	// Emit warning message for WorkloadClasses that matched, but are ignored
-	v.emitWarning(ctx, req, pod, bestMatch, otherMatches, maxSpecificity)
+	emitAmbiguousMatchWarning(ctx, recorder, req, pod, bestMatch, otherMatches, maxSpecificity)
 
 	return bestMatch, nil
 }
 
-func (v *DisruptionWebhook) emitWarning(ctx context.Context, req admission.Request, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass, matches map[string]int, maxSpecificity int) {
+func emitAmbiguousMatchWarning(ctx context.Context, recorder events.EventRecorder, req admission.Request, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass, matches map[string]int, maxSpecificity int) {
 	if len(matches) == 0 {
 		return
 	}
@@ -181,10 +188,10 @@ func (v *DisruptionWebhook) emitWarning(ctx context.Context, req admission.Reque
 	}
 
 	// Emit a warning specifically for those with max specificity that were not selected
-	if len(matchesWithMaxSpecificity) != 0 {
+	if len(matchesWithMaxSpecificity) != 0 && recorder != nil {
 		warning := fmt.Sprintf("the following WorkloadClasses match pods with the same specificity as the best match, but were not selected: %s", strings.Join(matchesWithMaxSpecificity, ", "))
 		// Emit a warning event
-		v.Recorder.Eventf(
+		recorder.Eventf(
 			bestMatch,
 			nil,
 			corev1.EventTypeWarning,
@@ -219,12 +226,19 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 }
 
 func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) *workloadsv1.WorkloadClass {
+	return getNamespaceDefaultWorkloadClass(ctx, v.Client, pod)
+}
+
+func getNamespaceDefaultWorkloadClass(ctx context.Context, c client.Client, pod *corev1.Pod) *workloadsv1.WorkloadClass {
 	const defaultClassLabel = "workloads.gke.io/default-class"
 	ns := &corev1.Namespace{}
-	if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
+	if err := c.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
 		if defaultClass, ok := ns.Labels[defaultClassLabel]; ok {
 			wc := &workloadsv1.WorkloadClass{}
-			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
+			if err := c.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err == nil {
+				return wc
+			}
+			if err := c.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
 				return wc
 			}
 		}

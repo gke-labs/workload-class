@@ -206,6 +206,14 @@ func main() {
 		},
 	})
 
+	setupLog.Info("Registering pod placement mutating webhook")
+	mgr.GetWebhookServer().Register("/mutate-v1-pod", &admission.Webhook{
+		Handler: &internalwebhook.PodPlacementWebhook{
+			Client:   mgr.GetClient(),
+			Recorder: mgr.GetEventRecorder("pod-placement-webhook"),
+		},
+	})
+
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		if err := webhookv1.SetupWorkloadClassGuardrailWebhookWithManager(mgr); err != nil {
