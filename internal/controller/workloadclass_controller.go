@@ -38,7 +38,39 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
+	"sigs.k8s.io/yaml"
 )
+
+const (
+	clusterAutoscalerStatusNamespace = "kube-system"
+	clusterAutoscalerStatusName      = "cluster-autoscaler-status"
+	spotNodeLabelKey                 = "cloud.google.com/gke-spot"
+	spotNodeLabelValue               = "true"
+)
+
+type clusterAutoscalerStatus struct {
+	NodeGroups []clusterAutoscalerNodeGroup `json:"nodeGroups"`
+}
+
+type clusterAutoscalerNodeGroup struct {
+	Name    string                            `json:"name"`
+	Health  clusterAutoscalerNodeGroupHealth  `json:"health"`
+	ScaleUp clusterAutoscalerNodeGroupScaleUp `json:"scaleUp"`
+}
+
+type clusterAutoscalerNodeGroupHealth struct {
+	Status string `json:"status"`
+}
+
+type clusterAutoscalerNodeGroupScaleUp struct {
+	Status      string                        `json:"status"`
+	BackoffInfo *clusterAutoscalerBackoffInfo `json:"backoffInfo,omitempty"`
+}
+
+type clusterAutoscalerBackoffInfo struct {
+	ErrorCode    string `json:"errorCode,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+}
 
 // WorkloadClassReconciler reconciles a WorkloadClass object
 type WorkloadClassReconciler struct {
@@ -51,7 +83,7 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/finalizers,verbs=update
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods;namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods;namespaces;configmaps;nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
@@ -94,14 +126,14 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		)
 	}
 
-	// 2. Calculate Readiness
+	// 3. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
 	if err != nil {
 		log.Error(err, "Failed to calculate readiness")
 		return ctrl.Result{}, err
 	}
 
-	// 3. Update Status if changed
+	// 4. Update Status if changed
 	if wc.Status.MaintenanceReadiness != readiness {
 		wc.Status.MaintenanceReadiness = readiness
 		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
@@ -110,7 +142,15 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// 4. Reconcile the PDB
+	// 5. Check Spot capacity availability
+	spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
+	if err != nil {
+		log.Error(err, "Failed to check Spot capacity")
+		return ctrl.Result{}, err
+	}
+	log.Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
+
+	// 6. Reconcile the PDB
 	err = r.reconcilePDB(ctx, wc, validationCond, overlappingClasses)
 	if err != nil {
 		r.Recorder.Eventf(
@@ -425,6 +465,76 @@ func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
 	return selA.String() == selB.String()
 }
 
+// checkSpotCapacity checks whether Spot capacity can be provisioned by inspecting
+// the kube-system/cluster-autoscaler-status ConfigMap for Spot node groups that are
+// Healthy and not in stockout Backoff, falling back to checking for Ready Spot nodes.
+func (r *WorkloadClassReconciler) checkSpotCapacity(ctx context.Context) (bool, error) {
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: clusterAutoscalerStatusNamespace,
+		Name:      clusterAutoscalerStatusName,
+	}, cm)
+	if err != nil && !errors.IsNotFound(err) {
+		return false, fmt.Errorf("failed to get %s/%s ConfigMap: %w", clusterAutoscalerStatusNamespace, clusterAutoscalerStatusName, err)
+	}
+
+	if err == nil && cm.Data != nil {
+		if rawStatus, ok := cm.Data["status"]; ok && strings.TrimSpace(rawStatus) != "" {
+			var caStatus clusterAutoscalerStatus
+			if unmarshalErr := yaml.Unmarshal([]byte(rawStatus), &caStatus); unmarshalErr == nil {
+				spotNodeGroupFound := false
+				for _, ng := range caStatus.NodeGroups {
+					if !strings.Contains(strings.ToLower(ng.Name), "spot") {
+						continue
+					}
+					spotNodeGroupFound = true
+					if isSpotNodeGroupAvailable(ng) {
+						return true, nil
+					}
+				}
+				if spotNodeGroupFound {
+					return false, nil
+				}
+			}
+		}
+	}
+
+	return r.hasReadySpotNodes(ctx)
+}
+
+func isSpotNodeGroupAvailable(ng clusterAutoscalerNodeGroup) bool {
+	if !strings.EqualFold(ng.Health.Status, "Healthy") {
+		return false
+	}
+	if strings.EqualFold(ng.ScaleUp.Status, "Backoff") {
+		return false
+	}
+	if ng.ScaleUp.BackoffInfo != nil && ng.ScaleUp.BackoffInfo.ErrorCode != "" {
+		return false
+	}
+	return true
+}
+
+func (r *WorkloadClassReconciler) hasReadySpotNodes(ctx context.Context) (bool, error) {
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes, client.MatchingLabels{spotNodeLabelKey: spotNodeLabelValue}); err != nil {
+		return false, fmt.Errorf("failed to list Spot nodes: %w", err)
+	}
+
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.Unschedulable {
+			continue
+		}
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -433,8 +543,19 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
 		).
+		Watches(
+			&corev1.ConfigMap{}, // Re-trigger when kube-system/cluster-autoscaler-status updates
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
+		).
 		Named("workloadclass").
 		Complete(r)
+}
+
+func (r *WorkloadClassReconciler) findWorkloadClassesForClusterAutoscalerStatus(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetNamespace() != clusterAutoscalerStatusNamespace || obj.GetName() != clusterAutoscalerStatusName {
+		return nil
+	}
+	return r.findWorkloadClassesToReconcile(ctx, obj)
 }
 
 func (r *WorkloadClassReconciler) findWorkloadClassesToReconcile(ctx context.Context, guardrail client.Object) []reconcile.Request {

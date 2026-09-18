@@ -1680,3 +1680,216 @@ func makeWC(name string, creationTime metav1.Time) *workloadsv1.WorkloadClass {
 		},
 	}
 }
+
+func TestCheckSpotCapacity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	testCases := []struct {
+		name    string
+		objects []client.Object
+		want    bool
+	}{
+		{
+			name: "Spot node pool in Backoff (ZONE_RESOURCE_POOL_EXHAUSTED) returns false",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: Backoff
+    backoffInfo:
+      errorCode: ZONE_RESOURCE_POOL_EXHAUSTED
+      errorMessage: "Zone resource pool exhausted"
+`,
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Spot node pool transitioned out of Backoff back to Healthy returns true",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Multiple Spot node pools with one in Backoff and one Healthy returns true",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-zone-a-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: Backoff
+    backoffInfo:
+      errorCode: ZONE_RESOURCE_POOL_EXHAUSTED
+- name: gke-cluster-spot-pool-zone-b-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Spot node pool with Unhealthy status returns false",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Unhealthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Fallback to Ready Spot node when ConfigMap has no Spot node groups returns true",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-default-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+				&corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "spot-node-1",
+						Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue},
+					},
+					Status: corev1.NodeStatus{
+						Conditions: []corev1.NodeCondition{
+							{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Fallback when ConfigMap is missing and Spot node is NotReady returns false",
+			objects: []client.Object{
+				&corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "spot-node-not-ready",
+						Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue},
+					},
+					Status: corev1.NodeStatus{
+						Conditions: []corev1.NodeCondition{
+							{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tc.objects...).
+				Build()
+
+			reconciler := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			got, err := reconciler.checkSpotCapacity(context.Background())
+			if err != nil {
+				t.Fatalf("checkSpotCapacity() unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("checkSpotCapacity() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFindWorkloadClassesForClusterAutoscalerStatus(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	wc := makeWC("test-wc", metav1.Now())
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).Build()
+	reconciler := &WorkloadClassReconciler{Client: fakeClient, Scheme: scheme}
+
+	caCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterAutoscalerStatusName,
+			Namespace: clusterAutoscalerStatusNamespace,
+		},
+	}
+	if reqs := reconciler.findWorkloadClassesForClusterAutoscalerStatus(context.Background(), caCM); len(reqs) != 1 {
+		t.Errorf("expected 1 reconcile request for cluster-autoscaler-status ConfigMap, got %d", len(reqs))
+	}
+
+	otherCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-cm",
+			Namespace: "default",
+		},
+	}
+	if reqs := reconciler.findWorkloadClassesForClusterAutoscalerStatus(context.Background(), otherCM); len(reqs) != 0 {
+		t.Errorf("expected 0 reconcile requests for unrelated ConfigMap, got %d", len(reqs))
+	}
+}
