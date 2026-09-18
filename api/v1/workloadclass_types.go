@@ -221,6 +221,13 @@ const (
 	ReasonValidationFailed = "ValidationFailed"
 	// ReasonNoGuardrails indicates that no Guardrails were found to validate against.
 	ReasonNoGuardrails = "NoGuardrails"
+
+	// ConditionTypeInFallback indicates if a Spot WorkloadClass has fallen back to On-Demand nodes.
+	ConditionTypeInFallback = "InFallback"
+	// ReasonFallbackActive indicates that one or more Spot-targeted Pods are running on On-Demand fallback nodes.
+	ReasonFallbackActive = "FallbackToOnDemandActive"
+	// ReasonNoFallback indicates that the WorkloadClass is not currently in On-Demand fallback.
+	ReasonNoFallback = "NoFallback"
 )
 
 // WorkloadClassStatus defines the observed state of WorkloadClass.

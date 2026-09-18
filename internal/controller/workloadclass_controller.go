@@ -154,14 +154,20 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	log.Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
 
-	if spotCapacityAvailable && validationCond.Status == metav1.ConditionTrue {
-		reversionRequeue, err := r.reconcileSpotReversion(ctx, wc, time.Now().UTC())
-		if err != nil {
-			log.Error(err, "Failed to reconcile Spot reversion")
+	if validationCond.Status == metav1.ConditionTrue {
+		if err := r.reconcileFallbackState(ctx, wc); err != nil {
+			log.Error(err, "Failed to reconcile Spot fallback state")
 			return ctrl.Result{}, err
 		}
-		if reversionRequeue > 0 && (nextReconcile == 0 || reversionRequeue < nextReconcile) {
-			nextReconcile = reversionRequeue
+		if spotCapacityAvailable {
+			reversionRequeue, err := r.reconcileSpotReversion(ctx, wc, time.Now().UTC())
+			if err != nil {
+				log.Error(err, "Failed to reconcile Spot reversion")
+				return ctrl.Result{}, err
+			}
+			if reversionRequeue > 0 && (nextReconcile == 0 || reversionRequeue < nextReconcile) {
+				nextReconcile = reversionRequeue
+			}
 		}
 	}
 
@@ -550,20 +556,110 @@ func (r *WorkloadClassReconciler) hasReadySpotNodes(ctx context.Context) (bool, 
 	return false, nil
 }
 
-// reconcileSpotReversion proactively evicts Pods running on On-Demand fallback nodes
-// when Spot capacity is available and the WorkloadClass specifies ReversionActionActive.
-func (r *WorkloadClassReconciler) reconcileSpotReversion(ctx context.Context, wc *workloadsv1.WorkloadClass, now time.Time) (time.Duration, error) {
+// reconcileFallbackState updates ConditionTypeInFallback on the WorkloadClass status
+// when Spot-targeted Pods fall back to On-Demand nodes. For ReversionActionNone, once
+// ConditionTypeInFallback becomes True it stays True permanently so future Pods stay on On-Demand.
+func (r *WorkloadClassReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
 	sp := wc.Spec.PlacementPolicy.SpotPlacement
-	if sp.Type == workloadsv1.SpotPlacementTypeOnDemand || sp.Reversion.Action != workloadsv1.ReversionActionActive {
-		return 0, nil
+	if sp.Type == workloadsv1.SpotPlacementTypeOnDemand || sp.Fallback.Action != workloadsv1.FallbackActionFallbackToOnDemand {
+		return nil
 	}
 
+	spotRatio := parseSpotRatio(sp.SpotRatio)
+	if spotRatio <= 0 {
+		return nil
+	}
+
+	spotNodes, err := r.listSpotNodeNames(ctx)
+	if err != nil {
+		return err
+	}
+
+	spotPods, onDemandPods, totalActivePods, err := r.classifyWorkloadClassPodsForReversion(ctx, wc, spotNodes)
+	if err != nil {
+		return err
+	}
+
+	currentlyInFallback := len(onDemandPods) > 0 && spotPods*100 < totalActivePods*spotRatio
+	reversionAction := sp.Reversion.Action
+	if reversionAction == "" {
+		reversionAction = workloadsv1.ReversionActionNone
+	}
+
+	if currentlyInFallback {
+		changed := meta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
+			Type:               workloadsv1.ConditionTypeInFallback,
+			Status:             metav1.ConditionTrue,
+			Reason:             workloadsv1.ReasonFallbackActive,
+			Message:            "One or more Pods fell back to On-Demand nodes",
+			LastTransitionTime: metav1.Now(),
+		})
+		if changed {
+			return r.Status().Update(ctx, wc)
+		}
+		return nil
+	}
+
+	// For None reversion, once in fallback, stay in fallback permanently.
+	if reversionAction == workloadsv1.ReversionActionNone &&
+		meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
+		return nil
+	}
+
+	if totalActivePods > 0 && meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
+		changed := meta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
+			Type:               workloadsv1.ConditionTypeInFallback,
+			Status:             metav1.ConditionFalse,
+			Reason:             workloadsv1.ReasonNoFallback,
+			Message:            "All Spot-targeted Pods are running on Spot nodes",
+			LastTransitionTime: metav1.Now(),
+		})
+		if changed {
+			return r.Status().Update(ctx, wc)
+		}
+	}
+
+	return nil
+}
+
+func parseSpotRatio(ratioStr string) int {
 	spotRatio := 100
-	if sp.SpotRatio != "" {
-		if parsed, err := strconv.Atoi(strings.TrimSuffix(sp.SpotRatio, "%")); err == nil {
+	if ratioStr != "" {
+		if parsed, err := strconv.Atoi(strings.TrimSuffix(ratioStr, "%")); err == nil {
 			spotRatio = parsed
 		}
 	}
+	return spotRatio
+}
+
+// reconcileSpotReversion handles reversion when Spot capacity is available:
+// - Active: proactively evicts Pods on On-Demand fallback nodes (respecting PDBs, disruption windows, and MinDurationOnFallback).
+// - Lazy: does not evict running On-Demand Pods; Pods migrate back to Spot only when naturally recreated.
+// - None: keeps Pods on On-Demand permanently after fallback.
+func (r *WorkloadClassReconciler) reconcileSpotReversion(ctx context.Context, wc *workloadsv1.WorkloadClass, now time.Time) (time.Duration, error) {
+	if err := r.reconcileFallbackState(ctx, wc); err != nil {
+		return 0, err
+	}
+
+	sp := wc.Spec.PlacementPolicy.SpotPlacement
+	if sp.Type == workloadsv1.SpotPlacementTypeOnDemand {
+		return 0, nil
+	}
+
+	reversionAction := sp.Reversion.Action
+	if reversionAction == "" {
+		reversionAction = workloadsv1.ReversionActionNone
+	}
+
+	switch reversionAction {
+	case workloadsv1.ReversionActionNone, workloadsv1.ReversionActionLazy:
+		return 0, nil
+	case workloadsv1.ReversionActionActive:
+	default:
+		return 0, nil
+	}
+
+	spotRatio := parseSpotRatio(sp.SpotRatio)
 	if spotRatio <= 0 {
 		return 0, nil
 	}

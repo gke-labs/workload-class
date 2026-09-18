@@ -2002,8 +2002,29 @@ func TestReconcileSpotReversion(t *testing.T) {
 			spotPlacement: workloadsv1.SpotPlacementPolicy{
 				Type:      workloadsv1.SpotPlacementTypeSpot,
 				SpotRatio: "100%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
 				Reversion: workloadsv1.SpotReversionPolicy{
 					Action: workloadsv1.ReversionActionLazy,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"ondemand-pod-1"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "None reversion does not evict OnDemand pods and records InFallback condition",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionNone,
 				},
 			},
 			pods: []client.Object{
@@ -2080,6 +2101,7 @@ func TestReconcileSpotReversion(t *testing.T) {
 			objects := append([]client.Object{spotNode, onDemandNode, wc}, tc.pods...)
 			builder := fake.NewClientBuilder().
 				WithScheme(scheme).
+				WithStatusSubresource(wc).
 				WithObjects(objects...)
 			if tc.throttleEvictions {
 				builder = builder.WithInterceptorFuncs(interceptor.Funcs{

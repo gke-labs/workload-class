@@ -26,8 +26,10 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -128,6 +130,20 @@ func (v *PodPlacementWebhook) mutatePodPlacement(ctx context.Context, pod *corev
 		}
 	}
 
+	reversionAction := sp.Reversion.Action
+	if reversionAction == "" {
+		reversionAction = workloadsv1.ReversionActionNone
+	}
+
+	// If reversion.action is None and the workload has already fallen back to On-Demand,
+	// keep new/recreated Pods on On-Demand permanently after fallback.
+	if reversionAction == workloadsv1.ReversionActionNone &&
+		sp.Fallback.Action == workloadsv1.FallbackActionFallbackToOnDemand &&
+		v.isWorkloadInFallback(ctx, pod, wc) {
+		mutateForOnDemand(pod)
+		return
+	}
+
 	if spotRatio < 100 {
 		spotExisting, totalExisting := v.countExistingWorkloadClassPods(ctx, pod, wc)
 		shouldUseSpot := spotExisting*100 < (totalExisting+1)*spotRatio
@@ -138,6 +154,53 @@ func (v *PodPlacementWebhook) mutatePodPlacement(ctx context.Context, pod *corev
 	}
 
 	mutateForSpot(pod, &sp)
+}
+
+func (v *PodPlacementWebhook) isWorkloadInFallback(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) bool {
+	if meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
+		return true
+	}
+	if v == nil || v.Client == nil {
+		return false
+	}
+
+	podList := &corev1.PodList{}
+	if err := v.Client.List(ctx, podList, client.InNamespace(incomingPod.Namespace)); err != nil {
+		return false
+	}
+
+	var selector labels.Selector
+	if wc.Spec.PodSelector != nil {
+		var err error
+		selector, err = metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+		if err != nil {
+			return false
+		}
+	}
+
+	for i := range podList.Items {
+		existing := &podList.Items[i]
+		if existing.DeletionTimestamp != nil ||
+			existing.Status.Phase == corev1.PodSucceeded ||
+			existing.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if incomingPod.Name != "" && existing.Name == incomingPod.Name {
+			continue
+		}
+		if selector != nil && !selector.Matches(labels.Set(existing.Labels)) {
+			continue
+		}
+		// A Pod that was targeted for Spot (has Spot toleration) or scheduled on an On-Demand node
+		// while fallback is enabled indicates the workload has fallen back to On-Demand.
+		if existing.Spec.NodeName != "" {
+			if isSpinningOnSpot, known := v.isNodeSpot(ctx, existing.Spec.NodeName); known && !isSpinningOnSpot && isPodTargetedForSpot(existing) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (v *PodPlacementWebhook) countExistingWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (spotCount, totalCount int) {
@@ -174,12 +237,32 @@ func (v *PodPlacementWebhook) countExistingWorkloadClassPods(ctx context.Context
 		}
 
 		totalCount++
-		if isPodTargetedForSpot(existing) {
+		if v.isPodEffectiveSpot(ctx, existing) {
 			spotCount++
 		}
 	}
 
 	return spotCount, totalCount
+}
+
+func (v *PodPlacementWebhook) isPodEffectiveSpot(ctx context.Context, pod *corev1.Pod) bool {
+	if pod.Spec.NodeName != "" {
+		if isSpot, known := v.isNodeSpot(ctx, pod.Spec.NodeName); known {
+			return isSpot
+		}
+	}
+	return isPodTargetedForSpot(pod)
+}
+
+func (v *PodPlacementWebhook) isNodeSpot(ctx context.Context, nodeName string) (isSpot, known bool) {
+	if v == nil || v.Client == nil || nodeName == "" {
+		return false, false
+	}
+	node := &corev1.Node{}
+	if err := v.Client.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		return false, false
+	}
+	return node.Labels != nil && node.Labels[SpotLabelKey] == SpotLabelValue, true
 }
 
 func isPodTargetedForSpot(pod *corev1.Pod) bool {

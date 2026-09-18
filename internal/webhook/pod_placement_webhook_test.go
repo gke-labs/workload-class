@@ -65,10 +65,38 @@ func TestMutatePodPlacement(t *testing.T) {
 		MatchLabels: map[string]string{"app": "worker"},
 	}
 
+	onDemandNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "ondemand-node-1",
+			Labels: map[string]string{},
+		},
+	}
+	fallbackPodOnOnDemand := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Labels:    map[string]string{"app": "worker"},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: "ondemand-node-1",
+				Tolerations: []corev1.Toleration{
+					{
+						Key:      SpotLabelKey,
+						Operator: corev1.TolerationOpEqual,
+						Value:    SpotLabelValue,
+						Effect:   corev1.TaintEffectNoSchedule,
+					},
+				},
+			},
+		}
+	}
+
 	tests := []struct {
 		name         string
 		initial      *corev1.Pod
 		existingPods []client.Object
+		wcConditions []metav1.Condition
 		spotSpec     workloadsv1.SpotPlacementPolicy
 		verifyPod    func(t *testing.T, pod *corev1.Pod)
 	}{
@@ -156,6 +184,51 @@ func TestMutatePodPlacement(t *testing.T) {
 			},
 			verifyPod: verifyOnDemandPod,
 		},
+		{
+			name:    "Lazy reversion mutates recreated pod for Spot even when 4 existing fallback pods are on OnDemand node",
+			initial: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-recreated", Namespace: "default"}},
+			existingPods: []client.Object{
+				onDemandNode,
+				fallbackPodOnOnDemand("worker-1"),
+				fallbackPodOnOnDemand("worker-2"),
+				fallbackPodOnOnDemand("worker-3"),
+				fallbackPodOnOnDemand("worker-4"),
+			},
+			spotSpec: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "80%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action:                 workloadsv1.FallbackActionFallbackToOnDemand,
+					AllowedMachineFamilies: []string{"n2d", "t2d"},
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionLazy,
+				},
+			},
+			verifyPod: verifyFallbackAllowedFamiliesPod,
+		},
+		{
+			name:    "None reversion mutates recreated pod for OnDemand when WorkloadClass is in fallback",
+			initial: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-after-fallback", Namespace: "default"}, Spec: corev1.PodSpec{NodeSelector: map[string]string{"disk": "ssd"}}},
+			wcConditions: []metav1.Condition{
+				{
+					Type:   workloadsv1.ConditionTypeInFallback,
+					Status: metav1.ConditionTrue,
+					Reason: workloadsv1.ReasonFallbackActive,
+				},
+			},
+			spotSpec: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionNone,
+				},
+			},
+			verifyPod: verifyOnDemandPod,
+		},
 	}
 
 	scheme := newTestScheme(t)
@@ -168,6 +241,9 @@ func TestMutatePodPlacement(t *testing.T) {
 					PlacementPolicy: workloadsv1.PlacementPolicy{
 						SpotPlacement: tc.spotSpec,
 					},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					Conditions: tc.wcConditions,
 				},
 			}
 			wh := &PodPlacementWebhook{
