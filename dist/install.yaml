@@ -138,6 +138,85 @@ spec:
                     minimum: 0
                     type: integer
                 type: object
+              placementPolicy:
+                description: PlacementPolicy defines compute capacity and scheduling
+                  placement intents for a WorkloadClass.
+                properties:
+                  spotPlacement:
+                    default: {}
+                    description: |-
+                      SpotPlacement specifies the desired Spot capacity allocation, stockout fallback,
+                      and reversion behavior for pods in this WorkloadClass.
+                    properties:
+                      fallback:
+                        default: {}
+                        description: Fallback configures pod scheduling behavior when
+                          Spot capacity is unavailable (stockout).
+                        properties:
+                          action:
+                            default: Fail
+                            description: |-
+                              Action specifies the action to take on Spot stockout:
+                              - Fail: Keeps pods Pending (default).
+                              - FallbackToOnDemand: Schedules pods on On-Demand VMs.
+                            enum:
+                            - Fail
+                            - FallbackToOnDemand
+                            type: string
+                          allowedMachineFamilies:
+                            description: |-
+                              AllowedMachineFamilies is an optional allowlist of GCE machine families
+                              (e.g., ["n2d", "t2d"]) permitted for On-Demand fallback VMs to control costs.
+                              If empty, all machine families are allowed.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      reversion:
+                        default: {}
+                        description: Reversion configures how and when workloads return
+                          to Spot once capacity is restored.
+                        properties:
+                          action:
+                            default: None
+                            description: |-
+                              Action specifies the reversion strategy once Spot capacity returns:
+                              - Active: Proactively evicts pods on On-Demand to migrate them to Spot (respecting PDBs).
+                              - Lazy: Migrates to Spot only when pods are naturally recreated.
+                              - None: Stays on On-Demand permanently after fallback (default).
+                            enum:
+                            - Active
+                            - Lazy
+                            - None
+                            type: string
+                          minDurationOnFallback:
+                            default: 0s
+                            description: |-
+                              MinDurationOnFallback sets the minimum duration a pod must run on On-Demand fallback VMs
+                              before becoming eligible for Active reversion (e.g., "4h"), dampening churn when Spot capacity is unstable.
+                            type: string
+                            x-kubernetes-validations:
+                            - message: minDurationOnFallback must be non-negative
+                              rule: duration(self) >= duration('0s')
+                        type: object
+                      spotRatio:
+                        default: 100%
+                        description: |-
+                          SpotRatio specifies the target percentage of Spot VMs for this workload
+                          (e.g., "80%" Spot, 20% On-Demand), enforced via Pod Topology Spread Constraints.
+                        pattern: ^(100|[1-9]?[0-9])%$
+                        type: string
+                      type:
+                        default: Spot
+                        description: |-
+                          Type specifies the desired provisioning model: Spot (default) or OnDemand
+                          (to opt out if the default is Spot).
+                        enum:
+                        - Spot
+                        - OnDemand
+                        type: string
+                    type: object
+                type: object
               podSelector:
                 description: PodSelector matches the pods that this class applies
                   to.
@@ -349,6 +428,100 @@ spec:
                     required:
                     - maxNonDisruptionDurationDays
                     type: object
+                  placement:
+                    default: {}
+                    description: Placement specifies compute capacity and scheduling
+                      guardrails for workloads.
+                    properties:
+                      spotPlacement:
+                        default: {}
+                        description: SpotPlacement defines guardrails and lifecycle
+                          rules for Spot capacity usage.
+                        properties:
+                          enforcementMode:
+                            default: Allowed
+                            description: |-
+                              EnforcementMode enforces Spot usage. Required forces Spot. Forbidden blocks Spot.
+                              Allowed lets workload choose.
+                            enum:
+                            - Allowed
+                            - Required
+                            - Forbidden
+                            type: string
+                          fallback:
+                            default:
+                              allowFallbackToOnDemand: true
+                            description: Fallback controls On-Demand fallback behavior
+                              when Spot capacity is unavailable.
+                            properties:
+                              allowFallbackToOnDemand:
+                                default: true
+                                description: AllowFallbackToOnDemand specifies if
+                                  workload owners are allowed to fall back to On-Demand.
+                                type: boolean
+                              maxFallbackRatio:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                description: |-
+                                  MaxFallbackRatio is the budget control specifying the maximum percentage (e.g. "25%")
+                                  or absolute number (e.g. 5) of pods in the class allowed on On-Demand fallback concurrently.
+                                x-kubernetes-int-or-string: true
+                                x-kubernetes-validations:
+                                - message: must be a non-negative integer or a percentage
+                                    between 0% and 100%
+                                  rule: 'type(self) == int ? self >= 0 : self.matches(''^(100|[1-9]?[0-9])%$'')'
+                            type: object
+                            x-kubernetes-validations:
+                            - message: maxFallbackRatio cannot be set when allowFallbackToOnDemand
+                                is false
+                              rule: self.allowFallbackToOnDemand || !has(self.maxFallbackRatio)
+                          minSpotRatio:
+                            description: |-
+                              MinSpotRatio is the minimum allowed Spot ratio (e.g., "50%").
+                              Prevents workload owners from configuring too low Spot ratios.
+                            pattern: ^(100|[1-9]?[0-9])%$
+                            type: string
+                          reversion:
+                            description: Reversion controls the transition of fallback
+                              workloads back to Spot capacity.
+                            properties:
+                              maxFallbackDuration:
+                                description: |-
+                                  MaxFallbackDuration sets an upper bound on how long a workload can run on
+                                  fallback before GKE forces reversion (disruption) (e.g., "30m", "2h").
+                                type: string
+                                x-kubernetes-validations:
+                                - message: maxFallbackDuration must be greater than
+                                    0
+                                  rule: duration(self) > duration('0s')
+                              requiredReversionAction:
+                                description: RequiredReversionAction enforces a reversion
+                                  strategy, e.g., must be `Active`.
+                                enum:
+                                - Active
+                                - Lazy
+                                - None
+                                type: string
+                            type: object
+                            x-kubernetes-validations:
+                            - message: maxFallbackDuration cannot be set when requiredReversionAction
+                                is None
+                              rule: '!has(self.requiredReversionAction) || self.requiredReversionAction
+                                != ''None'' || !has(self.maxFallbackDuration)'
+                        type: object
+                        x-kubernetes-validations:
+                        - message: minSpotRatio cannot be set when enforcementMode
+                            is Forbidden
+                          rule: self.enforcementMode != 'Forbidden' || !has(self.minSpotRatio)
+                        - message: reversion cannot be set when enforcementMode is
+                            Forbidden
+                          rule: self.enforcementMode != 'Forbidden' || !has(self.reversion)
+                        - message: reversion cannot be set when allowFallbackToOnDemand
+                            is false
+                          rule: '!has(self.fallback) || !has(self.fallback.allowFallbackToOnDemand)
+                            || self.fallback.allowFallbackToOnDemand || !has(self.reversion)'
+                    type: object
                 required:
                 - disruption
                 type: object
@@ -494,6 +667,17 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
+  - namespaces
+  - nodes
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - events
   verbs:
   - create
@@ -501,12 +685,9 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - namespaces
-  - pods
+  - pods/eviction
   verbs:
-  - get
-  - list
-  - watch
+  - create
 - apiGroups:
   - policy
   resources:
@@ -830,7 +1011,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/gke-labs/workload-class:latest
+        image: ghcr.io/gke-labs/workload-class:spot-poc
         livenessProbe:
           httpGet:
             path: /healthz
@@ -906,6 +1087,41 @@ spec:
   selfSigned: {}
 ---
 apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: workload-class-system/workload-class-serving-cert
+  name: workload-class-mutating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /mutate-v1-pod
+  failurePolicy: Fail
+  name: mpodplacement.gke.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      - workload-class-system
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   annotations:
@@ -921,6 +1137,14 @@ webhooks:
       path: /validate-disruption
   failurePolicy: Fail
   name: vpoddisruption.gke.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      - workload-class-system
   rules:
   - apiGroups:
     - ""
@@ -932,6 +1156,26 @@ webhooks:
     resources:
     - pods
     - pods/eviction
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /validate-workloads-gke-io-v1-workloadclass
+  failurePolicy: Fail
+  name: vworkloadclass-v1.kb.io
+  rules:
+  - apiGroups:
+    - workloads.gke.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workloadclasses
   sideEffects: None
 - admissionReviewVersions:
   - v1
