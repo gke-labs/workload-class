@@ -206,10 +206,25 @@ func main() {
 		},
 	})
 
+	setupLog.Info("Registering pod placement mutating webhook")
+	mgr.GetWebhookServer().Register("/mutate-v1-pod", &admission.Webhook{
+		Handler: &internalwebhook.PodPlacementWebhook{
+			Client:   mgr.GetClient(),
+			Recorder: mgr.GetEventRecorder("pod-placement-webhook"),
+		},
+	})
+
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		if err := webhookv1.SetupWorkloadClassGuardrailWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "WorkloadClassGuardrail")
+			os.Exit(1)
+		}
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1.SetupWorkloadClassWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "WorkloadClass")
 			os.Exit(1)
 		}
 	}

@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ghcr.io/gke-labs/workload-class
-  newTag: latest
+  newTag: spot-poc

@@ -19,7 +19,9 @@ package v1
 import (
 	"context"
 	"fmt"
+	"regexp"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -59,7 +61,136 @@ func (v *WorkloadClassGuardrailCustomValidator) ValidateCreate(ctx context.Conte
 		return []string{err.Error()}, err
 	}
 
+	if warnings, err := v.validatePlacement(obj); err != nil {
+		return warnings, err
+	}
+
 	return v.validateAgainstWorkloadClasses(ctx, obj)
+}
+
+var percentageRegex = regexp.MustCompile(`^(100|[1-9]?[0-9])%$`)
+
+// validatePlacement validates the guardrail's Placement field.
+func (v *WorkloadClassGuardrailCustomValidator) validatePlacement(obj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
+	return v.validateSpotPlacement(obj)
+}
+
+func (v *WorkloadClassGuardrailCustomValidator) validateSpotPlacement(obj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
+	sp := obj.Spec.Constraints.Placement.SpotPlacement
+
+	switch sp.EnforcementMode {
+	case "", workloadsv1.EnforcementAllowed, workloadsv1.EnforcementRequired, workloadsv1.EnforcementForbidden:
+	default:
+		err := fmt.Errorf("invalid enforcementMode %q: must be Allowed, Required, or Forbidden", sp.EnforcementMode)
+		return []string{err.Error()}, err
+	}
+
+	if sp.MinSpotRatio != "" {
+		if !percentageRegex.MatchString(sp.MinSpotRatio) {
+			err := fmt.Errorf("invalid minSpotRatio %q: must be a percentage between 0%% and 100%%", sp.MinSpotRatio)
+			return []string{err.Error()}, err
+		}
+		if sp.EnforcementMode == workloadsv1.EnforcementForbidden {
+			err := fmt.Errorf("minSpotRatio cannot be set when enforcementMode is Forbidden")
+			return []string{err.Error()}, err
+		}
+		if sp.EnforcementMode == workloadsv1.EnforcementRequired && sp.MinSpotRatio == "0%" {
+			err := fmt.Errorf("minSpotRatio cannot be 0%% when enforcementMode is Required")
+			return []string{err.Error()}, err
+		}
+	}
+
+	if warnings, err := v.validateFallback(obj); err != nil {
+		return warnings, err
+	}
+
+	if warnings, err := v.validateReversion(obj); err != nil {
+		return warnings, err
+	}
+
+	return nil, nil
+}
+
+func (v *WorkloadClassGuardrailCustomValidator) validateFallback(obj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
+	sp := obj.Spec.Constraints.Placement.SpotPlacement
+	fb := sp.Fallback
+
+	// allowFallbackToOnDemand default value is `true`
+	allowFallback := fb.AllowFallbackToOnDemand == nil || *fb.AllowFallbackToOnDemand
+
+	if sp.EnforcementMode == workloadsv1.EnforcementForbidden && !allowFallback {
+		err := fmt.Errorf("allowFallbackToOnDemand cannot be false when enforcementMode is Forbidden")
+		return []string{err.Error()}, err
+	}
+
+	if fb.MaxFallbackRatio != nil {
+		if !allowFallback {
+			err := fmt.Errorf("maxFallbackRatio cannot be set when allowFallbackToOnDemand is false")
+			return []string{err.Error()}, err
+		}
+		if sp.EnforcementMode == workloadsv1.EnforcementForbidden {
+			err := fmt.Errorf("maxFallbackRatio cannot be set when enforcementMode is Forbidden")
+			return []string{err.Error()}, err
+		}
+		switch fb.MaxFallbackRatio.Type {
+		case intstr.Int:
+			if fb.MaxFallbackRatio.IntVal < 0 {
+				err := fmt.Errorf("maxFallbackRatio integer value must be non-negative, got %d", fb.MaxFallbackRatio.IntVal)
+				return []string{err.Error()}, err
+			}
+		case intstr.String:
+			if !percentageRegex.MatchString(fb.MaxFallbackRatio.StrVal) {
+				err := fmt.Errorf("maxFallbackRatio string value %q must be a percentage between 0%% and 100%%", fb.MaxFallbackRatio.StrVal)
+				return []string{err.Error()}, err
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+func (v *WorkloadClassGuardrailCustomValidator) validateReversion(obj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
+	sp := obj.Spec.Constraints.Placement.SpotPlacement
+	rev := sp.Reversion
+	if rev == nil {
+		return nil, nil
+	}
+
+	hasReversionConfig := rev.RequiredReversionAction != "" || rev.MaxFallbackDuration != nil
+	if !hasReversionConfig {
+		return nil, nil
+	}
+
+	if sp.EnforcementMode == workloadsv1.EnforcementForbidden {
+		err := fmt.Errorf("reversion cannot be configured when enforcementMode is Forbidden")
+		return []string{err.Error()}, err
+	}
+
+	allowFallback := sp.Fallback.AllowFallbackToOnDemand == nil || *sp.Fallback.AllowFallbackToOnDemand
+	if !allowFallback {
+		err := fmt.Errorf("reversion cannot be configured when allowFallbackToOnDemand is false")
+		return []string{err.Error()}, err
+	}
+
+	switch rev.RequiredReversionAction {
+	case "", workloadsv1.ReversionActionActive, workloadsv1.ReversionActionLazy, workloadsv1.ReversionActionNone:
+	default:
+		err := fmt.Errorf("invalid requiredReversionAction %q: must be Active, Lazy, or None", rev.RequiredReversionAction)
+		return []string{err.Error()}, err
+	}
+
+	if rev.MaxFallbackDuration != nil {
+		if rev.MaxFallbackDuration.Duration <= 0 {
+			err := fmt.Errorf("maxFallbackDuration must be greater than 0")
+			return []string{err.Error()}, err
+		}
+		if rev.RequiredReversionAction == workloadsv1.ReversionActionNone {
+			err := fmt.Errorf("maxFallbackDuration cannot be set when requiredReversionAction is None")
+			return []string{err.Error()}, err
+		}
+	}
+
+	return nil, nil
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type WorkloadClassGuardrail.
@@ -68,6 +199,10 @@ func (v *WorkloadClassGuardrailCustomValidator) ValidateUpdate(ctx context.Conte
 
 	if err := utils.WeekdaysValid(newObj.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
 		return []string{err.Error()}, err
+	}
+
+	if warnings, err := v.validatePlacement(newObj); err != nil {
+		return warnings, err
 	}
 
 	return v.validateAgainstWorkloadClasses(ctx, newObj)
@@ -129,6 +264,8 @@ func (v *WorkloadClassGuardrailCustomValidator) violatesGuardrail(wc *workloadsv
 	if maxNonDisruptionDurationDays > 0 && wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > maxNonDisruptionDurationDays {
 		violations = append(violations, fmt.Sprintf("guardrail limits MaxNonDisruptionDurationDays to %d, but existing WorkloadClass '%s' requires %d", maxNonDisruptionDurationDays, wc.Name, wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays))
 	}
+
+	violations = append(violations, utils.ValidatePlacementAgainstGuardrail(wc, g)...)
 
 	return violations
 }

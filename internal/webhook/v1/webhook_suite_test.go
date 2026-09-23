@@ -112,6 +112,9 @@ var _ = BeforeSuite(func() {
 	err = SetupWorkloadClassGuardrailWebhookWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = SetupWorkloadClassWebhookWithManager(mgr)
+	Expect(err).NotTo(HaveOccurred())
+
 	// +kubebuilder:scaffold:webhook
 
 	go func() {

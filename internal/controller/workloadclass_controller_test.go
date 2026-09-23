@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,10 @@ import (
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
 )
+
+func boolPtr(b bool) *bool {
+	return &b
+}
 
 type GracePeriodSeconds int64
 
@@ -306,6 +311,145 @@ var _ = Describe("WorkloadClass Controller", func() {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
 							strings.Contains(cond.Message, "maxNonDisruptionDurationDays 4 exceeds guardrail limit")
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should pass validation when placement policy adheres to guardrail placement constraints", func() {
+			By("updating Guardrail with placement constraints")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Placement.SpotPlacement = workloadsv1.SpotPlacement{
+				EnforcementMode: workloadsv1.EnforcementRequired,
+				MinSpotRatio:    "80%",
+				Fallback: workloadsv1.Fallback{
+					AllowFallbackToOnDemand: boolPtr(true),
+				},
+				Reversion: &workloadsv1.Reversion{
+					RequiredReversionAction: workloadsv1.ReversionActionActive,
+					MaxFallbackDuration:     &metav1.Duration{Duration: 2 * time.Hour},
+				},
+			}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			By("updating WorkloadClass with compliant placement policy")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PlacementPolicy.SpotPlacement = workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "90%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action:                workloadsv1.ReversionActionActive,
+					MinDurationOnFallback: &metav1.Duration{Duration: 1 * time.Hour},
+				},
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking Status")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, updatedWC)
+				if err != nil {
+					return false
+				}
+				for _, cond := range updatedWC.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionTrue &&
+							cond.Reason == workloadsv1.ReasonValidationPassed
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should fail validation if guardrail enforcementMode is Required and WorkloadClass specifies OnDemand", func() {
+			By("updating Guardrail with EnforcementRequired")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Placement.SpotPlacement = workloadsv1.SpotPlacement{
+				EnforcementMode: workloadsv1.EnforcementRequired,
+			}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			By("updating WorkloadClass with OnDemand")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PlacementPolicy.SpotPlacement = workloadsv1.SpotPlacementPolicy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking Status")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, updatedWC)
+				if err != nil {
+					return false
+				}
+				for _, cond := range updatedWC.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionFalse &&
+							cond.Reason == workloadsv1.ReasonValidationFailed &&
+							strings.Contains(cond.Message, "spotPlacement type OnDemand is not allowed when guardrail enforcementMode is Required")
+					}
+				}
+				return false
+			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should fail validation if WorkloadClass spotRatio is less than guardrail minSpotRatio", func() {
+			By("updating Guardrail with MinSpotRatio 80%")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Placement.SpotPlacement = workloadsv1.SpotPlacement{
+				MinSpotRatio: "80%",
+			}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			By("updating WorkloadClass with SpotRatio 50%")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PlacementPolicy.SpotPlacement = workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "50%",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking Status")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, updatedWC)
+				if err != nil {
+					return false
+				}
+				for _, cond := range updatedWC.Status.Conditions {
+					if cond.Type == workloadsv1.ConditionTypeValidated {
+						return cond.Status == metav1.ConditionFalse &&
+							cond.Reason == workloadsv1.ReasonValidationFailed &&
+							strings.Contains(cond.Message, "spotRatio 50% is less than guardrail minSpotRatio 80%")
 					}
 				}
 				return false
@@ -1535,5 +1679,476 @@ func makeWC(name string, creationTime metav1.Time) *workloadsv1.WorkloadClass {
 		Status: workloadsv1.WorkloadClassStatus{
 			MaintenanceReadiness: workloadsv1.ReadinessReady,
 		},
+	}
+}
+
+func TestCheckSpotCapacity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	testCases := []struct {
+		name    string
+		objects []client.Object
+		want    bool
+	}{
+		{
+			name: "Spot node pool in Backoff (ZONE_RESOURCE_POOL_EXHAUSTED) returns false",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: Backoff
+    backoffInfo:
+      errorCode: ZONE_RESOURCE_POOL_EXHAUSTED
+      errorMessage: "Zone resource pool exhausted"
+`,
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Spot node pool transitioned out of Backoff back to Healthy returns true",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Multiple Spot node pools with one in Backoff and one Healthy returns true",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-zone-a-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: Backoff
+    backoffInfo:
+      errorCode: ZONE_RESOURCE_POOL_EXHAUSTED
+- name: gke-cluster-spot-pool-zone-b-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Spot node pool with Unhealthy status returns false",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Unhealthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Fallback to Ready Spot node when ConfigMap has no Spot node groups returns true",
+			objects: []client.Object{
+				&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      clusterAutoscalerStatusName,
+						Namespace: clusterAutoscalerStatusNamespace,
+					},
+					Data: map[string]string{
+						"status": `
+nodeGroups:
+- name: gke-cluster-default-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`,
+					},
+				},
+				&corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "spot-node-1",
+						Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue},
+					},
+					Status: corev1.NodeStatus{
+						Conditions: []corev1.NodeCondition{
+							{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Fallback when ConfigMap is missing and Spot node is NotReady returns false",
+			objects: []client.Object{
+				&corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "spot-node-not-ready",
+						Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue},
+					},
+					Status: corev1.NodeStatus{
+						Conditions: []corev1.NodeCondition{
+							{Type: corev1.NodeReady, Status: corev1.ConditionFalse},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tc.objects...).
+				Build()
+
+			reconciler := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			got, err := reconciler.checkSpotCapacity(context.Background())
+			if err != nil {
+				t.Fatalf("checkSpotCapacity() unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("checkSpotCapacity() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFindWorkloadClassesForClusterAutoscalerStatus(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	wc := makeWC("test-wc", metav1.Now())
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).Build()
+	reconciler := &WorkloadClassReconciler{Client: fakeClient, Scheme: scheme}
+
+	caCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterAutoscalerStatusName,
+			Namespace: clusterAutoscalerStatusNamespace,
+		},
+	}
+	if reqs := reconciler.findWorkloadClassesForClusterAutoscalerStatus(context.Background(), caCM); len(reqs) != 1 {
+		t.Errorf("expected 1 reconcile request for cluster-autoscaler-status ConfigMap, got %d", len(reqs))
+	}
+
+	otherCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-cm",
+			Namespace: "default",
+		},
+	}
+	if reqs := reconciler.findWorkloadClassesForClusterAutoscalerStatus(context.Background(), otherCM); len(reqs) != 0 {
+		t.Errorf("expected 0 reconcile requests for unrelated ConfigMap, got %d", len(reqs))
+	}
+}
+
+func newScheduledPod(name, nodeName string, startTime time.Time) *corev1.Pod {
+	t := metav1.NewTime(startTime)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			Labels:            map[string]string{"app": "test"},
+			CreationTimestamp: t,
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+		},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodRunning,
+			StartTime: &t,
+		},
+	}
+}
+
+func TestReconcileSpotReversion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(policyv1.AddToScheme(scheme))
+	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+
+	now := time.Date(2026, 9, 18, 15, 0, 0, 0, time.UTC)
+	spotNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "spot-node-1",
+			Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue},
+		},
+	}
+	onDemandNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "ondemand-node-1",
+			Labels: map[string]string{},
+		},
+	}
+
+	testCases := []struct {
+		name               string
+		spotPlacement      workloadsv1.SpotPlacementPolicy
+		windows            []workloadsv1.DisruptionWindow
+		throttleEvictions  bool
+		pods               []client.Object
+		wantRemaining      []string
+		wantRequeueWait    time.Duration
+		wantEvictAttempts  int
+		checkEvictAttempts bool
+	}{
+		{
+			name: "Active reversion with 100% spotRatio evicts OnDemand pods and keeps Spot pods",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("spot-pod-1", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"spot-pod-1"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "Active reversion respects MinDurationOnFallback and returns remaining wait time",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action:                workloadsv1.ReversionActionActive,
+					MinDurationOnFallback: &metav1.Duration{Duration: 30 * time.Minute},
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("young-ondemand-pod", "ondemand-node-1", now.Add(-10*time.Minute)),
+				newScheduledPod("mature-ondemand-pod", "ondemand-node-1", now.Add(-45*time.Minute)),
+			},
+			wantRemaining:   []string{"young-ondemand-pod"},
+			wantRequeueWait: 20 * time.Minute,
+		},
+		{
+			name: "Active reversion with 80% spotRatio evicts only enough OnDemand pods to reach 80%",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "80%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("spot-pod-1", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("spot-pod-2", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("spot-pod-3", "spot-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-2", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"ondemand-pod-2", "spot-pod-1", "spot-pod-2", "spot-pod-3"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "Lazy reversion does not proactively evict OnDemand pods",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionLazy,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"ondemand-pod-1"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "None reversion does not evict OnDemand pods and records InFallback condition",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Fallback: workloadsv1.SpotFallbackPolicy{
+					Action: workloadsv1.FallbackActionFallbackToOnDemand,
+				},
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionNone,
+				},
+			},
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:   []string{"ondemand-pod-1"},
+			wantRequeueWait: 0,
+		},
+		{
+			name: "Active reversion when TooManyRequests during closed disruption window stops evicting and requeues for nextWindow",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			windows: []workloadsv1.DisruptionWindow{
+				{
+					Name:       "evening-window",
+					DaysOfWeek: []string{"Friday"},
+					TimeZone:   "Etc/UTC",
+					StartTime:  "22:00",
+					EndTime:    "23:59",
+				},
+			},
+			throttleEvictions: true,
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-2", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:      []string{"ondemand-pod-1", "ondemand-pod-2"},
+			wantRequeueWait:    7 * time.Hour,
+			wantEvictAttempts:  1,
+			checkEvictAttempts: true,
+		},
+		{
+			name: "Active reversion when TooManyRequests during open disruption window retries after pdbRetryRequeueDelay",
+			spotPlacement: workloadsv1.SpotPlacementPolicy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "100%",
+				Reversion: workloadsv1.SpotReversionPolicy{
+					Action: workloadsv1.ReversionActionActive,
+				},
+			},
+			windows: []workloadsv1.DisruptionWindow{
+				{
+					Name:       "afternoon-window",
+					DaysOfWeek: []string{"Friday"},
+					TimeZone:   "Etc/UTC",
+					StartTime:  "14:00",
+					EndTime:    "18:00",
+				},
+			},
+			throttleEvictions: true,
+			pods: []client.Object{
+				newScheduledPod("ondemand-pod-1", "ondemand-node-1", now.Add(-1*time.Hour)),
+				newScheduledPod("ondemand-pod-2", "ondemand-node-1", now.Add(-1*time.Hour)),
+			},
+			wantRemaining:      []string{"ondemand-pod-1", "ondemand-pod-2"},
+			wantRequeueWait:    pdbRetryRequeueDelay,
+			wantEvictAttempts:  2,
+			checkEvictAttempts: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := makeWC("reversion-wc", metav1.NewTime(now.Add(-2*time.Hour)))
+			wc.Spec.PlacementPolicy.SpotPlacement = tc.spotPlacement
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = tc.windows
+
+			evictAttempts := 0
+			objects := append([]client.Object{spotNode, onDemandNode, wc}, tc.pods...)
+			builder := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(wc).
+				WithObjects(objects...)
+			if tc.throttleEvictions {
+				builder = builder.WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+						if subResourceName == "eviction" {
+							evictAttempts++
+							return errors.NewTooManyRequestsError("Cannot evict pod as it would violate the pod's disruption budget.")
+						}
+						return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+					},
+				})
+			}
+			fakeClient := builder.Build()
+
+			reconciler := &WorkloadClassReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			requeueWait, err := reconciler.reconcileSpotReversion(context.Background(), wc, now)
+			if err != nil {
+				t.Fatalf("reconcileSpotReversion() unexpected error: %v", err)
+			}
+			if requeueWait != tc.wantRequeueWait {
+				t.Errorf("reconcileSpotReversion() requeueWait = %v, want %v", requeueWait, tc.wantRequeueWait)
+			}
+			if tc.checkEvictAttempts && evictAttempts != tc.wantEvictAttempts {
+				t.Errorf("evictAttempts = %d, want %d", evictAttempts, tc.wantEvictAttempts)
+			}
+
+			podList := &corev1.PodList{}
+			if err := fakeClient.List(context.Background(), podList, client.InNamespace("default")); err != nil {
+				t.Fatalf("failed to list remaining pods: %v", err)
+			}
+
+			gotNames := make([]string, 0, len(podList.Items))
+			for _, p := range podList.Items {
+				gotNames = append(gotNames, p.Name)
+			}
+			if len(gotNames) != len(tc.wantRemaining) {
+				t.Fatalf("remaining pods = %v, want %v", gotNames, tc.wantRemaining)
+			}
+			for i := range gotNames {
+				if gotNames[i] != tc.wantRemaining[i] {
+					t.Errorf("remaining pods[%d] = %q, want %q", i, gotNames[i], tc.wantRemaining[i])
+				}
+			}
+		})
 	}
 }
