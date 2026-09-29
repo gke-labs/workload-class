@@ -32,4 +32,9 @@ resources:
   webhooks:
     validation: true
     webhookVersion: v1
+- controller: true
+  domain: gke.io
+  group: workloads
+  kind: GKESpotPlacementPolicy
+  version: v1
 version: "3"
