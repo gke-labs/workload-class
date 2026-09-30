@@ -23,6 +23,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
 
 // GKESpotPlacementPolicyReconciler reconciles a GKESpotPlacementPolicy object
@@ -55,8 +57,7 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 // SetupWithManager sets up the controller with the Manager.
 func (r *GKESpotPlacementPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		// Uncomment the following line adding a pointer to an instance of the controlled resource as an argument
-		// For().
+		For(&workloadsv1.GKESpotPlacementPolicy{}).
 		Named("gkespotplacementpolicy").
 		Complete(r)
 }
