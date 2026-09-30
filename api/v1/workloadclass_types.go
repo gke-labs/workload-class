@@ -20,7 +20,30 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// SpotPlacementType specifies the desired compute provisioning model for a workload.
+// +kubebuilder:validation:Enum=Spot;OnDemand
+type SpotPlacementType string
+
+const (
+	// SpotPlacementTypeSpot specifies Spot VMs as the desired provisioning model (default).
+	SpotPlacementTypeSpot SpotPlacementType = "Spot"
+
+	// SpotPlacementTypeOnDemand specifies On-Demand VMs as the desired provisioning model,
+	// allowing workloads to opt out when the cluster/namespace default is Spot.
+	SpotPlacementTypeOnDemand SpotPlacementType = "OnDemand"
+)
+
+// FallbackAction defines the action to take when Spot capacity is unavailable (stockout).
+// +kubebuilder:validation:Enum=Fail;FallbackToOnDemand
+type FallbackAction string
+
+const (
+	// FallbackActionFail keeps pods Pending when Spot capacity is unavailable (default).
+	FallbackActionFail FallbackAction = "Fail"
+
+	// FallbackActionFallbackToOnDemand schedules pods onto On-Demand VMs during Spot stockouts.
+	FallbackActionFallbackToOnDemand FallbackAction = "FallbackToOnDemand"
+)
 
 // DisruptionPolicy specifies the policy governing pod disruptions.
 type DisruptionPolicy struct {
@@ -105,14 +128,71 @@ type WorkloadClassSpec struct {
 	// DisruptionPolicy specifies the policy governing pod disruptions.
 	// +optional
 	DisruptionPolicy DisruptionPolicy `json:"disruptionPolicy,omitempty"`
+
+	// CapacityStrategy defines portable, cloud-agnostic compute capacity and fallback intent
+	// (e.g., targeting Spot vs. On-Demand capacity, target Spot percentage, and stockout fallback behavior).
+	// +optional
+	CapacityStrategy *CapacityStrategy `json:"capacityStrategy,omitempty"`
+
+	// InfrastructureProfileRef references a cluster-scoped, provider-specific infrastructure profile CR
+	// (such as GKESpotPlacementPolicy) managed by Platform/SRE.
+	// +optional
+	InfrastructureProfileRef *InfrastructureProfileReference `json:"infrastructureProfileRef,omitempty"`
 }
 
+// CapacityStrategy defines cloud-agnostic Spot/Preemptible capacity preferences.
+type CapacityStrategy struct {
+	// Type specifies whether the workload targets Spot or OnDemand capacity. Default: "Spot".
+	// +optional
+	// +kubebuilder:default="Spot"
+	Type SpotPlacementType `json:"type,omitempty"`
+
+	// SpotRatio is the target percentage of Pods to place on Spot capacity (e.g., "80%"). Default: "100%".
+	// Must be an integer percentage between "0%" and "100%".
+	// +optional
+	// +kubebuilder:default="100%"
+	// +kubebuilder:validation:Pattern=`^(100|[1-9]?[0-9])%$`
+	SpotRatio string `json:"spotRatio,omitempty"`
+
+	// FallbackAction determines whether Pods remain Pending ("Fail") or schedule onto On-Demand ("FallbackToOnDemand")
+	// when Spot capacity is unavailable. Default: "Fail".
+	// +optional
+	// +kubebuilder:default="Fail"
+	FallbackAction FallbackAction `json:"action,omitempty"`
+}
+
+// InfrastructureProfileReference identifies an external cluster-scoped, provider-specific profile CR.
+type InfrastructureProfileReference struct {
+	// Group is the API group of the infrastructure profile (e.g., "workloads.gke.io").
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Group string `json:"group,omitempty"`
+
+	// Kind is the resource kind of the infrastructure profile (e.g., "GKESpotPlacementPolicy").
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Kind string `json:"kind"`
+
+	// Name is the metadata.name of the cluster-scoped infrastructure profile resource.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+}
+
+// MaintenanceReadiness indicates whether a workload is currently inside an allowed disruption window or overdue.
+// +kubebuilder:validation:Enum=Ready;NotReady;Overdue
 type MaintenanceReadiness string
 
 const (
-	ReadinessReady    MaintenanceReadiness = "Ready"
+	// ReadinessReady indicates the workload is currently within an allowed disruption window.
+	ReadinessReady MaintenanceReadiness = "Ready"
+	// ReadinessNotReady indicates the workload is outside of its allowed disruption windows.
 	ReadinessNotReady MaintenanceReadiness = "NotReady"
-	ReadinessOverdue  MaintenanceReadiness = "Overdue"
+	// ReadinessOverdue indicates the workload has exceeded MaxNonDisruptionDurationDays and maintenance takes precedence.
+	ReadinessOverdue MaintenanceReadiness = "Overdue"
 )
 
 const (
@@ -125,6 +205,26 @@ const (
 	ReasonValidationFailed = "ValidationFailed"
 	// ReasonNoGuardrails indicates that no Guardrails were found to validate against.
 	ReasonNoGuardrails = "NoGuardrails"
+
+	// ConditionTypePlacementPluginAttached indicates whether the referenced infrastructureProfileRef
+	// has been resolved and attached by its corresponding placement plugin controller.
+	ConditionTypePlacementPluginAttached = "PlacementPluginAttached"
+
+	// ReasonPluginPending indicates that the WorkloadClass is waiting for the placement plugin controller to attach.
+	ReasonPluginPending = "PluginPending"
+	// ReasonProfileResolved indicates that the referenced infrastructure profile CR was found and attached.
+	ReasonProfileResolved = "ProfileResolved"
+	// ReasonPluginResolutionFailed indicates that the referenced infrastructure profile CR could not be found or resolved.
+	ReasonPluginResolutionFailed = "PluginResolutionFailed"
+
+	// ConditionTypeInFallback indicates whether Pods belonging to this WorkloadClass are currently running
+	// on On-Demand fallback capacity due to a Spot stockout.
+	ConditionTypeInFallback = "InFallback"
+
+	// ReasonFallbackActive indicates that one or more Pods are running on On-Demand fallback capacity below the target SpotRatio.
+	ReasonFallbackActive = "FallbackActive"
+	// ReasonSpotTargetMet indicates that the workload meets its target SpotRatio with no active fallback deficit.
+	ReasonSpotTargetMet = "SpotTargetMet"
 )
 
 // WorkloadClassStatus defines the observed state of WorkloadClass.
@@ -146,7 +246,13 @@ type WorkloadClassStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:resource:scope=Namespaced,shortName=wc
+// +kubebuilder:printcolumn:name="Maintenance",type="string",JSONPath=".status.maintenanceReadiness"
+// +kubebuilder:printcolumn:name="Capacity",type="string",JSONPath=".spec.capacityStrategy.type"
+// +kubebuilder:printcolumn:name="SpotRatio",type="string",JSONPath=".spec.capacityStrategy.spotRatio"
+// +kubebuilder:printcolumn:name="Profile",type="string",JSONPath=".spec.infrastructureProfileRef.name"
+// +kubebuilder:printcolumn:name="Validated",type="string",JSONPath=".status.conditions[?(@.type=='Validated')].status"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // WorkloadClass is the Schema for the workloadclasses API
 type WorkloadClass struct {
