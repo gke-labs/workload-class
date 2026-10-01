@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -660,6 +661,161 @@ var _ = Describe("WorkloadClass Controller", func() {
 				err := k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
 				return errors.IsNotFound(err)
 			}, "10s", "1s").Should(BeTrue(), "Expected PDB %s to be deleted", expectedPDBName)
+		})
+
+		It("should set PlacementPluginAttached=False and Validated=False when InfrastructureProfileRef is set and plugin has not attached", func() {
+			By("Updating WorkloadClass with an InfrastructureProfileRef")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
+				Group: "workloads.gke.io",
+				Kind:  "GKESpotPlacementPolicy",
+				Name:  "gke-t2d-spot-profile",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying PlacementPluginAttached is False (PluginPending) and Validated is False")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			pluginCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
+			Expect(pluginCond).NotTo(BeNil())
+			Expect(pluginCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(pluginCond.Reason).To(Equal(workloadsv1.ReasonPluginPending))
+			Expect(pluginCond.Message).To(ContainSubstring("Waiting for plugin controller to reconcile GKESpotPlacementPolicy"))
+			Expect(pluginCond.ObservedGeneration).To(Equal(updatedWC.Generation))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationFailed))
+			Expect(validatedCond.Message).To(ContainSubstring("WorkloadClass references an infrastructure profile, but the plugin has not attached"))
+
+			By("Verifying no PDB is created while plugin has not attached")
+			pdbKey := types.NamespacedName{Name: "workload-" + updatedWC.Name, Namespace: updatedWC.Namespace}
+			err = k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("should preserve PlacementPluginAttached=True, mark Validated=True, and create PDB when plugin has attached for current generation", func() {
+			By("Updating WorkloadClass with an InfrastructureProfileRef")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
+				Group: "workloads.gke.io",
+				Kind:  "GKESpotPlacementPolicy",
+				Name:  "gke-t2d-spot-profile",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Simulating the plugin controller attaching for the current generation")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			meta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
+				Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+				Status:             metav1.ConditionTrue,
+				Reason:             workloadsv1.ReasonProfileResolved,
+				Message:            "GKESpotPlacementPolicy gke-t2d-spot-profile attached",
+				ObservedGeneration: wc.Generation,
+				LastTransitionTime: metav1.Now(),
+			})
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying PlacementPluginAttached remains True and Validated is True")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			pluginCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
+			Expect(pluginCond).NotTo(BeNil())
+			Expect(pluginCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(pluginCond.Reason).To(Equal(workloadsv1.ReasonProfileResolved))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationPassed))
+
+			By("Verifying the PDB is created")
+			pdbKey := types.NamespacedName{Name: "workload-" + updatedWC.Name, Namespace: updatedWC.Namespace}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+			}, "10s", "1s").Should(Succeed())
+		})
+
+		It("should transition Validated through PluginPending -> PluginResolutionFailed -> ProfileResolved", func() {
+			By("Step 1: Updating WorkloadClass with an InfrastructureProfileRef")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
+				Group: "workloads.gke.io",
+				Kind:  "GKESpotPlacementPolicy",
+				Name:  "gke-t2d-spot-profile",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Step 2: Reconciling sets initial PlacementPluginAttached=False (PluginPending) and Validated=False")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			validatedCond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(validatedCond.Message).To(Equal("WorkloadClass references an infrastructure profile, but the plugin has not attached: Waiting for plugin controller to reconcile GKESpotPlacementPolicy"))
+
+			By("Step 3: Plugin fails to attach and sets PlacementPluginAttached=False (PluginResolutionFailed)")
+			meta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
+				Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+				Status:             metav1.ConditionFalse,
+				Reason:             workloadsv1.ReasonPluginResolutionFailed,
+				Message:            "GKESpotPlacementPolicy 'gke-t2d-spot-profile' not found",
+				ObservedGeneration: wc.Generation,
+				LastTransitionTime: metav1.Now(),
+			})
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			By("Step 4: Reconciling updates Validated=False with the plugin resolution failure message")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			validatedCond = meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(validatedCond.Message).To(Equal("WorkloadClass references an infrastructure profile, but the plugin has not attached: GKESpotPlacementPolicy 'gke-t2d-spot-profile' not found"))
+
+			By("Step 5: Plugin succeeds attaching and sets PlacementPluginAttached=True (ProfileResolved)")
+			meta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
+				Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+				Status:             metav1.ConditionTrue,
+				Reason:             workloadsv1.ReasonProfileResolved,
+				Message:            "GKESpotPlacementPolicy 'gke-t2d-spot-profile' attached",
+				ObservedGeneration: wc.Generation,
+				LastTransitionTime: metav1.Now(),
+			})
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			By("Step 6: Reconciling clears the placement violation and marks Validated=True")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			validatedCond = meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationPassed))
+			Expect(validatedCond.Message).To(Equal("WorkloadClass adheres to all Guardrail constraints"))
 		})
 	})
 })
@@ -1535,5 +1691,326 @@ func makeWC(name string, creationTime metav1.Time) *workloadsv1.WorkloadClass {
 		Status: workloadsv1.WorkloadClassStatus{
 			MaintenanceReadiness: workloadsv1.ReadinessReady,
 		},
+	}
+}
+
+func TestPlacementPluginCondition(t *testing.T) {
+	testCases := []struct {
+		name           string
+		wc             *workloadsv1.WorkloadClass
+		wantNil        bool
+		wantStatus     metav1.ConditionStatus
+		wantReason     string
+		wantMessageSub string
+		wantGen        int64
+	}{
+		{
+			name: "no_infrastructure_profile_ref_returns_nil",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "wc-no-ref",
+					Namespace:  "default",
+					Generation: 1,
+				},
+			},
+			wantNil: true,
+		},
+		{
+			name: "infrastructure_profile_ref_with_no_existing_condition_returns_plugin_pending",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "wc-pending",
+					Namespace:  "default",
+					Generation: 2,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					InfrastructureProfileRef: &workloadsv1.InfrastructureProfileReference{
+						Group: "workloads.gke.io",
+						Kind:  "GKESpotPlacementPolicy",
+						Name:  "gke-t2d-spot",
+					},
+				},
+			},
+			wantNil:        false,
+			wantStatus:     metav1.ConditionFalse,
+			wantReason:     workloadsv1.ReasonPluginPending,
+			wantMessageSub: "Waiting for plugin controller to reconcile GKESpotPlacementPolicy",
+			wantGen:        2,
+		},
+		{
+			name: "existing_condition_matching_generation_is_preserved",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "wc-attached",
+					Namespace:  "default",
+					Generation: 3,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					InfrastructureProfileRef: &workloadsv1.InfrastructureProfileReference{
+						Group: "workloads.gke.io",
+						Kind:  "GKESpotPlacementPolicy",
+						Name:  "gke-t2d-spot",
+					},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+							Status:             metav1.ConditionTrue,
+							Reason:             workloadsv1.ReasonProfileResolved,
+							Message:            "GKESpotPlacementPolicy gke-t2d-spot attached",
+							ObservedGeneration: 3,
+						},
+					},
+				},
+			},
+			wantNil:        false,
+			wantStatus:     metav1.ConditionTrue,
+			wantReason:     workloadsv1.ReasonProfileResolved,
+			wantMessageSub: "GKESpotPlacementPolicy gke-t2d-spot attached",
+			wantGen:        3,
+		},
+		{
+			name: "existing_condition_with_stale_generation_resets_to_plugin_pending",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "wc-stale-gen",
+					Namespace:  "default",
+					Generation: 4,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					InfrastructureProfileRef: &workloadsv1.InfrastructureProfileReference{
+						Group: "workloads.gke.io",
+						Kind:  "GKESpotPlacementPolicy",
+						Name:  "gke-t2d-spot",
+					},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+							Status:             metav1.ConditionTrue,
+							Reason:             workloadsv1.ReasonProfileResolved,
+							Message:            "GKESpotPlacementPolicy gke-t2d-spot attached",
+							ObservedGeneration: 3,
+						},
+					},
+				},
+			},
+			wantNil:        false,
+			wantStatus:     metav1.ConditionFalse,
+			wantReason:     workloadsv1.ReasonPluginPending,
+			wantMessageSub: "Waiting for plugin controller to reconcile GKESpotPlacementPolicy",
+			wantGen:        4,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := placementPluginCondition(context.Background(), tc.wc)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("placementPluginCondition() = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("placementPluginCondition() = nil, want non-nil condition")
+			}
+			if got.Type != workloadsv1.ConditionTypePlacementPluginAttached {
+				t.Errorf("got Type = %q, want %q", got.Type, workloadsv1.ConditionTypePlacementPluginAttached)
+			}
+			if got.Status != tc.wantStatus {
+				t.Errorf("got Status = %q, want %q", got.Status, tc.wantStatus)
+			}
+			if got.Reason != tc.wantReason {
+				t.Errorf("got Reason = %q, want %q", got.Reason, tc.wantReason)
+			}
+			if !strings.Contains(got.Message, tc.wantMessageSub) {
+				t.Errorf("got Message = %q, want substring %q", got.Message, tc.wantMessageSub)
+			}
+			if got.ObservedGeneration != tc.wantGen {
+				t.Errorf("got ObservedGeneration = %d, want %d", got.ObservedGeneration, tc.wantGen)
+			}
+		})
+	}
+}
+
+func TestReconcileConditions(t *testing.T) {
+	testCases := []struct {
+		name        string
+		validation  metav1.Condition
+		placement   *metav1.Condition
+		wantStatus  metav1.ConditionStatus
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name: "nil_placement_leaves_validation_unchanged",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionTrue,
+				Reason:  workloadsv1.ReasonValidationPassed,
+				Message: "WorkloadClass adheres to all Guardrail constraints",
+			},
+			placement:   nil,
+			wantStatus:  metav1.ConditionTrue,
+			wantReason:  workloadsv1.ReasonValidationPassed,
+			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
+		},
+		{
+			name: "attached_placement_leaves_validation_unchanged",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionTrue,
+				Reason:  workloadsv1.ReasonValidationPassed,
+				Message: "WorkloadClass adheres to all Guardrail constraints",
+			},
+			placement: &metav1.Condition{
+				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+				Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonProfileResolved,
+			},
+			wantStatus:  metav1.ConditionTrue,
+			wantReason:  workloadsv1.ReasonValidationPassed,
+			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
+		},
+		{
+			name: "attached_placement_transitions_validation_to_true_when_failed_only_due_to_unattached_plugin",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonValidationFailed,
+				Message: "WorkloadClass references an infrastructure profile, but the plugin has not attached",
+			},
+			placement: &metav1.Condition{
+				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+				Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonProfileResolved,
+			},
+			wantStatus:  metav1.ConditionTrue,
+			wantReason:  workloadsv1.ReasonValidationPassed,
+			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
+		},
+		{
+			name: "attached_placement_keeps_validation_false_when_other_guardrail_violations_exist",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonValidationFailed,
+				Message: "number of windows exceeds guardrail limit 2; WorkloadClass references an infrastructure profile, but the plugin has not attached",
+			},
+			placement: &metav1.Condition{
+				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+				Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonProfileResolved,
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "number of windows exceeds guardrail limit 2",
+		},
+		{
+			name: "attached_placement_removes_only_placement_segment_and_preserves_trailing_messages",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonValidationFailed,
+				Message: "number of windows exceeds guardrail limit 2; WorkloadClass references an infrastructure profile, but the plugin has not attached: Waiting for plugin; another plugin violation",
+			},
+			placement: &metav1.Condition{
+				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+				Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonProfileResolved,
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "number of windows exceeds guardrail limit 2; another plugin violation",
+		},
+		{
+			name: "unattached_placement_marks_passing_validation_as_failed_with_clean_message",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionTrue,
+				Reason:  workloadsv1.ReasonValidationPassed,
+				Message: "WorkloadClass adheres to all Guardrail constraints",
+			},
+			placement: &metav1.Condition{
+				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+				Status: metav1.ConditionFalse,
+				Reason: workloadsv1.ReasonPluginPending,
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "WorkloadClass references an infrastructure profile, but the plugin has not attached",
+		},
+		{
+			name: "unattached_placement_with_message_surfaces_details_in_validation",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionTrue,
+				Reason:  workloadsv1.ReasonValidationPassed,
+				Message: "WorkloadClass adheres to all Guardrail constraints",
+			},
+			placement: &metav1.Condition{
+				Type:    workloadsv1.ConditionTypePlacementPluginAttached,
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonPluginResolutionFailed,
+				Message: "GKESpotPlacementPolicy 'gke-t2d-spot' not found",
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "WorkloadClass references an infrastructure profile, but the plugin has not attached: GKESpotPlacementPolicy 'gke-t2d-spot' not found",
+		},
+		{
+			name: "attached_placement_clears_previous_detailed_placement_error_message",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonValidationFailed,
+				Message: "WorkloadClass references an infrastructure profile, but the plugin has not attached: GKESpotPlacementPolicy 'gke-t2d-spot' not found",
+			},
+			placement: &metav1.Condition{
+				Type:    workloadsv1.ConditionTypePlacementPluginAttached,
+				Status:  metav1.ConditionTrue,
+				Reason:  workloadsv1.ReasonProfileResolved,
+				Message: "GKESpotPlacementPolicy 'gke-t2d-spot' attached",
+			},
+			wantStatus:  metav1.ConditionTrue,
+			wantReason:  workloadsv1.ReasonValidationPassed,
+			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
+		},
+		{
+			name: "unattached_placement_appends_to_existing_validation_failures",
+			validation: metav1.Condition{
+				Type:    workloadsv1.ConditionTypeValidated,
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonValidationFailed,
+				Message: "number of windows exceeds guardrail limit 2",
+			},
+			placement: &metav1.Condition{
+				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+				Status: metav1.ConditionFalse,
+				Reason: workloadsv1.ReasonPluginPending,
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "number of windows exceeds guardrail limit 2; WorkloadClass references an infrastructure profile, but the plugin has not attached",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := tc.validation
+			reconcileConditions(&v, tc.placement)
+			if v.Status != tc.wantStatus {
+				t.Errorf("got Status = %q, want %q", v.Status, tc.wantStatus)
+			}
+			if v.Reason != tc.wantReason {
+				t.Errorf("got Reason = %q, want %q", v.Reason, tc.wantReason)
+			}
+			if v.Message != tc.wantMessage {
+				t.Errorf("got Message = %q, want %q", v.Message, tc.wantMessage)
+			}
+		})
 	}
 }

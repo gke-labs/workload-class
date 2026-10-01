@@ -64,19 +64,34 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 1. Fetch Guardrails and validate
+	// 1.1 Fetch Guardrails and validate
 	validationCond, err := r.validateAgainstGuardrails(ctx, wc)
 	if err != nil {
 		log.Error(err, "Failed to validate against guardrails")
 		return ctrl.Result{}, err
 	}
-	meta.SetStatusCondition(&wc.Status.Conditions, validationCond)
 
-	// 1.1 Persist the status change
-	err = r.Status().Update(ctx, wc)
-	if err != nil {
-		log.Error(err, "Failed to update Status conditions")
-		return ctrl.Result{}, err
+	// 1.2 Check for plugin placement attachment conditions
+	changed, removed := false, false
+	pluginPlacementCondition := placementPluginCondition(ctx, wc)
+	if pluginPlacementCondition != nil {
+		changed = meta.SetStatusCondition(&wc.Status.Conditions, *pluginPlacementCondition)
+	} else {
+		// Clean up stale PluginPlacementAttached condition
+		removed = meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
+	}
+
+	// 1.3 If the plugin has not attached, mark the WorkloadClass as not yet validated
+	reconcileConditions(&validationCond, pluginPlacementCondition)
+	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
+
+	// 1.4 Persist the status change
+	if changed || removed {
+		err = r.Status().Update(ctx, wc)
+		if err != nil {
+			log.Error(err, "Failed to update Status conditions")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 2. Check if other existing WorkloadClasses have the same PodSelector
@@ -281,6 +296,97 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	return workloadsv1.ReadinessReady, nextWindow, nil
 }
 
+// placementPluginCondition returns a PlacementPluginAttached metav1.Condition from the WorkloadClass status if it matches
+// the current Generation. If no such Condition exists, a new one is created. If the WorkloadClass does not have an
+// InfrastructureProfileRef, no Condition is returned.
+func placementPluginCondition(ctx context.Context, wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	log := logf.FromContext(ctx)
+	if wc.Spec.InfrastructureProfileRef == nil {
+		log.Info(fmt.Sprintf("WorkloadClass %s/%s does not have an InfrastructureProfileRef set", wc.Namespace, wc.Name))
+		return nil
+	}
+
+	if existing := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached); existing != nil && existing.ObservedGeneration == wc.Generation {
+		log.Info(fmt.Sprintf("WorkloadClass %s/%s has a Placement Plugin condition. Status: %s, reason: %s, message: %s", wc.Namespace, wc.Name, existing.Status, existing.Reason, existing.Message))
+		cond := *existing
+		return &cond
+	}
+
+	// The placement plugin has not attached for the current generation
+	return &metav1.Condition{
+		Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+		Status:             metav1.ConditionFalse,
+		Reason:             workloadsv1.ReasonPluginPending,
+		Message:            fmt.Sprintf("Waiting for plugin controller to reconcile %s", wc.Spec.InfrastructureProfileRef.Kind),
+		ObservedGeneration: wc.Generation,
+		LastTransitionTime: metav1.Now(),
+	}
+}
+
+const (
+	placementUnattachedMsg = "WorkloadClass references an infrastructure profile, but the plugin has not attached"
+	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
+)
+
+func reconcileConditions(validation, placement *metav1.Condition) {
+	if validation == nil || placement == nil {
+		return
+	}
+
+	if placement.Status == metav1.ConditionTrue {
+		clearPlacementViolation(validation)
+		return
+	}
+
+	addPlacementViolation(validation, placement)
+}
+
+func clearPlacementViolation(validation *metav1.Condition) {
+	if validation.Status != metav1.ConditionFalse {
+		return
+	}
+
+	parts := strings.Split(validation.Message, "; ")
+	var remaining []string
+	for _, part := range parts {
+		if !strings.HasPrefix(part, placementUnattachedMsg) {
+			remaining = append(remaining, part)
+		}
+	}
+
+	// If the placement plugin violation was the only violation, validation is now passing
+	if len(remaining) == 0 {
+		validation.Status = metav1.ConditionTrue
+		validation.Reason = workloadsv1.ReasonValidationPassed
+		validation.Message = validationPassedMsg
+		validation.LastTransitionTime = metav1.Now()
+		return
+	}
+
+	validation.Message = strings.Join(remaining, "; ")
+}
+
+func addPlacementViolation(validation, placement *metav1.Condition) {
+	// Clear any previous placement violation message (e.g. transitioning from PluginPending to PluginResolutionFailed)
+	// before applying the latest placement violation message.
+	clearPlacementViolation(validation)
+
+	violationMsg := placementUnattachedMsg
+	if placement.Message != "" {
+		violationMsg = fmt.Sprintf("%s: %s", placementUnattachedMsg, placement.Message)
+	}
+
+	if validation.Status == metav1.ConditionFalse {
+		validation.Message = validation.Message + "; " + violationMsg
+	} else {
+		validation.Message = violationMsg
+	}
+
+	validation.Status = metav1.ConditionFalse
+	validation.Reason = workloadsv1.ReasonValidationFailed
+	validation.LastTransitionTime = metav1.Now()
+}
+
 func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 {
 		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
@@ -334,6 +440,7 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 			Status:             metav1.ConditionTrue,
 			Reason:             workloadsv1.ReasonNoGuardrails,
 			Message:            "No Guardrails found to validate against",
+			ObservedGeneration: wc.Generation,
 			LastTransitionTime: metav1.Now(),
 		}, nil
 	}
@@ -359,7 +466,7 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, *maxNonDisruptionDurationDays))
 	}
 
-	return condition(violations), nil
+	return condition(wc.Generation, violations), nil
 }
 
 // validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.
@@ -453,24 +560,23 @@ func (r *WorkloadClassReconciler) findWorkloadClassesToReconcile(ctx context.Con
 	return requests
 }
 
-func condition(violations []string) metav1.Condition {
-	if len(violations) > 0 {
-		return metav1.Condition{
-			Type:               workloadsv1.ConditionTypeValidated,
-			Status:             metav1.ConditionFalse,
-			Reason:             workloadsv1.ReasonValidationFailed,
-			Message:            strings.Join(violations, "; "),
-			LastTransitionTime: metav1.Now(),
-		}
-	}
-
-	return metav1.Condition{
+func condition(generation int64, violations []string) metav1.Condition {
+	condition := metav1.Condition{
 		Type:               workloadsv1.ConditionTypeValidated,
 		Status:             metav1.ConditionTrue,
 		Reason:             workloadsv1.ReasonValidationPassed,
-		Message:            "WorkloadClass adheres to all Guardrail constraints",
+		Message:            validationPassedMsg,
 		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: generation,
 	}
+
+	if len(violations) > 0 {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = workloadsv1.ReasonValidationFailed
+		condition.Message = strings.Join(violations, "; ")
+	}
+
+	return condition
 }
 
 func guardrailDisruptionConstraints(guardrails []workloadsv1.WorkloadClassGuardrail) ([][]string, *int32, *int32) {
