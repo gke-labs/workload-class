@@ -87,15 +87,6 @@ type SpotReversionPolicy struct {
 
 // GKESpotPlacementPolicyStatus defines the observed state of GKESpotPlacementPolicy.
 type GKESpotPlacementPolicyStatus struct {
-	// ObservedGeneration is the most recent generation observed by the controller for this GKESpotPlacementPolicy.
-	// +optional
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-
-	// AttachedWorkloadClasses lists the "<namespace>/<name>" of WorkloadClasses currently referencing this policy.
-	// +optional
-	// +listType=set
-	AttachedWorkloadClasses []string `json:"attachedWorkloadClasses,omitempty"`
-
 	// Conditions represent the current state of the GKESpotPlacementPolicy resource (e.g., Validated, SpotCapacityAvailable).
 	// +listType=map
 	// +listMapKey=type
