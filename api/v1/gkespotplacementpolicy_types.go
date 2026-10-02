@@ -18,6 +18,7 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // ReversionAction specifies the strategy for moving fallback workloads back to Spot capacity.
@@ -33,6 +34,21 @@ const (
 
 	// NoneReversionAction stays on On-Demand permanently after fallback (default).
 	NoneReversionAction ReversionAction = "None"
+)
+
+// EnforcementMode specifies whether Spot usage is Required, Allowed (default), or Forbidden
+// +kubebuilder:validation:Enum=Allowed;Required;Forbidden
+type EnforcementMode string
+
+const (
+	// AllowedEnforcementMode lets WorkloadClasses decide whether or not to use Spot placement.
+	AllowedEnforcementMode EnforcementMode = "Allowed"
+
+	// RequiredEnforcementMode forces WorkloadClasses to use Spot placement.
+	RequiredEnforcementMode EnforcementMode = "Required"
+
+	// ForbiddenEnforcementMode forbids WorkloadClasses from using Spot placement.
+	ForbiddenEnforcementMode EnforcementMode = "Forbidden"
 )
 
 const (
@@ -131,4 +147,50 @@ type GKESpotPlacementPolicyList struct {
 
 func init() {
 	SchemeBuilder.Register(&GKESpotPlacementPolicy{}, &GKESpotPlacementPolicyList{})
+}
+
+// GKESpotGuardrailParameters defines the schema for "gke-spot-placement" guardrail parameters.
+type GKESpotGuardrailParameters struct {
+	// EnforcementMode specifies whether Spot usage is Required, Allowed (default), or Forbidden.
+	// +optional
+	// +kubebuilder:default="Allowed"
+	EnforcementMode EnforcementMode `json:"enforcementMode,omitempty"`
+
+	// MinSpotRatio sets the minimum allowed Spot ratio (e.g., "80%").
+	// +optional
+	// +kubebuilder:validation:Pattern=`^(100|[1-9]?[0-9])%$`
+	MinSpotRatio string `json:"minSpotRatio,omitempty"`
+
+	// Fallback restricts On-Demand fallback configuration and capacity budget.
+	// +optional
+	Fallback *GKESpotFallbackConstraints `json:"fallback,omitempty"`
+
+	// Reversion mandates reversion behavior and maximum fallback duration.
+	// +optional
+	Reversion *GKESpotReversionConstraints `json:"reversion,omitempty"`
+}
+
+// GKESpotFallbackConstraints defines guardrail constraints on On-Demand fallback behavior when Spot capacity is unavailable.
+type GKESpotFallbackConstraints struct {
+	// AllowFallbackToOnDemand specifies whether workload owners are allowed to fall back to On-Demand capacity.
+	// +optional
+	AllowFallbackToOnDemand *bool `json:"allowFallbackToOnDemand,omitempty"`
+
+	// MaxFallbackRatio is the budget control specifying the maximum percentage (e.g., "25%")
+	// or absolute number (e.g., 5) of Pods in the WorkloadClass allowed on On-Demand fallback concurrently.
+	// +optional
+	MaxFallbackRatio *intstr.IntOrString `json:"maxFallbackRatio,omitempty"`
+}
+
+// GKESpotReversionConstraints defines guardrail constraints on transitioning fallback workloads back to Spot capacity.
+type GKESpotReversionConstraints struct {
+	// RequiredReversionAction enforces a specific reversion strategy (e.g., must be "Active").
+	// +optional
+	RequiredReversionAction ReversionAction `json:"requiredReversionAction,omitempty"`
+
+	// MaxFallbackDuration sets an upper bound on how long a Pod can run on On-Demand fallback
+	// before reversion to Spot is forced (e.g., "30m", "2h").
+	// +optional
+	// +kubebuilder:validation:Type=string
+	MaxFallbackDuration *metav1.Duration `json:"maxFallbackDuration,omitempty"`
 }
