@@ -52,6 +52,9 @@ const (
 )
 
 const (
+	// PluginNameGKESpotPlacement is the plugin identifier used in WorkloadClassGuardrail.spec.pluginConstraints.
+	PluginNameGKESpotPlacement = "gke-spot-placement"
+
 	// ConditionTypeSpotCapacityAvailable indicates whether GKE Spot capacity is currently available in the cluster.
 	ConditionTypeSpotCapacityAvailable = "SpotCapacityAvailable"
 
