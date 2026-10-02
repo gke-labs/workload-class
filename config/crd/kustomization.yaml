@@ -4,6 +4,7 @@
 resources:
 - bases/workloads.gke.io_workloadclasses.yaml
 - bases/workloads.gke.io_workloadclassguardrails.yaml
+- bases/workloads.gke.io_gkespotplacementpolicies.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
