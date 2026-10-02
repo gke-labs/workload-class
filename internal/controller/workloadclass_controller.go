@@ -85,15 +85,6 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	reconcileConditions(&validationCond, pluginPlacementCondition)
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
-	// 1.4 Persist the status change
-	if changed || removed {
-		err = r.Status().Update(ctx, wc)
-		if err != nil {
-			log.Error(err, "Failed to update Status conditions")
-			return ctrl.Result{}, err
-		}
-	}
-
 	// 2. Check if other existing WorkloadClasses have the same PodSelector
 	overlappingClasses, err := r.validateSelectors(ctx, wc)
 	if err != nil {
@@ -116,8 +107,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 3. Update Status if changed
-	if wc.Status.MaintenanceReadiness != readiness {
+	// 3. Update Status
+	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
 		wc.Status.MaintenanceReadiness = readiness
 		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
 		if err := r.Status().Update(ctx, wc); err != nil {
@@ -329,48 +320,14 @@ const (
 )
 
 func reconcileConditions(validation, placement *metav1.Condition) {
-	if validation == nil || placement == nil {
-		return
-	}
-
-	if placement.Status == metav1.ConditionTrue {
-		clearPlacementViolation(validation)
+	if validation == nil || placement == nil || placement.Status == metav1.ConditionTrue {
 		return
 	}
 
 	addPlacementViolation(validation, placement)
 }
 
-func clearPlacementViolation(validation *metav1.Condition) {
-	if validation.Status != metav1.ConditionFalse {
-		return
-	}
-
-	parts := strings.Split(validation.Message, "; ")
-	var remaining []string
-	for _, part := range parts {
-		if !strings.HasPrefix(part, placementUnattachedMsg) {
-			remaining = append(remaining, part)
-		}
-	}
-
-	// If the placement plugin violation was the only violation, validation is now passing
-	if len(remaining) == 0 {
-		validation.Status = metav1.ConditionTrue
-		validation.Reason = workloadsv1.ReasonValidationPassed
-		validation.Message = validationPassedMsg
-		validation.LastTransitionTime = metav1.Now()
-		return
-	}
-
-	validation.Message = strings.Join(remaining, "; ")
-}
-
 func addPlacementViolation(validation, placement *metav1.Condition) {
-	// Clear any previous placement violation message (e.g. transitioning from PluginPending to PluginResolutionFailed)
-	// before applying the latest placement violation message.
-	clearPlacementViolation(validation)
-
 	violationMsg := placementUnattachedMsg
 	if placement.Message != "" {
 		violationMsg = fmt.Sprintf("%s: %s", placementUnattachedMsg, placement.Message)

@@ -1859,7 +1859,7 @@ func TestReconcileConditions(t *testing.T) {
 			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
 		},
 		{
-			name: "attached_placement_leaves_validation_unchanged",
+			name: "attached_placement_leaves_passing_validation_unchanged",
 			validation: metav1.Condition{
 				Type:    workloadsv1.ConditionTypeValidated,
 				Status:  metav1.ConditionTrue,
@@ -1876,29 +1876,12 @@ func TestReconcileConditions(t *testing.T) {
 			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
 		},
 		{
-			name: "attached_placement_transitions_validation_to_true_when_failed_only_due_to_unattached_plugin",
+			name: "attached_placement_leaves_failing_validation_unchanged",
 			validation: metav1.Condition{
 				Type:    workloadsv1.ConditionTypeValidated,
 				Status:  metav1.ConditionFalse,
 				Reason:  workloadsv1.ReasonValidationFailed,
-				Message: "WorkloadClass references an infrastructure profile, but the plugin has not attached",
-			},
-			placement: &metav1.Condition{
-				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
-				Status: metav1.ConditionTrue,
-				Reason: workloadsv1.ReasonProfileResolved,
-			},
-			wantStatus:  metav1.ConditionTrue,
-			wantReason:  workloadsv1.ReasonValidationPassed,
-			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
-		},
-		{
-			name: "attached_placement_keeps_validation_false_when_other_guardrail_violations_exist",
-			validation: metav1.Condition{
-				Type:    workloadsv1.ConditionTypeValidated,
-				Status:  metav1.ConditionFalse,
-				Reason:  workloadsv1.ReasonValidationFailed,
-				Message: "number of windows exceeds guardrail limit 2; WorkloadClass references an infrastructure profile, but the plugin has not attached",
+				Message: "number of windows exceeds guardrail limit 2",
 			},
 			placement: &metav1.Condition{
 				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
@@ -1908,23 +1891,6 @@ func TestReconcileConditions(t *testing.T) {
 			wantStatus:  metav1.ConditionFalse,
 			wantReason:  workloadsv1.ReasonValidationFailed,
 			wantMessage: "number of windows exceeds guardrail limit 2",
-		},
-		{
-			name: "attached_placement_removes_only_placement_segment_and_preserves_trailing_messages",
-			validation: metav1.Condition{
-				Type:    workloadsv1.ConditionTypeValidated,
-				Status:  metav1.ConditionFalse,
-				Reason:  workloadsv1.ReasonValidationFailed,
-				Message: "number of windows exceeds guardrail limit 2; WorkloadClass references an infrastructure profile, but the plugin has not attached: Waiting for plugin; another plugin violation",
-			},
-			placement: &metav1.Condition{
-				Type:   workloadsv1.ConditionTypePlacementPluginAttached,
-				Status: metav1.ConditionTrue,
-				Reason: workloadsv1.ReasonProfileResolved,
-			},
-			wantStatus:  metav1.ConditionFalse,
-			wantReason:  workloadsv1.ReasonValidationFailed,
-			wantMessage: "number of windows exceeds guardrail limit 2; another plugin violation",
 		},
 		{
 			name: "unattached_placement_marks_passing_validation_as_failed_with_clean_message",
@@ -1960,24 +1926,6 @@ func TestReconcileConditions(t *testing.T) {
 			wantStatus:  metav1.ConditionFalse,
 			wantReason:  workloadsv1.ReasonValidationFailed,
 			wantMessage: "WorkloadClass references an infrastructure profile, but the plugin has not attached: GKESpotPlacementPolicy 'gke-t2d-spot' not found",
-		},
-		{
-			name: "attached_placement_clears_previous_detailed_placement_error_message",
-			validation: metav1.Condition{
-				Type:    workloadsv1.ConditionTypeValidated,
-				Status:  metav1.ConditionFalse,
-				Reason:  workloadsv1.ReasonValidationFailed,
-				Message: "WorkloadClass references an infrastructure profile, but the plugin has not attached: GKESpotPlacementPolicy 'gke-t2d-spot' not found",
-			},
-			placement: &metav1.Condition{
-				Type:    workloadsv1.ConditionTypePlacementPluginAttached,
-				Status:  metav1.ConditionTrue,
-				Reason:  workloadsv1.ReasonProfileResolved,
-				Message: "GKESpotPlacementPolicy 'gke-t2d-spot' attached",
-			},
-			wantStatus:  metav1.ConditionTrue,
-			wantReason:  workloadsv1.ReasonValidationPassed,
-			wantMessage: "WorkloadClass adheres to all Guardrail constraints",
 		},
 		{
 			name: "unattached_placement_appends_to_existing_validation_failures",
