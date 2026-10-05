@@ -17,12 +17,21 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
@@ -30,34 +39,249 @@ import (
 // GKESpotPlacementPolicyReconciler reconciles a GKESpotPlacementPolicy object
 type GKESpotPlacementPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the GKESpotPlacementPolicy object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
 func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	spotPolicy := &workloadsv1.GKESpotPlacementPolicy{}
+	if err := r.Get(ctx, req.NamespacedName, spotPolicy); err != nil {
+		log.Error(err, "Failed to get GKESpotPlacementPolicy", "GKESpotPlacementPolicy", req.Name)
+		// Get workloadClasses that reference this specific SpotPlacementPolicy and update their status
+		msg := fmt.Sprintf("Failed to get GKESpotPlacementPolicy '%s': %v", req.Name, err)
+		if apierrors.IsNotFound(err) {
+			msg = fmt.Sprintf("GKESpotPlacementPolicy '%s' not found", req.Name)
+		}
+		if updateErr := r.updateReferencingWorkloadClasses(ctx, req.Name, statusOptions{
+			Status:  metav1.ConditionFalse,
+			Reason:  workloadsv1.ReasonPluginResolutionFailed,
+			Message: msg,
+		}); updateErr != nil {
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Validate GKESpotPlacementPolicy against Guardrails
+	validationCond, err := r.validateAgainstGuardrails(ctx, spotPolicy)
+	if err != nil {
+		log.Error(err, "Failed to validate GKESpotPlacementPolicy against guardrails", "GKESpotPlacementPolicy", spotPolicy.Name)
+		return ctrl.Result{}, err
+	}
+
+	if meta.SetStatusCondition(&spotPolicy.Status.Conditions, validationCond) {
+		if err := r.Status().Update(ctx, spotPolicy); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	wcStatusOpts := statusOptions{
+		Status:  metav1.ConditionTrue,
+		Reason:  workloadsv1.ReasonProfileResolved,
+		Message: fmt.Sprintf("GKESpotPlacementPolicy '%s' attached", spotPolicy.Name),
+	}
+	if validationCond.Status != metav1.ConditionTrue {
+		wcStatusOpts = statusOptions{
+			Status:  metav1.ConditionFalse,
+			Reason:  workloadsv1.ReasonPluginResolutionFailed,
+			Message: fmt.Sprintf("GKESpotPlacementPolicy '%s' is invalid: %s", spotPolicy.Name, validationCond.Message),
+		}
+	}
+
+	if err := r.updateReferencingWorkloadClasses(ctx, spotPolicy.Name, wcStatusOpts); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *GKESpotPlacementPolicyReconciler) validateAgainstGuardrails(ctx context.Context, spotPolicy *workloadsv1.GKESpotPlacementPolicy) (metav1.Condition, error) {
+	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
+	if err := r.List(ctx, guardrails); err != nil {
+		return metav1.Condition{}, err
+	}
+
+	if len(guardrails.Items) == 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeValidated,
+			Status:             metav1.ConditionTrue,
+			Reason:             workloadsv1.ReasonNoGuardrails,
+			Message:            "No Guardrails found to validate against",
+			ObservedGeneration: spotPolicy.Generation,
+			LastTransitionTime: metav1.Now(),
+		}, nil
+	}
+
+	violations := validateSpotPolicyAgainstGuardrails(spotPolicy, guardrails.Items)
+	return condition(spotPolicy.Generation, violations), nil
+}
+
+func validateSpotPolicyAgainstGuardrails(spotPolicy *workloadsv1.GKESpotPlacementPolicy, guardrails []workloadsv1.WorkloadClassGuardrail) []string {
+	var violations []string
+	seen := make(map[string]bool)
+
+	reversionAction := spotPolicy.Spec.Reversion.Action
+	if reversionAction == "" {
+		reversionAction = workloadsv1.NoneReversionAction
+	}
+
+	for _, g := range guardrails {
+		if g.Spec.PluginConstraints == nil {
+			continue
+		}
+		validateAgainstPlacementConstraints(g.Spec.PluginConstraints.Placement, spotPolicy.Spec.Reversion, reversionAction, &violations, seen)
+	}
+
+	return violations
+}
+
+func validateAgainstPlacementConstraints(placement []workloadsv1.PluginConstraint, reversion workloadsv1.SpotReversionPolicy, reversionAction workloadsv1.ReversionAction, violations *[]string, seen map[string]bool) {
+	for _, c := range placement {
+		if c.PluginName != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
+			continue
+		}
+
+		var params workloadsv1.GKESpotGuardrailParameters
+		dec := json.NewDecoder(bytes.NewReader(c.Parameters.Raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&params); err != nil {
+			addViolation(fmt.Sprintf("invalid %s parameters: %v", workloadsv1.PluginNameGKESpotPlacement, err), seen, violations)
+			continue
+		}
+
+		if params.EnforcementMode == workloadsv1.ForbiddenEnforcementMode {
+			addViolation("GKESpotPlacementPolicy is not allowed when guardrail enforcementMode is Forbidden", seen, violations)
+		}
+
+		validateReversionConstraints(params.Reversion, reversion, reversionAction, seen, violations)
+	}
+}
+
+func validateReversionConstraints(constraints *workloadsv1.GKESpotReversionConstraints, reversion workloadsv1.SpotReversionPolicy, reversionAction workloadsv1.ReversionAction, seen map[string]bool, violations *[]string) {
+	if constraints == nil {
+		return
+	}
+
+	if constraints.RequiredReversionAction != "" && reversionAction != constraints.RequiredReversionAction {
+		addViolation(fmt.Sprintf("reversion action %s does not match guardrail requiredReversionAction %s", reversionAction, constraints.RequiredReversionAction), seen, violations)
+	}
+
+	if constraints.MaxFallbackDuration == nil {
+		return
+	}
+
+	if reversionAction == workloadsv1.NoneReversionAction {
+		addViolation("reversion action cannot be None when guardrail specifies maxFallbackDuration", seen, violations)
+	}
+
+	if reversion.MinDurationOnFallback != nil &&
+		reversion.MinDurationOnFallback.Duration > constraints.MaxFallbackDuration.Duration {
+		addViolation(fmt.Sprintf("minDurationOnFallback %s exceeds guardrail maxFallbackDuration %s", reversion.MinDurationOnFallback.Duration, constraints.MaxFallbackDuration.Duration), seen, violations)
+	}
+}
+
+func addViolation(msg string, seen map[string]bool, violations *[]string) {
+	if !seen[msg] {
+		seen[msg] = true
+		*violations = append(*violations, msg)
+	}
+}
+
+type statusOptions struct {
+	// Status that will be set in the WorkloadClass.Status
+	Status metav1.ConditionStatus
+
+	// Reason that will be set in the WorkloadClass.Status
+	Reason string
+
+	// Message that will be set in the WorkloadClass.Status
+	Message string
+}
+
+func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx context.Context, policyName string, options statusOptions) error {
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses); err != nil {
+		return err
+	}
+
+	for i := range workloadClasses.Items {
+		wc := &workloadClasses.Items[i]
+		ref := wc.Spec.InfrastructureProfileRef
+		if ref == nil || ref.Kind != workloadsv1.GKESpotPlacementPolicyKind || ref.Name != policyName {
+			continue
+		}
+		if ref.Group != "" && ref.Group != workloadsv1.GroupVersion.Group {
+			continue
+		}
+		return r.updateWorkloadClassStatus(ctx, wc, options)
+	}
+	return nil
+}
+
+func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context.Context, wc *workloadsv1.WorkloadClass, options statusOptions) error {
+	cond := metav1.Condition{
+		Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+		Status:             options.Status,
+		Reason:             options.Reason,
+		Message:            options.Message,
+		ObservedGeneration: wc.Generation,
+		LastTransitionTime: metav1.Now(),
+	}
+	if meta.SetStatusCondition(&wc.Status.Conditions, cond) {
+		return r.Status().Update(ctx, wc)
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *GKESpotPlacementPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.GKESpotPlacementPolicy{}).
+		Watches(
+			&workloadsv1.WorkloadClass{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueIfReferencesSpotPolicy),
+		).
+		Watches(
+			&workloadsv1.WorkloadClassGuardrail{},
+			handler.EnqueueRequestsFromMapFunc(r.findSpotPoliciesToReconcile),
+		).
 		Named("gkespotplacementpolicy").
 		Complete(r)
+}
+
+func (r *GKESpotPlacementPolicyReconciler) enqueueIfReferencesSpotPolicy(ctx context.Context, obj client.Object) []reconcile.Request {
+	wc, ok := obj.(*workloadsv1.WorkloadClass)
+	if !ok {
+		return []reconcile.Request{}
+	}
+
+	infraProfileRef := wc.Spec.InfrastructureProfileRef
+	if infraProfileRef == nil || infraProfileRef.Kind != workloadsv1.GKESpotPlacementPolicyKind {
+		return []reconcile.Request{}
+	}
+
+	return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: infraProfileRef.Name}}}
+}
+
+func (r *GKESpotPlacementPolicyReconciler) findSpotPoliciesToReconcile(ctx context.Context, _ client.Object) []reconcile.Request {
+	policies := &workloadsv1.GKESpotPlacementPolicyList{}
+	if err := r.List(ctx, policies); err != nil {
+		return nil
+	}
+
+	requests := make([]reconcile.Request, len(policies.Items))
+	for i, item := range policies.Items {
+		requests[i] = reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Name: item.GetName(),
+			},
+		}
+	}
+	return requests
 }
