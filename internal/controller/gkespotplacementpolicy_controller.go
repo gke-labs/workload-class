@@ -54,20 +54,19 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 
 	spotPolicy := &workloadsv1.GKESpotPlacementPolicy{}
 	if err := r.Get(ctx, req.NamespacedName, spotPolicy); err != nil {
-		log.Error(err, "Failed to get GKESpotPlacementPolicy", "GKESpotPlacementPolicy", req.Name)
-		// Get workloadClasses that reference this specific SpotPlacementPolicy and update their status
-		msg := fmt.Sprintf("Failed to get GKESpotPlacementPolicy '%s': %v", req.Name, err)
 		if apierrors.IsNotFound(err) {
-			msg = fmt.Sprintf("GKESpotPlacementPolicy '%s' not found", req.Name)
+			// Get workloadClasses that reference this specific SpotPlacementPolicy and update their status
+			if updateErr := r.updateReferencingWorkloadClasses(ctx, req.Name, statusOptions{
+				Status:  metav1.ConditionFalse,
+				Reason:  workloadsv1.ReasonPluginResolutionFailed,
+				Message: fmt.Sprintf("GKESpotPlacementPolicy '%s' not found", req.Name),
+			}); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{}, nil
 		}
-		if updateErr := r.updateReferencingWorkloadClasses(ctx, req.Name, statusOptions{
-			Status:  metav1.ConditionFalse,
-			Reason:  workloadsv1.ReasonPluginResolutionFailed,
-			Message: msg,
-		}); updateErr != nil {
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		log.Error(err, "Failed to get GKESpotPlacementPolicy", "GKESpotPlacementPolicy", req.Name)
+		return ctrl.Result{}, err
 	}
 
 	// Validate GKESpotPlacementPolicy against Guardrails
