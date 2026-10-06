@@ -219,7 +219,9 @@ func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx 
 		if ref.Group != "" && ref.Group != workloadsv1.GroupVersion.Group {
 			continue
 		}
-		return r.updateWorkloadClassStatus(ctx, wc, options)
+		if err := r.updateWorkloadClassStatus(ctx, wc, options); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -258,12 +260,12 @@ func (r *GKESpotPlacementPolicyReconciler) SetupWithManager(mgr ctrl.Manager) er
 func (r *GKESpotPlacementPolicyReconciler) enqueueIfReferencesSpotPolicy(ctx context.Context, obj client.Object) []reconcile.Request {
 	wc, ok := obj.(*workloadsv1.WorkloadClass)
 	if !ok {
-		return []reconcile.Request{}
+		return nil
 	}
 
 	infraProfileRef := wc.Spec.InfrastructureProfileRef
 	if infraProfileRef == nil || infraProfileRef.Kind != workloadsv1.GKESpotPlacementPolicyKind {
-		return []reconcile.Request{}
+		return nil
 	}
 
 	return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: infraProfileRef.Name}}}
