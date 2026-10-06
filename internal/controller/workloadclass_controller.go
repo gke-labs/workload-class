@@ -17,8 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -423,7 +427,166 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, *maxNonDisruptionDurationDays))
 	}
 
+	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+
 	return condition(wc.Generation, violations), nil
+}
+
+// validateCapacityStrategy validates WorkloadClass.Spec.CapacityStrategy against the aggregated
+// capacity constraints across all WorkloadClassGuardrails.
+//
+// It aggregates the most restrictive constraints (EnforcementMode, MinSpotRatio, and whether
+// fallback to OnDemand is allowed) and checks:
+//   - If CapacityStrategy is omitted (nil), validation fails when EnforcementMode is Required.
+//   - When EnforcementMode is Required, CapacityStrategy.Type must be Spot and SpotRatio cannot be 0%.
+//   - When EnforcementMode is Forbidden, CapacityStrategy.Type cannot be Spot.
+//   - SpotRatio must be greater than or equal to the guardrail MinSpotRatio.
+//   - FallbackAction cannot be FallbackToOnDemand when guardrails disallow fallback to OnDemand.
+func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass, guardrails *workloadsv1.WorkloadClassGuardrailList) []string {
+	if guardrails == nil || len(guardrails.Items) == 0 {
+		return nil
+	}
+
+	enforcementMode, minSpotRatioStr, allowFallback := guardrailCapacityConstraints(ctx, guardrails.Items)
+
+	if wc.Spec.CapacityStrategy == nil {
+		if enforcementMode == workloadsv1.RequiredEnforcementMode {
+			return []string{"capacityStrategy is required when guardrail enforcementMode is Required"}
+		}
+		return nil
+	}
+
+	var violations []string
+	cs := wc.Spec.CapacityStrategy
+
+	csType := cs.Type
+	if csType == "" {
+		csType = workloadsv1.SpotPlacementTypeSpot
+	}
+
+	spotRatio := 100
+	if csType == workloadsv1.SpotPlacementTypeOnDemand {
+		spotRatio = 0
+	} else if cs.SpotRatio != "" {
+		if parsed, err := parsePercentage(cs.SpotRatio); err == nil {
+			spotRatio = parsed
+		}
+	}
+
+	fallbackAction := cs.FallbackAction
+	if fallbackAction == "" {
+		fallbackAction = workloadsv1.FallbackActionFail
+	}
+
+	switch enforcementMode {
+	case workloadsv1.RequiredEnforcementMode:
+		if csType != workloadsv1.SpotPlacementTypeSpot {
+			violations = append(violations, fmt.Sprintf("capacityStrategy type %s is not allowed when guardrail enforcementMode is Required", csType))
+		} else if spotRatio == 0 {
+			violations = append(violations, "spotRatio cannot be 0% when guardrail enforcementMode is Required")
+		}
+	case workloadsv1.ForbiddenEnforcementMode:
+		if csType == workloadsv1.SpotPlacementTypeSpot {
+			violations = append(violations, fmt.Sprintf("capacityStrategy type %s is not allowed when guardrail enforcementMode is Forbidden", csType))
+		}
+	}
+
+	if csType == workloadsv1.SpotPlacementTypeSpot {
+		if minRatio, err := parsePercentage(minSpotRatioStr); err == nil && minRatio > 0 {
+			if spotRatio < minRatio {
+				violations = append(violations, fmt.Sprintf("spotRatio %d%% is less than guardrail minSpotRatio %d%%", spotRatio, minRatio))
+			}
+		}
+	}
+
+	if !allowFallback && fallbackAction == workloadsv1.FallbackActionFallbackToOnDemand {
+		violations = append(violations, "fallback action FallbackToOnDemand is not allowed when guardrail disallows fallback to OnDemand")
+	}
+
+	return violations
+}
+
+// guardrailCapacityConstraints returns the most restrictive capacity strategy constraints from all WorkloadClassGuardrails.
+// Capacity strategy constraints are: EnforcementMode, MinSpotRatio, and AllowFallbackToOnDemand.
+// If there are no guardrails, default least-restrictive constraints (Allowed, "0%", true) are returned.
+func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.WorkloadClassGuardrail) (workloadsv1.EnforcementMode, string, bool) {
+	log := logf.FromContext(ctx)
+
+	enforcementMode := workloadsv1.AllowedEnforcementMode
+	minSpotRatioPct := 0
+	allowFallback := true
+
+	if len(guardrails) == 0 {
+		log.Info("WorkloadClassGuardrailList is empty, returning default CapacityStrategy constraints")
+		return enforcementMode, "0%", allowFallback
+	}
+
+	for _, g := range guardrails {
+		if g.Spec.PluginConstraints == nil {
+			continue
+		}
+		applyPlacementCapacityConstraints(ctx, g.Name, g.Spec.PluginConstraints.Placement, &enforcementMode, &minSpotRatioPct, &allowFallback)
+	}
+
+	return enforcementMode, fmt.Sprintf("%d%%", minSpotRatioPct), allowFallback
+}
+
+// applyPlacementCapacityConstraints inspects the placement plugin constraints of a single WorkloadClassGuardrail,
+// decodes any gke.io/spot-placement parameters, and updates the effective capacity constraints in-place to reflect
+// the most restrictive settings seen so far:
+//   - enforcementMode precedence: Forbidden > Required > Allowed
+//   - minSpotRatioPct: highest minimum spot percentage (0 if enforcementMode is Forbidden)
+//   - allowFallback: set to false if AllowFallbackToOnDemand is false or MaxFallbackRatio is 0 / "0%"
+func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string, placement []workloadsv1.PluginConstraint, enforcementMode *workloadsv1.EnforcementMode, minSpotRatioPct *int, allowFallback *bool) {
+	log := logf.FromContext(ctx)
+
+	for _, c := range placement {
+		if c.PluginName != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
+			continue
+		}
+
+		var params workloadsv1.GKESpotGuardrailParameters
+		dec := json.NewDecoder(bytes.NewReader(c.Parameters.Raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&params); err != nil {
+			log.Error(err, "Failed to decode GKESpotGuardrailParameters", "guardrail", guardrailName)
+			continue
+		}
+
+		switch params.EnforcementMode {
+		case workloadsv1.ForbiddenEnforcementMode:
+			*enforcementMode = workloadsv1.ForbiddenEnforcementMode
+			*minSpotRatioPct = 0
+		case workloadsv1.RequiredEnforcementMode:
+			if *enforcementMode != workloadsv1.ForbiddenEnforcementMode {
+				*enforcementMode = workloadsv1.RequiredEnforcementMode
+			}
+		}
+
+		if *enforcementMode != workloadsv1.ForbiddenEnforcementMode && params.MinSpotRatio != "" {
+			if parsed, err := parsePercentage(params.MinSpotRatio); err == nil && parsed > *minSpotRatioPct {
+				*minSpotRatioPct = parsed
+			}
+		}
+
+		if params.Fallback != nil {
+			if params.Fallback.AllowFallbackToOnDemand != nil && !*params.Fallback.AllowFallbackToOnDemand {
+				*allowFallback = false
+			}
+			if params.Fallback.MaxFallbackRatio != nil {
+				mfr := params.Fallback.MaxFallbackRatio
+				isZero := (mfr.Type == intstr.Int && mfr.IntVal == 0) || (mfr.Type == intstr.String && (mfr.StrVal == "0%" || mfr.StrVal == "0"))
+				if isZero {
+					*allowFallback = false
+				}
+			}
+		}
+	}
+}
+
+// parsePercentage strips a trailing "%" from a percentage string (e.g. "60%") and parses the integer value.
+func parsePercentage(s string) (int, error) {
+	return strconv.Atoi(strings.TrimSuffix(s, "%"))
 }
 
 // validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.

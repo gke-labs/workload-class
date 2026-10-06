@@ -35,6 +35,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
@@ -1958,6 +1959,225 @@ func TestReconcileConditions(t *testing.T) {
 			}
 			if v.Message != tc.wantMessage {
 				t.Errorf("got Message = %q, want %q", v.Message, tc.wantMessage)
+			}
+		})
+	}
+}
+
+func TestGuardrailCapacityConstraints(t *testing.T) {
+	testCases := []struct {
+		name            string
+		guardrailJSONs  []string
+		wantEnforcement workloadsv1.EnforcementMode
+		wantMinRatio    string
+		wantFallback    bool
+	}{
+		{
+			name:            "empty_guardrails_returns_defaults",
+			guardrailJSONs:  nil,
+			wantEnforcement: workloadsv1.AllowedEnforcementMode,
+			wantMinRatio:    "0%",
+			wantFallback:    true,
+		},
+		{
+			name: "most_restrictive_across_multiple_guardrails",
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Allowed", "minSpotRatio": "20%", "fallback": {"allowFallbackToOnDemand": true}}`,
+				`{"enforcementMode": "Required", "minSpotRatio": "60%"}`,
+			},
+			wantEnforcement: workloadsv1.RequiredEnforcementMode,
+			wantMinRatio:    "60%",
+			wantFallback:    true,
+		},
+		{
+			name: "forbidden_overrides_required_and_resets_min_spot_ratio_to_zero",
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "50%"}`,
+				`{"enforcementMode": "Forbidden", "fallback": {"allowFallbackToOnDemand": false}}`,
+			},
+			wantEnforcement: workloadsv1.ForbiddenEnforcementMode,
+			wantMinRatio:    "0%",
+			wantFallback:    false,
+		},
+		{
+			name: "fallback_disallowed_by_zero_max_fallback_ratio",
+			guardrailJSONs: []string{
+				`{"fallback": {"maxFallbackRatio": "0%"}}`,
+			},
+			wantEnforcement: workloadsv1.AllowedEnforcementMode,
+			wantMinRatio:    "0%",
+			wantFallback:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			guardrails := make([]workloadsv1.WorkloadClassGuardrail, 0, len(tc.guardrailJSONs))
+			for i, raw := range tc.guardrailJSONs {
+				guardrails = append(guardrails, workloadsv1.WorkloadClassGuardrail{
+					ObjectMeta: metav1.ObjectMeta{Name: "g-" + string(rune('a'+i))},
+					Spec: workloadsv1.WorkloadClassGuardrailSpec{
+						PluginConstraints: &workloadsv1.PluginConstraints{
+							Placement: []workloadsv1.PluginConstraint{
+								{
+									PluginName: workloadsv1.PluginNameGKESpotPlacement,
+									Parameters: &apiextensionsv1.JSON{Raw: []byte(raw)},
+								},
+							},
+						},
+					},
+				})
+			}
+
+			gotEnforcement, gotMinRatio, gotFallback := guardrailCapacityConstraints(context.Background(), guardrails)
+			if gotEnforcement != tc.wantEnforcement {
+				t.Errorf("got enforcementMode = %q, want %q", gotEnforcement, tc.wantEnforcement)
+			}
+			if gotMinRatio != tc.wantMinRatio {
+				t.Errorf("got minSpotRatio = %q, want %q", gotMinRatio, tc.wantMinRatio)
+			}
+			if gotFallback != tc.wantFallback {
+				t.Errorf("got allowFallback = %v, want %v", gotFallback, tc.wantFallback)
+			}
+		})
+	}
+}
+
+func TestValidateCapacityStrategy(t *testing.T) {
+	testCases := []struct {
+		name             string
+		capacityStrategy *workloadsv1.CapacityStrategy
+		guardrailJSONs   []string
+		wantViolations   []string
+	}{
+		{
+			name: "no_guardrails_is_valid",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:           workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio:      "50%",
+				FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand,
+			},
+			guardrailJSONs: nil,
+			wantViolations: nil,
+		},
+		{
+			name:             "nil_capacity_strategy_allowed_when_enforcement_is_allowed",
+			capacityStrategy: nil,
+			guardrailJSONs:   []string{`{"enforcementMode": "Allowed", "minSpotRatio": "50%"}`},
+			wantViolations:   nil,
+		},
+		{
+			name: "on_demand_allowed_when_enforcement_is_allowed_with_min_spot_ratio",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			},
+			guardrailJSONs: []string{`{"enforcementMode": "Allowed", "minSpotRatio": "50%"}`},
+			wantViolations: nil,
+		},
+		{
+			name:             "nil_capacity_strategy_fails_when_enforcement_is_required",
+			capacityStrategy: nil,
+			guardrailJSONs:   []string{`{"enforcementMode": "Required"}`},
+			wantViolations:   []string{"capacityStrategy is required when guardrail enforcementMode is Required"},
+		},
+		{
+			name: "on_demand_fails_when_enforcement_is_required",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type: workloadsv1.SpotPlacementTypeOnDemand,
+			},
+			guardrailJSONs: []string{`{"enforcementMode": "Required"}`},
+			wantViolations: []string{"capacityStrategy type OnDemand is not allowed when guardrail enforcementMode is Required"},
+		},
+		{
+			name: "zero_spot_ratio_fails_when_enforcement_is_required",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "0%",
+			},
+			guardrailJSONs: []string{`{"enforcementMode": "Required"}`},
+			wantViolations: []string{"spotRatio cannot be 0% when guardrail enforcementMode is Required"},
+		},
+		{
+			name: "spot_fails_when_enforcement_is_forbidden",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type: workloadsv1.SpotPlacementTypeSpot,
+			},
+			guardrailJSONs: []string{`{"enforcementMode": "Forbidden"}`},
+			wantViolations: []string{"capacityStrategy type Spot is not allowed when guardrail enforcementMode is Forbidden"},
+		},
+		{
+			name: "spot_ratio_below_guardrail_min_spot_ratio_fails",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "40%",
+			},
+			guardrailJSONs: []string{
+				`{"minSpotRatio": "30%"}`,
+				`{"minSpotRatio": "60%"}`,
+			},
+			wantViolations: []string{"spotRatio 40% is less than guardrail minSpotRatio 60%"},
+		},
+		{
+			name: "fallback_to_on_demand_fails_when_guardrail_disallows_fallback",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:           workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio:      "80%",
+				FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand,
+			},
+			guardrailJSONs: []string{
+				`{"fallback": {"allowFallbackToOnDemand": false}}`,
+			},
+			wantViolations: []string{"fallback action FallbackToOnDemand is not allowed when guardrail disallows fallback to OnDemand"},
+		},
+		{
+			name: "valid_spot_capacity_strategy_passes_all_constraints",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:           workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio:      "80%",
+				FallbackAction: workloadsv1.FallbackActionFail,
+			},
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "60%", "fallback": {"allowFallbackToOnDemand": false}}`,
+			},
+			wantViolations: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			guardrails := make([]workloadsv1.WorkloadClassGuardrail, 0, len(tc.guardrailJSONs))
+			for i, raw := range tc.guardrailJSONs {
+				guardrails = append(guardrails, workloadsv1.WorkloadClassGuardrail{
+					ObjectMeta: metav1.ObjectMeta{Name: "g-" + string(rune('a'+i))},
+					Spec: workloadsv1.WorkloadClassGuardrailSpec{
+						PluginConstraints: &workloadsv1.PluginConstraints{
+							Placement: []workloadsv1.PluginConstraint{
+								{
+									PluginName: workloadsv1.PluginNameGKESpotPlacement,
+									Parameters: &apiextensionsv1.JSON{Raw: []byte(raw)},
+								},
+							},
+						},
+					},
+				})
+			}
+
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-wc"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					CapacityStrategy: tc.capacityStrategy,
+				},
+			}
+			guardrailList := &workloadsv1.WorkloadClassGuardrailList{Items: guardrails}
+
+			got := validateCapacityStrategy(context.Background(), wc, guardrailList)
+			if len(got) != len(tc.wantViolations) {
+				t.Fatalf("got violations %v, want %v", got, tc.wantViolations)
+			}
+			for i := range got {
+				if got[i] != tc.wantViolations[i] {
+					t.Errorf("violation[%d] = %q, want %q", i, got[i], tc.wantViolations[i])
+				}
 			}
 		})
 	}
