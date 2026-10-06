@@ -20,17 +20,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -39,8 +42,7 @@ import (
 // GKESpotPlacementPolicyReconciler reconciles a GKESpotPlacementPolicy object
 type GKESpotPlacementPolicyReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	Scheme *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -210,35 +212,47 @@ func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx 
 		return err
 	}
 
+	var errs []error
 	for i := range workloadClasses.Items {
 		wc := &workloadClasses.Items[i]
 		ref := wc.Spec.InfrastructureProfileRef
-		if ref == nil || ref.Kind != workloadsv1.GKESpotPlacementPolicyKind || ref.Name != policyName {
-			continue
-		}
-		if ref.Group != "" && ref.Group != workloadsv1.GroupVersion.Group {
+		if !referencesSpotPolicy(ref) || ref.Name != policyName {
 			continue
 		}
 		if err := r.updateWorkloadClassStatus(ctx, wc, options); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+func referencesSpotPolicy(ref *workloadsv1.InfrastructureProfileReference) bool {
+	if ref == nil || ref.Kind != workloadsv1.GKESpotPlacementPolicyKind {
+		return false
+	}
+	return ref.Group == "" || ref.Group == workloadsv1.GroupVersion.Group
 }
 
 func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context.Context, wc *workloadsv1.WorkloadClass, options statusOptions) error {
-	cond := metav1.Condition{
-		Type:               workloadsv1.ConditionTypePlacementPluginAttached,
-		Status:             options.Status,
-		Reason:             options.Reason,
-		Message:            options.Message,
-		ObservedGeneration: wc.Generation,
-		LastTransitionTime: metav1.Now(),
-	}
-	if meta.SetStatusCondition(&wc.Status.Conditions, cond) {
-		return r.Status().Update(ctx, wc)
-	}
-	return nil
+	key := client.ObjectKeyFromObject(wc)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &workloadsv1.WorkloadClass{}
+		if err := r.Get(ctx, key, latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		cond := metav1.Condition{
+			Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+			Status:             options.Status,
+			Reason:             options.Reason,
+			Message:            options.Message,
+			ObservedGeneration: latest.Generation,
+			LastTransitionTime: metav1.Now(),
+		}
+		if meta.SetStatusCondition(&latest.Status.Conditions, cond) {
+			return r.Status().Update(ctx, latest)
+		}
+		return nil
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -248,10 +262,12 @@ func (r *GKESpotPlacementPolicyReconciler) SetupWithManager(mgr ctrl.Manager) er
 		Watches(
 			&workloadsv1.WorkloadClass{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueIfReferencesSpotPolicy),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Watches(
 			&workloadsv1.WorkloadClassGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.findSpotPoliciesToReconcile),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Named("gkespotplacementpolicy").
 		Complete(r)
@@ -264,7 +280,7 @@ func (r *GKESpotPlacementPolicyReconciler) enqueueIfReferencesSpotPolicy(ctx con
 	}
 
 	infraProfileRef := wc.Spec.InfrastructureProfileRef
-	if infraProfileRef == nil || infraProfileRef.Kind != workloadsv1.GKESpotPlacementPolicyKind {
+	if !referencesSpotPolicy(infraProfileRef) {
 		return nil
 	}
 
