@@ -38,7 +38,7 @@ func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 
 // TODO(user): EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 
-// +kubebuilder:webhook:path=/mutate-pod-placement,mutating=true,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create;update,versions=v1,name=mpod-v1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-pod-placement,mutating=true,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod-v1.kb.io,admissionReviewVersions=v1
 
 // PodCustomDefaulter struct is responsible for setting default values on the custom resource of the
 // Kind Pod when those are created or updated.
