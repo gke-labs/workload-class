@@ -1969,14 +1969,15 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 		name            string
 		guardrailJSONs  []string
 		wantEnforcement workloadsv1.EnforcementMode
-		wantMinRatio    string
+		wantMinRatio    int
 		wantFallback    bool
+		wantErr         bool
 	}{
 		{
 			name:            "empty_guardrails_returns_defaults",
 			guardrailJSONs:  nil,
 			wantEnforcement: workloadsv1.AllowedEnforcementMode,
-			wantMinRatio:    "0%",
+			wantMinRatio:    0,
 			wantFallback:    true,
 		},
 		{
@@ -1986,7 +1987,7 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 				`{"enforcementMode": "Required", "minSpotRatio": "60%"}`,
 			},
 			wantEnforcement: workloadsv1.RequiredEnforcementMode,
-			wantMinRatio:    "60%",
+			wantMinRatio:    60,
 			wantFallback:    true,
 		},
 		{
@@ -1996,8 +1997,18 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 				`{"enforcementMode": "Forbidden", "fallback": {"allowFallbackToOnDemand": false}}`,
 			},
 			wantEnforcement: workloadsv1.ForbiddenEnforcementMode,
-			wantMinRatio:    "0%",
+			wantMinRatio:    0,
 			wantFallback:    false,
+		},
+		{
+			name: "forbidden_preceding_required_is_not_overwritten",
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Forbidden"}`,
+				`{"enforcementMode": "Required", "minSpotRatio": "50%"}`,
+			},
+			wantEnforcement: workloadsv1.ForbiddenEnforcementMode,
+			wantMinRatio:    0,
+			wantFallback:    true,
 		},
 		{
 			name: "fallback_disallowed_by_zero_max_fallback_ratio",
@@ -2005,8 +2016,29 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 				`{"fallback": {"maxFallbackRatio": "0%"}}`,
 			},
 			wantEnforcement: workloadsv1.AllowedEnforcementMode,
-			wantMinRatio:    "0%",
+			wantMinRatio:    0,
 			wantFallback:    false,
+		},
+		{
+			name: "malformed_guardrail_json_returns_error_and_still_processes_valid_guardrails",
+			guardrailJSONs: []string{
+				`{"unknownField": true}`,
+				`{"enforcementMode": "Required", "minSpotRatio": "50%"}`,
+			},
+			wantEnforcement: workloadsv1.RequiredEnforcementMode,
+			wantMinRatio:    50,
+			wantFallback:    true,
+			wantErr:         true,
+		},
+		{
+			name: "invalid_guardrail_min_spot_ratio_returns_error",
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "invalid%"}`,
+			},
+			wantEnforcement: workloadsv1.RequiredEnforcementMode,
+			wantMinRatio:    0,
+			wantFallback:    true,
+			wantErr:         true,
 		},
 	}
 
@@ -2029,12 +2061,15 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 				})
 			}
 
-			gotEnforcement, gotMinRatio, gotFallback := guardrailCapacityConstraints(context.Background(), guardrails)
+			gotEnforcement, gotMinRatio, gotFallback, err := guardrailCapacityConstraints(context.Background(), guardrails)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("got err = %v, wantErr %v", err, tc.wantErr)
+			}
 			if gotEnforcement != tc.wantEnforcement {
 				t.Errorf("got enforcementMode = %q, want %q", gotEnforcement, tc.wantEnforcement)
 			}
 			if gotMinRatio != tc.wantMinRatio {
-				t.Errorf("got minSpotRatio = %q, want %q", gotMinRatio, tc.wantMinRatio)
+				t.Errorf("got minSpotRatio = %d, want %d", gotMinRatio, tc.wantMinRatio)
 			}
 			if gotFallback != tc.wantFallback {
 				t.Errorf("got allowFallback = %v, want %v", gotFallback, tc.wantFallback)
@@ -2130,6 +2165,29 @@ func TestValidateCapacityStrategy(t *testing.T) {
 			wantViolations: []string{"fallback action FallbackToOnDemand is not allowed when guardrail disallows fallback to OnDemand"},
 		},
 		{
+			name: "multiple_simultaneous_violations_are_all_returned",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:           workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio:      "40%",
+				FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand,
+			},
+			guardrailJSONs: []string{
+				`{"minSpotRatio": "60%", "fallback": {"allowFallbackToOnDemand": false}}`,
+			},
+			wantViolations: []string{
+				"spotRatio 40% is less than guardrail minSpotRatio 60%",
+				"fallback action FallbackToOnDemand is not allowed when guardrail disallows fallback to OnDemand",
+			},
+		},
+		{
+			name:             "empty_capacity_strategy_uses_defaults_and_passes_required_guardrail",
+			capacityStrategy: &workloadsv1.CapacityStrategy{},
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "80%", "fallback": {"allowFallbackToOnDemand": false}}`,
+			},
+			wantViolations: nil,
+		},
+		{
 			name: "valid_spot_capacity_strategy_passes_all_constraints",
 			capacityStrategy: &workloadsv1.CapacityStrategy{
 				Type:           workloadsv1.SpotPlacementTypeSpot,
@@ -2140,6 +2198,29 @@ func TestValidateCapacityStrategy(t *testing.T) {
 				`{"enforcementMode": "Required", "minSpotRatio": "60%", "fallback": {"allowFallbackToOnDemand": false}}`,
 			},
 			wantViolations: nil,
+		},
+		{
+			name:             "malformed_guardrail_parameters_fails_closed",
+			capacityStrategy: nil,
+			guardrailJSONs: []string{
+				`{"unknownField": true}`,
+			},
+			wantViolations: []string{
+				`failed to parse guardrail parameters: guardrail g-a: json: unknown field "unknownField"`,
+			},
+		},
+		{
+			name: "invalid_spot_ratio_fails_closed",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "invalid%",
+			},
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "60%"}`,
+			},
+			wantViolations: []string{
+				`invalid spotRatio "invalid%": strconv.Atoi: parsing "invalid": invalid syntax`,
+			},
 		},
 	}
 
