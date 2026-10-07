@@ -20,13 +20,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -205,7 +206,7 @@ func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1
 
 	if err := r.Delete(ctx, pdb); err != nil {
 		// If it's already gone, that's a success for a delete operation
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to delete PDB: %w", err)
@@ -447,16 +448,19 @@ func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass
 		return nil
 	}
 
-	enforcementMode, minSpotRatioStr, allowFallback := guardrailCapacityConstraints(ctx, guardrails.Items)
+	var violations []string
+	enforcementMode, minSpotRatioPct, allowFallback, err := guardrailCapacityConstraints(ctx, guardrails.Items)
+	if err != nil {
+		violations = append(violations, fmt.Sprintf("failed to parse guardrail parameters: %v", err))
+	}
 
 	if wc.Spec.CapacityStrategy == nil {
 		if enforcementMode == workloadsv1.RequiredEnforcementMode {
-			return []string{"capacityStrategy is required when guardrail enforcementMode is Required"}
+			violations = append(violations, "capacityStrategy is required when guardrail enforcementMode is Required")
 		}
-		return nil
+		return violations
 	}
 
-	var violations []string
 	cs := wc.Spec.CapacityStrategy
 
 	csType := cs.Type
@@ -465,10 +469,15 @@ func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass
 	}
 
 	spotRatio := 100
+	spotRatioValid := true
 	if csType == workloadsv1.SpotPlacementTypeOnDemand {
 		spotRatio = 0
 	} else if cs.SpotRatio != "" {
-		if parsed, err := parsePercentage(cs.SpotRatio); err == nil {
+		parsed, err := parsePercentage(cs.SpotRatio)
+		if err != nil {
+			violations = append(violations, fmt.Sprintf("invalid spotRatio %q: %v", cs.SpotRatio, err))
+			spotRatioValid = false
+		} else {
 			spotRatio = parsed
 		}
 	}
@@ -482,7 +491,7 @@ func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass
 	case workloadsv1.RequiredEnforcementMode:
 		if csType != workloadsv1.SpotPlacementTypeSpot {
 			violations = append(violations, fmt.Sprintf("capacityStrategy type %s is not allowed when guardrail enforcementMode is Required", csType))
-		} else if spotRatio == 0 {
+		} else if spotRatioValid && spotRatio == 0 {
 			violations = append(violations, "spotRatio cannot be 0% when guardrail enforcementMode is Required")
 		}
 	case workloadsv1.ForbiddenEnforcementMode:
@@ -491,12 +500,8 @@ func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass
 		}
 	}
 
-	if csType == workloadsv1.SpotPlacementTypeSpot {
-		if minRatio, err := parsePercentage(minSpotRatioStr); err == nil && minRatio > 0 {
-			if spotRatio < minRatio {
-				violations = append(violations, fmt.Sprintf("spotRatio %d%% is less than guardrail minSpotRatio %d%%", spotRatio, minRatio))
-			}
-		}
+	if csType == workloadsv1.SpotPlacementTypeSpot && spotRatioValid && minSpotRatioPct > 0 && spotRatio < minSpotRatioPct {
+		violations = append(violations, fmt.Sprintf("spotRatio %d%% is less than guardrail minSpotRatio %d%%", spotRatio, minSpotRatioPct))
 	}
 
 	if !allowFallback && fallbackAction == workloadsv1.FallbackActionFallbackToOnDemand {
@@ -507,9 +512,9 @@ func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass
 }
 
 // guardrailCapacityConstraints returns the most restrictive capacity strategy constraints from all WorkloadClassGuardrails.
-// Capacity strategy constraints are: EnforcementMode, MinSpotRatio, and AllowFallbackToOnDemand.
-// If there are no guardrails, default least-restrictive constraints (Allowed, "0%", true) are returned.
-func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.WorkloadClassGuardrail) (workloadsv1.EnforcementMode, string, bool) {
+// Capacity strategy constraints are: EnforcementMode, MinSpotRatio (as an integer percentage), and AllowFallbackToOnDemand.
+// If there are no guardrails, default least-restrictive constraints (Allowed, 0, true) are returned.
+func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.WorkloadClassGuardrail) (workloadsv1.EnforcementMode, int, bool, error) {
 	log := logf.FromContext(ctx)
 
 	enforcementMode := workloadsv1.AllowedEnforcementMode
@@ -518,17 +523,20 @@ func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.
 
 	if len(guardrails) == 0 {
 		log.Info("WorkloadClassGuardrailList is empty, returning default CapacityStrategy constraints")
-		return enforcementMode, "0%", allowFallback
+		return enforcementMode, minSpotRatioPct, allowFallback, nil
 	}
 
+	var errs []error
 	for _, g := range guardrails {
 		if g.Spec.PluginConstraints == nil {
 			continue
 		}
-		applyPlacementCapacityConstraints(ctx, g.Name, g.Spec.PluginConstraints.Placement, &enforcementMode, &minSpotRatioPct, &allowFallback)
+		if err := applyPlacementCapacityConstraints(ctx, g.Name, g.Spec.PluginConstraints.Placement, &enforcementMode, &minSpotRatioPct, &allowFallback); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	return enforcementMode, fmt.Sprintf("%d%%", minSpotRatioPct), allowFallback
+	return enforcementMode, minSpotRatioPct, allowFallback, errors.Join(errs...)
 }
 
 // applyPlacementCapacityConstraints inspects the placement plugin constraints of a single WorkloadClassGuardrail,
@@ -537,9 +545,10 @@ func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.
 //   - enforcementMode precedence: Forbidden > Required > Allowed
 //   - minSpotRatioPct: highest minimum spot percentage (0 if enforcementMode is Forbidden)
 //   - allowFallback: set to false if AllowFallbackToOnDemand is false or MaxFallbackRatio is 0 / "0%"
-func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string, placement []workloadsv1.PluginConstraint, enforcementMode *workloadsv1.EnforcementMode, minSpotRatioPct *int, allowFallback *bool) {
+func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string, placement []workloadsv1.PluginConstraint, enforcementMode *workloadsv1.EnforcementMode, minSpotRatioPct *int, allowFallback *bool) error {
 	log := logf.FromContext(ctx)
 
+	var errs []error
 	for _, c := range placement {
 		if c.PluginName != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
 			continue
@@ -550,6 +559,7 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&params); err != nil {
 			log.Error(err, "Failed to decode GKESpotGuardrailParameters", "guardrail", guardrailName)
+			errs = append(errs, fmt.Errorf("guardrail %s: %w", guardrailName, err))
 			continue
 		}
 
@@ -563,8 +573,14 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 			}
 		}
 
-		if *enforcementMode != workloadsv1.ForbiddenEnforcementMode && params.MinSpotRatio != "" {
-			if parsed, err := parsePercentage(params.MinSpotRatio); err == nil && parsed > *minSpotRatioPct {
+		if params.MinSpotRatio != "" {
+			parsed, err := parsePercentage(params.MinSpotRatio)
+			if err != nil {
+				log.Error(err, "Failed to parse GKESpotGuardrailParameters minSpotRatio", "guardrail", guardrailName)
+				errs = append(errs, fmt.Errorf("guardrail %s has invalid minSpotRatio %q: %w", guardrailName, params.MinSpotRatio, err))
+				continue
+			}
+			if *enforcementMode != workloadsv1.ForbiddenEnforcementMode && parsed > *minSpotRatioPct {
 				*minSpotRatioPct = parsed
 			}
 		}
@@ -582,6 +598,8 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 			}
 		}
 	}
+
+	return errors.Join(errs...)
 }
 
 // parsePercentage strips a trailing "%" from a percentage string (e.g. "60%") and parses the integer value.
