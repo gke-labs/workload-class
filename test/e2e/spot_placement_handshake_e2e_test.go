@@ -395,6 +395,17 @@ var _ = Describe("WorkloadClass and GKESpotPlacementPolicy Handshake", Ordered, 
 			By("Creating a WorkloadClass with valid CapacityStrategy referencing the GKESpotPlacementPolicy")
 			Expect(applyManifest(validSpotWorkloadClassYAML)).To(Succeed())
 
+			By("Verifying initial state is PlacementPluginAttached=True and Validated=True")
+			Eventually(func(g Gomega) {
+				attachedStatus, err := getConditionField("workloadclass", "spot-batch", "sample", "PlacementPluginAttached", "status")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(attachedStatus).To(Equal("True"))
+
+				validatedStatus, err := getConditionField("workloadclass", "spot-batch", "sample", "Validated", "status")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(validatedStatus).To(Equal("True"))
+			}).Should(Succeed())
+
 			By("Patching WorkloadClass CapacityStrategy with spotRatio below guardrail minSpotRatio (20% < 60%)")
 			patch := `{"spec": {"capacityStrategy": {"spotRatio": "20%"}}}`
 			_, err := utils.Run(exec.Command("kubectl", "patch", "workloadclass", "spot-batch", "-n", "sample", "--type", "merge", "-p", patch))
@@ -412,7 +423,7 @@ var _ = Describe("WorkloadClass and GKESpotPlacementPolicy Handshake", Ordered, 
 
 				validatedMsg, err := getConditionField("workloadclass", "spot-batch", "sample", "Validated", "message")
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(validatedMsg).To(ContainSubstring("spotRatio 20% is less than guardrail minSpotRatio 60%"))
+				g.Expect(validatedMsg).To(Equal("spotRatio 20% is less than guardrail minSpotRatio 60%"))
 			}).Should(Succeed())
 
 			By("Patching WorkloadClass CapacityStrategy back to a valid spotRatio (80%)")
