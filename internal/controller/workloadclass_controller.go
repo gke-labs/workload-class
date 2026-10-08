@@ -17,9 +17,7 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -554,10 +552,8 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 			continue
 		}
 
-		var params workloadsv1.GKESpotGuardrailParameters
-		dec := json.NewDecoder(bytes.NewReader(c.Parameters.Raw))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&params); err != nil {
+		params, err := utils.ParseGKESpotGuardrailParameters(c.Parameters.Raw)
+		if err != nil {
 			log.Error(err, "Failed to decode GKESpotGuardrailParameters", "guardrail", guardrailName)
 			errs = append(errs, fmt.Errorf("guardrail %s: %w", guardrailName, err))
 			continue
