@@ -58,17 +58,17 @@ type PluginConstraints struct {
 	// Placement holds the list of plugin constraints for workload placement.
 	// +optional
 	// +listType=map
-	// +listMapKey=pluginName
+	// +listMapKey=name
 	Placement []PluginConstraint `json:"placement,omitempty"`
 }
 
 // PluginConstraint defines constraints for a specific plugin controller.
 type PluginConstraint struct {
-	// PluginName identifies the target plugin controller (e.g., "gke-spot-placement").
+	// Name identifies the target plugin controller (e.g., "gke-spot-placement").
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
-	PluginName string `json:"pluginName"`
+	Name string `json:"name"`
 
 	// AllowedConfigTemplate optionally specifies a policy template name (e.g., "K8sAllowedSpotRatio").
 	// +optional
@@ -94,7 +94,7 @@ type WorkloadClassGuardrailSpec struct {
 
 // WorkloadClassGuardrailStatus defines the observed state of WorkloadClassGuardrail.
 type WorkloadClassGuardrailStatus struct {
-	// The status of each condition is one of True, False, or Unknown.
+	// Conditions represent the latest observed state of the WorkloadClassGuardrail resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
