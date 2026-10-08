@@ -144,7 +144,7 @@ func validateSpotPolicyAgainstGuardrails(spotPolicy *workloadsv1.GKESpotPlacemen
 
 func validateAgainstPlacementConstraints(placement []workloadsv1.PluginConstraint, reversion workloadsv1.SpotReversionPolicy, reversionAction workloadsv1.ReversionAction, violations *[]string, seen map[string]bool) {
 	for _, c := range placement {
-		if c.PluginName != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
+		if c.Name != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
 			continue
 		}
 
@@ -169,8 +169,8 @@ func validateReversionConstraints(constraints *workloadsv1.GKESpotReversionConst
 		return
 	}
 
-	if constraints.RequiredReversionAction != "" && reversionAction != constraints.RequiredReversionAction {
-		addViolation(fmt.Sprintf("reversion action %s does not match guardrail requiredReversionAction %s", reversionAction, constraints.RequiredReversionAction), seen, violations)
+	if required := constraints.RequiredReversionAction; required != nil && reversionAction != *required {
+		addViolation(fmt.Sprintf("reversion action %s does not match guardrail requiredReversionAction %s", reversionAction, *required), seen, violations)
 	}
 
 	if constraints.MaxFallbackDuration == nil {
