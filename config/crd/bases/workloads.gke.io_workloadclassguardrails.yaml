@@ -41,7 +41,8 @@ spec:
             description: spec defines the desired state of WorkloadClassGuardrail
             properties:
               constraints:
-                description: Constraints defines the guardrails for WorkloadClasses.
+                description: Constraints defines the core cloud-agnostic guardrails
+                  for WorkloadClasses.
                 properties:
                   disruption:
                     description: Disruption defines the constraints within which WorkloadClasses
@@ -83,6 +84,40 @@ spec:
                 required:
                 - disruption
                 type: object
+              pluginConstraints:
+                description: PluginConstraints defines guardrail constraints grouped
+                  by plugin optimization intent.
+                properties:
+                  placement:
+                    description: Placement holds the list of plugin constraints for
+                      workload placement.
+                    items:
+                      description: PluginConstraint defines constraints for a specific
+                        plugin controller.
+                      properties:
+                        allowedConfigTemplate:
+                          description: AllowedConfigTemplate optionally specifies
+                            a policy template name (e.g., "K8sAllowedSpotRatio").
+                          type: string
+                        name:
+                          description: Name identifies the target plugin controller
+                            (e.g., "gke-spot-placement").
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        parameters:
+                          description: Parameters holds plugin-specific guardrail
+                            parameters as an arbitrary JSON/YAML object.
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                type: object
             required:
             - constraints
             type: object
@@ -90,16 +125,8 @@ spec:
             description: status defines the observed state of WorkloadClassGuardrail
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the WorkloadClassGuardrail resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                description: Conditions represent the latest observed state of the
+                  WorkloadClassGuardrail resource.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
