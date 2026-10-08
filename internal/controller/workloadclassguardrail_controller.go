@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -127,10 +126,8 @@ func validatePlacementPluginConstraint(c workloadsv1.PluginConstraint) []string 
 }
 
 func validateGKESpotGuardrailParameters(raw []byte) []string {
-	var params workloadsv1.GKESpotGuardrailParameters
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&params); err != nil {
+	params, err := utils.ParseGKESpotGuardrailParameters(raw)
+	if err != nil {
 		return []string{fmt.Sprintf("invalid %s parameters: %v", workloadsv1.PluginNameGKESpotPlacement, err)}
 	}
 
@@ -174,7 +171,7 @@ func validateGKESpotGuardrailParameters(raw []byte) []string {
 		}
 	}
 
-	violations = append(violations, validateGKESpotGuardrailCombinations(&params)...)
+	violations = append(violations, validateGKESpotGuardrailCombinations(params)...)
 
 	return violations
 }
