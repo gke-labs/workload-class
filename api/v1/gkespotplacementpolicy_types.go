@@ -52,6 +52,9 @@ const (
 )
 
 const (
+	// GKESpotPlacementPolicyKind is the Kind name for GKESpotPlacementPolicy.
+	GKESpotPlacementPolicyKind = "GKESpotPlacementPolicy"
+
 	// PluginNameGKESpotPlacement is the plugin identifier used in WorkloadClassGuardrail.spec.pluginConstraints.
 	PluginNameGKESpotPlacement = "gke-spot-placement"
 
