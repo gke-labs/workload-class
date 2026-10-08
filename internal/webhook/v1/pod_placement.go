@@ -46,7 +46,8 @@ const (
 	ComputeClassLabelKey = "cloud.google.com/compute-class"
 )
 
-// shouldUseSpot determines if a Pod should be placed on Spot based on the existing Spot count, total existing pods, and the target spot ratio
+// shouldUseSpot reports whether the next Pod should go to Spot: true while existing Spot Pods are
+// below spotRatio percent of the workload's Pods, counting the new one.
 func shouldUseSpot(spotExisting, totalExisting, spotRatio int) bool {
 	return spotExisting*100 < (totalExisting+1)*spotRatio
 }
@@ -128,6 +129,9 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 	return pods, nil
 }
 
+// isPodEffectiveSpot reports whether the Pod counts as Spot for SpotRatio purposes. A scheduled Pod
+// is judged by its node's Spot label; an unscheduled Pod (or one whose node can't be fetched) is
+// judged by whether it is targeted for Spot.
 func (d *PodPlacementDefaulter) isPodEffectiveSpot(ctx context.Context, pod *corev1.Pod) bool {
 	if pod.Spec.NodeName != "" {
 		if isSpot, known := d.isNodeSpot(ctx, pod.Spec.NodeName); known {
@@ -137,6 +141,8 @@ func (d *PodPlacementDefaulter) isPodEffectiveSpot(ctx context.Context, pod *cor
 	return isPodTargetedForSpot(pod)
 }
 
+// isNodeSpot reports whether the named node carries the GKE Spot label. known is false when the
+// node name is empty or the node can't be fetched, so callers can fall back to other signals.
 func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string) (isSpot, known bool) {
 	if nodeName == "" {
 		return false, false
@@ -148,11 +154,14 @@ func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string)
 	return node.Labels[SpotLabelKey] == SpotLabelValue, true
 }
 
+// isPodTargetedForSpot reports whether the Pod has been directed at Spot capacity, either via the
+// Spot nodeSelector or the Spot toleration.
 func isPodTargetedForSpot(pod *corev1.Pod) bool {
 	return pod.Spec.NodeSelector[SpotLabelKey] == SpotLabelValue ||
 		slices.ContainsFunc(pod.Spec.Tolerations, isSpotToleration)
 }
 
+// isSpotToleration reports whether t tolerates the GKE Spot NoSchedule taint (gke-spot=true).
 func isSpotToleration(t corev1.Toleration) bool {
 	return t.Key == SpotLabelKey &&
 		(t.Operator == corev1.TolerationOpEqual || t.Operator == "") &&
@@ -217,14 +226,17 @@ func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, s
 	}
 }
 
+// spotIn returns a node selector requirement matching Spot nodes (gke-spot In [true]).
 func spotIn() corev1.NodeSelectorRequirement {
 	return corev1.NodeSelectorRequirement{Key: SpotLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{SpotLabelValue}}
 }
 
+// spotDoesNotExist returns a node selector requirement matching non-Spot nodes (gke-spot DoesNotExist).
 func spotDoesNotExist() corev1.NodeSelectorRequirement {
 	return corev1.NodeSelectorRequirement{Key: SpotLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist}
 }
 
+// setNodeSelector sets key=value in the Pod's nodeSelector, initializing the map if needed.
 func setNodeSelector(pod *corev1.Pod, key, value string) {
 	if pod.Spec.NodeSelector == nil {
 		pod.Spec.NodeSelector = make(map[string]string)
@@ -232,6 +244,7 @@ func setNodeSelector(pod *corev1.Pod, key, value string) {
 	pod.Spec.NodeSelector[key] = value
 }
 
+// ensureSpotToleration adds the GKE Spot toleration to the Pod if it isn't already present.
 func ensureSpotToleration(pod *corev1.Pod) {
 	if slices.ContainsFunc(pod.Spec.Tolerations, isSpotToleration) {
 		return
@@ -244,6 +257,7 @@ func ensureSpotToleration(pod *corev1.Pod) {
 	})
 }
 
+// removeSpotToleration removes any GKE Spot tolerations from the Pod, leaving other tolerations intact.
 func removeSpotToleration(pod *corev1.Pod) {
 	if len(pod.Spec.Tolerations) == 0 {
 		return
@@ -258,6 +272,7 @@ func removeSpotToleration(pod *corev1.Pod) {
 	pod.Spec.Tolerations = filtered
 }
 
+// ensureNodeAffinity returns the Pod's NodeAffinity, initializing Affinity and NodeAffinity if nil.
 func ensureNodeAffinity(pod *corev1.Pod) *corev1.NodeAffinity {
 	if pod.Spec.Affinity == nil {
 		pod.Spec.Affinity = &corev1.Affinity{}
@@ -305,6 +320,7 @@ func concatRequirements(a, b []corev1.NodeSelectorRequirement) []corev1.NodeSele
 	return append(out, b...)
 }
 
+// addPreferredSchedulingTerm appends a preferred (soft) node affinity term to the Pod.
 func addPreferredSchedulingTerm(pod *corev1.Pod, term corev1.PreferredSchedulingTerm) {
 	na := ensureNodeAffinity(pod)
 	na.PreferredDuringSchedulingIgnoredDuringExecution = append(
