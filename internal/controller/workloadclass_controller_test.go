@@ -2052,7 +2052,7 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 						PluginConstraints: &workloadsv1.PluginConstraints{
 							Placement: []workloadsv1.PluginConstraint{
 								{
-									PluginName: workloadsv1.PluginNameGKESpotPlacement,
+									Name:       workloadsv1.PluginNameGKESpotPlacement,
 									Parameters: &apiextensionsv1.JSON{Raw: []byte(raw)},
 								},
 							},
@@ -2234,7 +2234,7 @@ func TestValidateCapacityStrategy(t *testing.T) {
 						PluginConstraints: &workloadsv1.PluginConstraints{
 							Placement: []workloadsv1.PluginConstraint{
 								{
-									PluginName: workloadsv1.PluginNameGKESpotPlacement,
+									Name:       workloadsv1.PluginNameGKESpotPlacement,
 									Parameters: &apiextensionsv1.JSON{Raw: []byte(raw)},
 								},
 							},

@@ -550,7 +550,7 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 
 	var errs []error
 	for _, c := range placement {
-		if c.PluginName != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
+		if c.Name != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
 			continue
 		}
 
@@ -573,11 +573,11 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 			}
 		}
 
-		if params.MinSpotRatio != "" {
-			parsed, err := parsePercentage(params.MinSpotRatio)
+		if params.MinSpotRatio != nil {
+			parsed, err := parsePercentage(*params.MinSpotRatio)
 			if err != nil {
 				log.Error(err, "Failed to parse GKESpotGuardrailParameters minSpotRatio", "guardrail", guardrailName)
-				errs = append(errs, fmt.Errorf("guardrail %s has invalid minSpotRatio %q: %w", guardrailName, params.MinSpotRatio, err))
+				errs = append(errs, fmt.Errorf("guardrail %s has invalid minSpotRatio %q: %w", guardrailName, *params.MinSpotRatio, err))
 				continue
 			}
 			if *enforcementMode != workloadsv1.ForbiddenEnforcementMode && parsed > *minSpotRatioPct {
