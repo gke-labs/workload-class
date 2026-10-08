@@ -154,7 +154,7 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 					PluginConstraints: &workloadsv1.PluginConstraints{
 						Placement: []workloadsv1.PluginConstraint{
 							{
-								PluginName: workloadsv1.PluginNameGKESpotPlacement,
+								Name: workloadsv1.PluginNameGKESpotPlacement,
 								Parameters: &apiextensionsv1.JSON{
 									Raw: []byte(`{"enforcementMode":"Required","reversion":{"requiredReversionAction":"Active","maxFallbackDuration":"2h"}}`),
 								},
@@ -210,7 +210,7 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 					PluginConstraints: &workloadsv1.PluginConstraints{
 						Placement: []workloadsv1.PluginConstraint{
 							{
-								PluginName: workloadsv1.PluginNameGKESpotPlacement,
+								Name: workloadsv1.PluginNameGKESpotPlacement,
 								Parameters: &apiextensionsv1.JSON{
 									Raw: []byte(`{"reversion":{"requiredReversionAction":"Active","maxFallbackDuration":"1h"}}`),
 								},
@@ -375,7 +375,7 @@ func TestValidateSpotPolicyAgainstGuardrails(t *testing.T) {
 						PluginConstraints: &workloadsv1.PluginConstraints{
 							Placement: []workloadsv1.PluginConstraint{
 								{
-									PluginName: workloadsv1.PluginNameGKESpotPlacement,
+									Name:       workloadsv1.PluginNameGKESpotPlacement,
 									Parameters: &apiextensionsv1.JSON{Raw: []byte(raw)},
 								},
 							},
