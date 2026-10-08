@@ -46,7 +46,7 @@ spec:
       maxNonDisruptionDurationDays: 30
   pluginConstraints:
     placement:
-      - pluginName: gke-spot-placement
+      - name: gke-spot-placement
         parameters:
           enforcementMode: Required
           minSpotRatio: "60%"
@@ -475,7 +475,7 @@ spec:
       maxNonDisruptionDurationDays: 30
   pluginConstraints:
     placement:
-      - pluginName: gke-spot-placement
+      - name: gke-spot-placement
         parameters:
           enforcementMode: Forbidden
 `
