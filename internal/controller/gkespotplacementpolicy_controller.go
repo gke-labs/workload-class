@@ -17,9 +17,7 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -37,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 // GKESpotPlacementPolicyReconciler reconciles a GKESpotPlacementPolicy object
@@ -148,10 +147,8 @@ func validateAgainstPlacementConstraints(placement []workloadsv1.PluginConstrain
 			continue
 		}
 
-		var params workloadsv1.GKESpotGuardrailParameters
-		dec := json.NewDecoder(bytes.NewReader(c.Parameters.Raw))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&params); err != nil {
+		params, err := utils.ParseGKESpotGuardrailParameters(c.Parameters.Raw)
+		if err != nil {
 			addViolation(fmt.Sprintf("invalid %s parameters: %v", workloadsv1.PluginNameGKESpotPlacement, err), seen, violations)
 			continue
 		}
