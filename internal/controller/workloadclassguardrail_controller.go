@@ -96,8 +96,8 @@ func validatePluginConstraints(pc *workloadsv1.PluginConstraints) []string {
 }
 
 func validatePlacementPluginConstraint(c workloadsv1.PluginConstraint) []string {
-	if strings.TrimSpace(c.PluginName) == "" {
-		return []string{"placement pluginConstraint pluginName must not be empty"}
+	if strings.TrimSpace(c.Name) == "" {
+		return []string{"placement pluginConstraint name must not be empty"}
 	}
 
 	if c.Parameters == nil || len(c.Parameters.Raw) == 0 {
@@ -106,10 +106,10 @@ func validatePlacementPluginConstraint(c workloadsv1.PluginConstraint) []string 
 
 	var rawObj map[string]any
 	if err := json.Unmarshal(c.Parameters.Raw, &rawObj); err != nil {
-		return []string{fmt.Sprintf("pluginConstraint %q parameters must be a valid JSON object: %v", c.PluginName, err)}
+		return []string{fmt.Sprintf("pluginConstraint %q parameters must be a valid JSON object: %v", c.Name, err)}
 	}
 
-	if c.PluginName == workloadsv1.PluginNameGKESpotPlacement {
+	if c.Name == workloadsv1.PluginNameGKESpotPlacement {
 		return validateGKESpotGuardrailParameters(c.Parameters.Raw)
 	}
 
@@ -132,8 +132,8 @@ func validateGKESpotGuardrailParameters(raw []byte) []string {
 		violations = append(violations, fmt.Sprintf("invalid enforcementMode %q: must be one of Allowed, Required, Forbidden", params.EnforcementMode))
 	}
 
-	if params.MinSpotRatio != "" && !percentagePattern.MatchString(params.MinSpotRatio) {
-		violations = append(violations, fmt.Sprintf("invalid minSpotRatio %q: must be an integer percentage between 0%% and 100%%", params.MinSpotRatio))
+	if params.MinSpotRatio != nil && !percentagePattern.MatchString(*params.MinSpotRatio) {
+		violations = append(violations, fmt.Sprintf("invalid minSpotRatio %q: must be an integer percentage between 0%% and 100%%", *params.MinSpotRatio))
 	}
 
 	if params.Fallback != nil && params.Fallback.MaxFallbackRatio != nil {
@@ -151,10 +151,12 @@ func validateGKESpotGuardrailParameters(raw []byte) []string {
 	}
 
 	if params.Reversion != nil {
-		switch params.Reversion.RequiredReversionAction {
-		case "", workloadsv1.ActiveReversionAction, workloadsv1.LazyReversionAction, workloadsv1.NoneReversionAction:
-		default:
-			violations = append(violations, fmt.Sprintf("invalid reversion.requiredReversionAction %q: must be one of Active, Lazy, None", params.Reversion.RequiredReversionAction))
+		if action := params.Reversion.RequiredReversionAction; action != nil {
+			switch *action {
+			case workloadsv1.ActiveReversionAction, workloadsv1.LazyReversionAction, workloadsv1.NoneReversionAction:
+			default:
+				violations = append(violations, fmt.Sprintf("invalid reversion.requiredReversionAction %q: must be one of Active, Lazy, None", *action))
+			}
 		}
 
 		if params.Reversion.MaxFallbackDuration != nil && params.Reversion.MaxFallbackDuration.Duration < 0 {

@@ -151,7 +151,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 			g.Spec.PluginConstraints = &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName:            workloadsv1.PluginNameGKESpotPlacement,
+						Name:                  workloadsv1.PluginNameGKESpotPlacement,
 						AllowedConfigTemplate: "K8sAllowedSpotRatio",
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"enforcementMode":"Allowed","minSpotRatio":"80%","fallback":{"allowFallbackToOnDemand":true,"maxFallbackRatio":"20%"},"reversion":{"requiredReversionAction":"Active","maxFallbackDuration":"2h"}}`),
@@ -194,7 +194,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 			g.Spec.PluginConstraints = &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"enforcementMode":"InvalidMode","minSpotRatio":"150%"}`),
 						},
@@ -249,7 +249,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"enforcementMode":"Required","minSpotRatio":"80%","fallback":{"allowFallbackToOnDemand":true,"maxFallbackRatio":5},"reversion":{"requiredReversionAction":"Lazy","maxFallbackDuration":"30m"}}`),
 						},
@@ -263,7 +263,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: "karpenter-spot-placement",
+						Name: "karpenter-spot-placement",
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"maxSpotPrice":"0.05","instanceFamilies":["m6i","c6i"]}`),
 						},
@@ -277,19 +277,19 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: "   ",
+						Name: "   ",
 					},
 				},
 			},
 			wantViolationCount: 1,
-			wantSubstring:      "pluginName must not be empty",
+			wantSubstring:      "name must not be empty",
 		},
 		{
 			name: "unknown_field_in_gke_spot_parameters_fails",
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"unknownField":"value"}`),
 						},
@@ -304,7 +304,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"enforcementMode":"Optional"}`),
 						},
@@ -319,7 +319,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"minSpotRatio":"80"}`),
 						},
@@ -334,7 +334,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"fallback":{"maxFallbackRatio":"120%"}}`),
 						},
@@ -349,7 +349,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"fallback":{"maxFallbackRatio":-1}}`),
 						},
@@ -364,7 +364,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"reversion":{"requiredReversionAction":"Immediate"}}`),
 						},
@@ -379,7 +379,7 @@ func TestValidatePluginConstraints(t *testing.T) {
 			pc: &workloadsv1.PluginConstraints{
 				Placement: []workloadsv1.PluginConstraint{
 					{
-						PluginName: workloadsv1.PluginNameGKESpotPlacement,
+						Name: workloadsv1.PluginNameGKESpotPlacement,
 						Parameters: &apiextensionsv1.JSON{
 							Raw: []byte(`{"reversion":{"maxFallbackDuration":"-10m"}}`),
 						},
