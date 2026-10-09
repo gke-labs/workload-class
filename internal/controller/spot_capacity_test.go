@@ -26,6 +26,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
@@ -264,4 +265,83 @@ func TestFindWorkloadClassesForClusterAutoscalerStatus(t *testing.T) {
 	if reqs := r.findWorkloadClassesForClusterAutoscalerStatus(context.Background(), sameNameOtherNS); len(reqs) != 0 {
 		t.Errorf("expected 0 reconcile requests for %s in another namespace, got %d", ClusterAutoscalerStatusName, len(reqs))
 	}
+}
+
+func TestClusterAutoscalerStatusPredicate(t *testing.T) {
+	const (
+		spotHealthy = `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`
+		// Same availability as spotHealthy; only the probe timestamp differs.
+		spotHealthyNewProbe = `
+time: 2026-10-09 11:00:10 +0000 UTC
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: NoActivity
+`
+		spotBackoff = `
+nodeGroups:
+- name: gke-cluster-spot-pool-1234-grp
+  health:
+    status: Healthy
+  scaleUp:
+    status: Backoff
+    backoffInfo:
+      errorCode: ZONE_RESOURCE_POOL_EXHAUSTED
+`
+		noSpotGroups = `
+nodeGroups:
+- name: gke-cluster-default-pool-1234-grp
+  health:
+    status: Healthy
+`
+		unparsable = "nodeGroups: [this is: not valid"
+	)
+
+	otherCM := func(status string) *corev1.ConfigMap {
+		cm := autoscalerStatusConfigMap(status)
+		cm.Namespace = "default"
+		return cm
+	}
+
+	p := clusterAutoscalerStatusPredicate()
+
+	updateCases := []struct {
+		name     string
+		old, new *corev1.ConfigMap
+		want     bool
+	}{
+		{name: "unchanged availability (probe timestamp only) is filtered", old: autoscalerStatusConfigMap(spotHealthy), new: autoscalerStatusConfigMap(spotHealthyNewProbe), want: false},
+		{name: "Healthy to Backoff passes", old: autoscalerStatusConfigMap(spotHealthy), new: autoscalerStatusConfigMap(spotBackoff), want: true},
+		{name: "Backoff to Healthy passes", old: autoscalerStatusConfigMap(spotBackoff), new: autoscalerStatusConfigMap(spotHealthy), want: true},
+		{name: "Spot node groups disappearing (switch to node fallback) passes", old: autoscalerStatusConfigMap(spotBackoff), new: autoscalerStatusConfigMap(noSpotGroups), want: true},
+		{name: "status becoming unparsable passes", old: autoscalerStatusConfigMap(noSpotGroups), new: autoscalerStatusConfigMap(unparsable), want: true},
+		{name: "empty to no Spot node groups is filtered", old: autoscalerStatusConfigMap(""), new: autoscalerStatusConfigMap(noSpotGroups), want: false},
+		{name: "unrelated ConfigMap is filtered", old: otherCM(spotHealthy), new: otherCM(spotBackoff), want: false},
+	}
+	for _, tc := range updateCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
+				t.Errorf("Update() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("create and delete pass only for the cluster autoscaler status ConfigMap", func(t *testing.T) {
+		caCM := autoscalerStatusConfigMap(spotHealthy)
+		if !p.Create(event.CreateEvent{Object: caCM}) || !p.Delete(event.DeleteEvent{Object: caCM}) {
+			t.Errorf("expected create/delete of %s to pass", ClusterAutoscalerStatusName)
+		}
+		if p.Create(event.CreateEvent{Object: otherCM(spotHealthy)}) || p.Delete(event.DeleteEvent{Object: otherCM(spotHealthy)}) {
+			t.Errorf("expected create/delete of an unrelated ConfigMap to be filtered")
+		}
+	})
 }
