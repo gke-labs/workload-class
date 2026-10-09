@@ -33,10 +33,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -54,7 +56,7 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/finalizers,verbs=update
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods;namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods;namespaces;configmaps;nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
@@ -119,7 +121,17 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// 4. Reconcile the PDB
+	// 4. Check Spot capacity availability for WorkloadClasses that target Spot
+	if targetsSpot(wc) {
+		spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
+		if err != nil {
+			log.Error(err, "Failed to check Spot capacity")
+		} else {
+			log.Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
+		}
+	}
+
+	// 5. Reconcile the PDB
 	err = r.reconcilePDB(ctx, wc, validationCond, overlappingClasses)
 	if err != nil {
 		r.Recorder.Eventf(
@@ -671,6 +683,11 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
+		).
+		Watches(
+			&corev1.ConfigMap{}, // Re-check Spot capacity when kube-system/cluster-autoscaler-status changes
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isClusterAutoscalerStatus)),
 		).
 		Named("workloadclass").
 		Complete(r)
