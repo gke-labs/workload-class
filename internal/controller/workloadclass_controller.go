@@ -56,6 +56,8 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/finalizers,verbs=update
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods;namespaces;configmaps;nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
@@ -120,17 +122,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// 4. Check Spot capacity availability for WorkloadClasses that target Spot
-	if targetsSpot(wc) {
-		spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
-		if err != nil {
-			log.Error(err, "Failed to check Spot capacity")
-		} else {
-			log.Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
-		}
-	}
-
-	// 5. Reconcile the PDB
+	// 4. Reconcile the PDB (before Spot reversion so the PDB exists to pace reversion evictions)
 	err = r.reconcilePDB(ctx, wc, validationCond, overlappingClasses)
 	if err != nil {
 		r.Recorder.Eventf(
@@ -142,6 +134,25 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			"Failed to reconcile PDB: %s",
 			err.Error(),
 		)
+	}
+
+	// 5. Check Spot capacity and perform Active reversion for WorkloadClasses that target Spot
+	if targetsSpot(wc) {
+		spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
+		if err != nil {
+			log.Error(err, "Failed to check Spot capacity")
+		} else {
+			log.Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
+		}
+
+		if spotCapacityAvailable && validationCond.Status == metav1.ConditionTrue {
+			reversionRequeue, err := r.reconcileSpotReversion(ctx, wc, time.Now().UTC())
+			if err != nil {
+				log.Error(err, "Failed to reconcile Spot reversion")
+				reversionRequeue = evictionRetryDelay
+			}
+			nextReconcile = minPositiveDuration(nextReconcile, reversionRequeue)
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: nextReconcile}, nil
