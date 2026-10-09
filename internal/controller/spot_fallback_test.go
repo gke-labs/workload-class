@@ -55,15 +55,14 @@ func onDemandPod(name, nodeName string) *corev1.Pod {
 	return newReversionPod(name, nodeName, time.Now().Add(-time.Hour))
 }
 
-func inFallbackCondition(status metav1.ConditionStatus) metav1.Condition {
-	reason := workloadsv1.ReasonSpotTargetMet
-	if status == metav1.ConditionTrue {
-		reason = workloadsv1.ReasonFallbackActive
+// inFallbackTrue returns a new InFallback=True condition, as set when Pods have fallen back to On-Demand.
+func inFallbackTrue() *metav1.Condition {
+	return &metav1.Condition{
+		Type:   workloadsv1.ConditionTypeInFallback,
+		Status: metav1.ConditionTrue,
+		Reason: workloadsv1.ReasonFallbackActive,
 	}
-	return metav1.Condition{Type: workloadsv1.ConditionTypeInFallback, Status: status, Reason: reason}
 }
-
-func condPtr(c metav1.Condition) *metav1.Condition { return &c }
 
 func TestReconcileFallbackState(t *testing.T) {
 	scheme := newFallbackScheme()
@@ -136,7 +135,7 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "None latches InFallback=True while the workload has active Pods",
 			cs:          fallbackCS("100%"),
 			reversion:   &none,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			pods:        []client.Object{onDemandPod("pinned-od-1", "ondemand-node-1")},
 			wantChanged: false,
 			wantStatus:  metav1.ConditionTrue,
@@ -145,7 +144,7 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "unset reversion action defaults to None and latches",
 			cs:          fallbackCS("100%"),
 			reversion:   &workloadsv1.SpotReversionPolicy{},
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			pods:        []client.Object{onDemandPod("pinned-od-1", "ondemand-node-1")},
 			wantChanged: false,
 			wantStatus:  metav1.ConditionTrue,
@@ -154,7 +153,7 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "None releases the latch when the workload scales to zero",
 			cs:          fallbackCS("100%"),
 			reversion:   &none,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			wantChanged: true,
 			wantStatus:  metav1.ConditionFalse,
 		},
@@ -162,7 +161,7 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "Lazy clears InFallback once no fallback Pods remain",
 			cs:          fallbackCS("100%"),
 			reversion:   &lazy,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			pods:        []client.Object{spotTargetedPod("spot-1", "spot-node-1")},
 			wantChanged: true,
 			wantStatus:  metav1.ConditionFalse,
@@ -171,7 +170,7 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "without a profile ref reversion is Lazy, so InFallback is not latched",
 			cs:          fallbackCS("100%"),
 			noRef:       true,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			pods:        []client.Object{onDemandPod("od-1", "ondemand-node-1")},
 			wantChanged: true,
 			wantStatus:  metav1.ConditionFalse,
@@ -179,7 +178,7 @@ func TestReconcileFallbackState(t *testing.T) {
 		{
 			name:        "missing policy is treated as Lazy",
 			cs:          fallbackCS("100%"),
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			pods:        []client.Object{onDemandPod("od-1", "ondemand-node-1")},
 			wantChanged: true,
 			wantStatus:  metav1.ConditionFalse,
@@ -197,7 +196,7 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "not validated leaves the condition untouched",
 			cs:          fallbackCS("100%"),
 			reversion:   &lazy,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			notValid:    true,
 			pods:        []client.Object{spotTargetedPod("spot-1", "spot-node-1")},
 			wantChanged: false,
@@ -207,14 +206,14 @@ func TestReconcileFallbackState(t *testing.T) {
 			name:        "FallbackAction Fail removes the condition",
 			cs:          &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFail},
 			reversion:   &none,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			wantChanged: true,
 		},
 		{
 			name:        "Type OnDemand removes the condition",
 			cs:          &workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeOnDemand, FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand},
 			reversion:   &none,
-			existing:    condPtr(inFallbackCondition(metav1.ConditionTrue)),
+			existing:    inFallbackTrue(),
 			wantChanged: true,
 		},
 		{
