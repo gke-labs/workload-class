@@ -187,7 +187,7 @@ func (r *WorkloadClassReconciler) classifyWorkloadClassPods(ctx context.Context,
 
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		if !isPodActive(pod) {
 			continue
 		}
 

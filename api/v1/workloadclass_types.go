@@ -221,9 +221,10 @@ const (
 	// on On-Demand fallback capacity due to a Spot stockout.
 	ConditionTypeInFallback = "InFallback"
 
-	// ReasonFallbackActive indicates that one or more Pods are running on On-Demand fallback capacity below the target SpotRatio.
+	// ReasonFallbackActive indicates that one or more Spot-targeted Pods are running on On-Demand fallback capacity,
+	// or (with reversion None) that the workload fell back and remains latched on On-Demand.
 	ReasonFallbackActive = "FallbackActive"
-	// ReasonSpotTargetMet indicates that the workload meets its target SpotRatio with no active fallback deficit.
+	// ReasonSpotTargetMet indicates that no Spot-targeted Pods are running on On-Demand fallback capacity.
 	ReasonSpotTargetMet = "SpotTargetMet"
 )
 
