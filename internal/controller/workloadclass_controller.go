@@ -113,6 +113,13 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 2.1 Track whether Spot-targeted Pods have fallen back to On-Demand (InFallback condition)
+	fallbackChanged, err := r.reconcileFallbackState(ctx, wc, validationCond.Status == metav1.ConditionTrue)
+	if err != nil {
+		log.Error(err, "Failed to reconcile Spot fallback state")
+	}
+	changed = changed || fallbackChanged
+
 	// 3. Update Status
 	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
 		wc.Status.MaintenanceReadiness = readiness
@@ -698,6 +705,11 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&corev1.ConfigMap{}, // Re-check Spot capacity when kube-system/cluster-autoscaler-status changes
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
 			builder.WithPredicates(clusterAutoscalerStatusPredicate()),
+		).
+		Watches(
+			&corev1.Pod{}, // Re-evaluate InFallback when Pods are bound, terminate, or are deleted
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassForPod),
+			builder.WithPredicates(podPlacementChangePredicate()),
 		).
 		Named("workloadclass").
 		Complete(r)
