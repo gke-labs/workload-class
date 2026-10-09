@@ -25,7 +25,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
@@ -165,6 +167,38 @@ func (r *WorkloadClassReconciler) hasReadySpotNodes(ctx context.Context) (bool, 
 // isClusterAutoscalerStatus reports whether obj is the kube-system/cluster-autoscaler-status ConfigMap.
 func isClusterAutoscalerStatus(obj client.Object) bool {
 	return obj.GetNamespace() == ClusterAutoscalerStatusNamespace && obj.GetName() == ClusterAutoscalerStatusName
+}
+
+// clusterAutoscalerStatusPredicate filters ConfigMap events down to the cluster autoscaler status ConfigMap.
+// The cluster autoscaler rewrites the ConfigMap every few seconds (e.g. with fresh probe timestamps), so
+// updates are only passed through when the Spot availability derived from it changes.
+func clusterAutoscalerStatusPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return isClusterAutoscalerStatus(e.Object) },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return isClusterAutoscalerStatus(e.Object) },
+		GenericFunc: func(e event.GenericEvent) bool { return isClusterAutoscalerStatus(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if !isClusterAutoscalerStatus(e.ObjectNew) {
+				return false
+			}
+			return spotAvailabilityChanged(e.ObjectOld, e.ObjectNew)
+		},
+	}
+}
+
+// spotAvailabilityChanged reports whether the Spot availability parsed from the cluster autoscaler status
+// differs between the old and new ConfigMap. A change in whether Spot node groups are reported (which
+// switches checkSpotCapacity to or from the node fallback) or in parseability also counts as a change.
+func spotAvailabilityChanged(oldObj, newObj client.Object) bool {
+	oldCM, okOld := oldObj.(*corev1.ConfigMap)
+	newCM, okNew := newObj.(*corev1.ConfigMap)
+	if !okOld || !okNew {
+		return true
+	}
+
+	oldAvailable, oldFound, oldErr := spotCapacityFromAutoscalerStatus(oldCM.Data["status"])
+	newAvailable, newFound, newErr := spotCapacityFromAutoscalerStatus(newCM.Data["status"])
+	return oldAvailable != newAvailable || oldFound != newFound || (oldErr == nil) != (newErr == nil)
 }
 
 // findWorkloadClassesForClusterAutoscalerStatus enqueues all WorkloadClasses that target Spot capacity when

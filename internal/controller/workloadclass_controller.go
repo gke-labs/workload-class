@@ -38,7 +38,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -687,7 +686,7 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&corev1.ConfigMap{}, // Re-check Spot capacity when kube-system/cluster-autoscaler-status changes
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
-			builder.WithPredicates(predicate.NewPredicateFuncs(isClusterAutoscalerStatus)),
+			builder.WithPredicates(clusterAutoscalerStatusPredicate()),
 		).
 		Named("workloadclass").
 		Complete(r)
