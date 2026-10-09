@@ -57,17 +57,15 @@ func tracksFallback(wc *workloadsv1.WorkloadClass) bool {
 // fallback.
 //
 //   - Not applicable (no Spot targeting or FallbackAction is not FallbackToOnDemand): the condition is removed.
-//   - Not validated: the condition is left untouched, so a transient validation failure doesn't release a
-//     latched None fallback.
+//   - Not validated: the condition is removed. The Pod placement webhook doesn't mutate Pods of an invalid
+//     WorkloadClass, so the condition would be stale. This also releases a None latch when the WorkloadClass
+//     becomes invalid, e.g. when a guardrail sets maxFallbackDuration (which None reversion is not allowed with).
 //   - In fallback: InFallback=True.
 //   - Not in fallback: InFallback=False, except with reversion None, where InFallback=True is latched (so the
 //     Pod placement webhook keeps new Pods on On-Demand) until the workload scales down to zero Pods.
 func (r *WorkloadClassReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass, validated bool) (bool, error) {
-	if !tracksFallback(wc) {
+	if !tracksFallback(wc) || !validated {
 		return meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypeInFallback), nil
-	}
-	if !validated {
-		return false, nil
 	}
 
 	reversionAction, err := r.effectiveReversionAction(ctx, wc)
