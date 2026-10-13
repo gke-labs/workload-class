@@ -84,10 +84,12 @@ func TestReconcileFallbackState(t *testing.T) {
 		reversion *workloadsv1.SpotReversionPolicy
 		noRef     bool
 		// existing is the InFallback condition already on the WorkloadClass, if any.
-		existing    *metav1.Condition
-		notValid    bool
-		pods        []client.Object
-		wantChanged bool
+		existing *metav1.Condition
+		notValid bool
+		// pluginPending sets PlacementPluginAttached=False/PluginPending, as the controller does on a generation bump.
+		pluginPending bool
+		pods          []client.Object
+		wantChanged   bool
 		// wantStatus is the expected InFallback status; "" means the condition must be absent.
 		wantStatus metav1.ConditionStatus
 	}{
@@ -219,6 +221,26 @@ func TestReconcileFallbackState(t *testing.T) {
 			wantChanged: false,
 		},
 		{
+			name:          "plugin pending after a generation bump keeps a None latch",
+			cs:            fallbackCS("100%"),
+			reversion:     &none,
+			existing:      inFallbackTrue(),
+			notValid:      true,
+			pluginPending: true,
+			pods:          []client.Object{onDemandPod("pinned-od-1", "ondemand-node-1")},
+			wantChanged:   false,
+			wantStatus:    metav1.ConditionTrue,
+		},
+		{
+			name:          "plugin pending does not set the condition either",
+			cs:            fallbackCS("100%"),
+			reversion:     &lazy,
+			notValid:      true,
+			pluginPending: true,
+			pods:          []client.Object{spotTargetedPod("fallback-1", "ondemand-node-1")},
+			wantChanged:   false,
+		},
+		{
 			name:        "FallbackAction Fail removes the condition",
 			cs:          &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFail},
 			reversion:   &none,
@@ -244,6 +266,13 @@ func TestReconcileFallbackState(t *testing.T) {
 			if tc.noRef {
 				wc.Spec.InfrastructureProfileRef = nil
 				wc.Status.Conditions = nil
+			}
+			if tc.pluginPending {
+				wc.Status.Conditions = []metav1.Condition{{
+					Type:   workloadsv1.ConditionTypePlacementPluginAttached,
+					Status: metav1.ConditionFalse,
+					Reason: workloadsv1.ReasonPluginPending,
+				}}
 			}
 			if tc.existing != nil {
 				wc.Status.Conditions = append(wc.Status.Conditions, *tc.existing)
