@@ -57,14 +57,24 @@ func tracksFallback(wc *workloadsv1.WorkloadClass) bool {
 // fallback.
 //
 //   - Not applicable (no Spot targeting or FallbackAction is not FallbackToOnDemand): the condition is removed.
-//   - Not validated: the condition is removed. The Pod placement webhook doesn't mutate Pods of an invalid
-//     WorkloadClass, so the condition would be stale. This also releases a None latch when the WorkloadClass
-//     becomes invalid, e.g. when a guardrail sets maxFallbackDuration (which None reversion is not allowed with).
+//   - Waiting for the placement plugin (PlacementPluginAttached=False with reason PluginPending): the condition
+//     is left untouched. This state is transient and happens on every WorkloadClass generation bump, so
+//     removing the condition here would release a None latch whenever an unrelated spec field is edited.
+//   - Otherwise not validated (guardrail violation, missing or invalid policy): the condition is removed. The
+//     Pod placement webhook doesn't mutate Pods of an invalid WorkloadClass, so the condition would be stale.
+//     This also releases a None latch when the WorkloadClass becomes invalid, e.g. when a guardrail sets
+//     maxFallbackDuration (which None reversion is not allowed with).
 //   - In fallback: InFallback=True.
 //   - Not in fallback: InFallback=False, except with reversion None, where InFallback=True is latched (so the
 //     Pod placement webhook keeps new Pods on On-Demand) until the workload scales down to zero Pods.
 func (r *WorkloadClassReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass, validated bool) (bool, error) {
-	if !tracksFallback(wc) || !validated {
+	if !tracksFallback(wc) {
+		return meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypeInFallback), nil
+	}
+	if !validated {
+		if isPlacementPluginPending(wc) {
+			return false, nil
+		}
 		return meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypeInFallback), nil
 	}
 
@@ -106,6 +116,14 @@ func (r *WorkloadClassReconciler) reconcileFallbackState(ctx context.Context, wc
 			"activePods", activePods, "reversionAction", reversionAction)
 	}
 	return changed, nil
+}
+
+// isPlacementPluginPending reports whether the WorkloadClass is waiting for its placement plugin to (re)attach,
+// i.e. PlacementPluginAttached is False with reason PluginPending. The WorkloadClass controller resets the
+// condition to this state on every generation bump until the plugin controller reconciles the new generation.
+func isPlacementPluginPending(wc *workloadsv1.WorkloadClass) bool {
+	cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
+	return cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == workloadsv1.ReasonPluginPending
 }
 
 // effectiveReversionAction returns the reversion action from the WorkloadClass's attached GKESpotPlacementPolicy,
