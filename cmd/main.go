@@ -220,6 +220,14 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "gkespotplacementpolicy")
 		os.Exit(1)
 	}
+	if err := (&controller.GKESpotPlacementReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("gkespotplacement-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "gkespotplacement")
+		os.Exit(1)
+	}
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		if err := webhookv1.SetupPodWebhookWithManager(mgr); err != nil {
