@@ -139,7 +139,7 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 		return nil
 	}
 
-	log.Info("Mutated Pod placement", "targetSpot", isPodTargetedForSpot(pod))
+	log.Info("Mutated Pod placement", "targetSpot", utils.IsPodTargetedForSpot(pod))
 	return nil
 }
 

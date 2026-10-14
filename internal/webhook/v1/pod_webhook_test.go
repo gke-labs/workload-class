@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 func readyConditions() []metav1.Condition {
@@ -147,7 +148,7 @@ var _ = Describe("Pod Webhook", func() {
 			Expect(newDefaulter(wlc, policy).Default(testCtx, pod)).To(Succeed())
 
 			Expect(pod.Spec.NodeSelector).NotTo(HaveKey(SpotLabelKey))
-			Expect(isPodTargetedForSpot(pod)).To(BeTrue())
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 			Expect(pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
 			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
 				{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
@@ -185,7 +186,7 @@ var _ = Describe("Pod Webhook", func() {
 			pod := newIncomingPod()
 			Expect(newDefaulter(wlc, policy, existing, newNode("od-node", false)).Default(testCtx, pod)).To(Succeed())
 
-			Expect(isPodTargetedForSpot(pod)).To(BeTrue())
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 		})
 	})
 
@@ -201,7 +202,7 @@ var _ = Describe("Pod Webhook", func() {
 			pod := newIncomingPod()
 			Expect(newDefaulter(objs...).Default(testCtx, pod)).To(Succeed())
 
-			Expect(isPodTargetedForSpot(pod)).To(BeTrue())
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 		})
 
 		It("places the Pod on On-Demand once the target ratio is met", func() {
@@ -271,7 +272,7 @@ var _ = Describe("Pod Webhook", func() {
 			pod := newIncomingPod()
 			Expect(newDefaulter(wlc).Default(testCtx, pod)).To(Succeed())
 
-			Expect(isPodTargetedForSpot(pod)).To(BeTrue())
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 			Expect(pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
 			Expect(requiredTerms(pod)).To(BeEmpty())
 		})
@@ -282,7 +283,7 @@ var _ = Describe("Pod Webhook", func() {
 			pod := newIncomingPod()
 			Expect(newDefaulter(wlc, existing, newNode("od-node", false)).Default(testCtx, pod)).To(Succeed())
 
-			Expect(isPodTargetedForSpot(pod)).To(BeTrue())
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 		})
 
 		It("does nothing when Validated is not True", func() {

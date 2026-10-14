@@ -34,9 +34,9 @@ import (
 
 const (
 	// SpotLabelKey is the GKE node label indicating a Spot VM node.
-	SpotLabelKey = "cloud.google.com/gke-spot"
+	SpotLabelKey = utils.SpotLabelKey
 	// SpotLabelValue is the value for SpotLabelKey on Spot VM nodes.
-	SpotLabelValue = "true"
+	SpotLabelValue = utils.SpotLabelValue
 	// ProvisioningLabelKey is the GKE node label indicating provisioning model ("spot" or "standard").
 	ProvisioningLabelKey = "cloud.google.com/gke-provisioning"
 	// MachineFamilyLabelKey is the GKE node label indicating the GCE machine family (e.g., "n2d", "t2d").
@@ -66,7 +66,7 @@ func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomi
 	}
 
 	for _, existing := range pods {
-		if existing.Spec.NodeName == "" || !isPodTargetedForSpot(existing) {
+		if existing.Spec.NodeName == "" || !utils.IsPodTargetedForSpot(existing) {
 			continue
 		}
 		if isSpot, known := d.isNodeSpot(ctx, existing.Spec.NodeName); known && !isSpot {
@@ -111,9 +111,7 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 	var pods []*corev1.Pod
 	for i := range podList.Items {
 		existing := &podList.Items[i]
-		if existing.DeletionTimestamp != nil ||
-			existing.Status.Phase == corev1.PodSucceeded ||
-			existing.Status.Phase == corev1.PodFailed {
+		if !utils.IsPodActive(existing) {
 			continue
 		}
 		if incomingPod.Name != "" && existing.Name == incomingPod.Name {
@@ -133,7 +131,7 @@ func (d *PodPlacementDefaulter) isPodEffectiveSpot(ctx context.Context, pod *cor
 			return isSpot
 		}
 	}
-	return isPodTargetedForSpot(pod)
+	return utils.IsPodTargetedForSpot(pod)
 }
 
 // isNodeSpot reports whether the named node carries the GKE Spot label. known is false when the
@@ -147,21 +145,6 @@ func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string)
 		return false, false
 	}
 	return node.Labels[SpotLabelKey] == SpotLabelValue, true
-}
-
-// isPodTargetedForSpot reports whether the Pod has been directed at Spot capacity, either via the
-// Spot nodeSelector or the Spot toleration.
-func isPodTargetedForSpot(pod *corev1.Pod) bool {
-	return pod.Spec.NodeSelector[SpotLabelKey] == SpotLabelValue ||
-		slices.ContainsFunc(pod.Spec.Tolerations, isSpotToleration)
-}
-
-// isSpotToleration reports whether t tolerates the GKE Spot NoSchedule taint (gke-spot=true).
-func isSpotToleration(t corev1.Toleration) bool {
-	return t.Key == SpotLabelKey &&
-		(t.Operator == corev1.TolerationOpEqual || t.Operator == "") &&
-		t.Value == SpotLabelValue &&
-		t.Effect == corev1.TaintEffectNoSchedule
 }
 
 // mutateForOnDemand pins the Pod to On-Demand (non-Spot) nodes.
@@ -241,7 +224,7 @@ func setNodeSelector(pod *corev1.Pod, key, value string) {
 
 // ensureSpotToleration adds the GKE Spot toleration to the Pod if it isn't already present.
 func ensureSpotToleration(pod *corev1.Pod) {
-	if slices.ContainsFunc(pod.Spec.Tolerations, isSpotToleration) {
+	if slices.ContainsFunc(pod.Spec.Tolerations, utils.IsSpotToleration) {
 		return
 	}
 	pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{
@@ -259,7 +242,7 @@ func removeSpotToleration(pod *corev1.Pod) {
 	}
 	filtered := pod.Spec.Tolerations[:0]
 	for _, t := range pod.Spec.Tolerations {
-		if isSpotToleration(t) {
+		if utils.IsSpotToleration(t) {
 			continue
 		}
 		filtered = append(filtered, t)
