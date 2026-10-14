@@ -17,8 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -47,14 +49,24 @@ func tracksFallback(wc *workloadsv1.WorkloadClass) bool {
 	return utils.TargetsSpot(wc) && wc.Spec.CapacityStrategy.FallbackAction == workloadsv1.FallbackActionFallbackToOnDemand
 }
 
-// workloadPods is the classification of a WorkloadClass's active Pods by placement.
+// workloadPods is the classification of a WorkloadClass's active (non-terminating, non-terminal) Pods by
+// placement.
 type workloadPods struct {
-	// active is the number of active (non-terminating, non-terminal) Pods selected by the WorkloadClass,
-	// including unscheduled ones.
+	// active is the number of active Pods selected by the WorkloadClass, including unscheduled ones.
 	active int
-	// fallback is the number of Spot-targeted Pods scheduled on non-Spot nodes.
-	fallback int
+	// spot is the number of Pods scheduled on Spot nodes.
+	spot int
+	// pendingSpot is the number of unscheduled Spot-targeted Pods. They are waiting for Spot capacity and
+	// count as Spot for ratio purposes (as the Pod placement webhook does), so a scale-up doesn't look like a
+	// Spot deficit.
+	pendingSpot int
+	// fallback holds the Spot-targeted Pods scheduled on non-Spot nodes: the Pods that have fallen back to
+	// On-Demand and are candidates for reversion.
+	fallback []corev1.Pod
 }
+
+// effectiveSpot returns the number of Pods counted as Spot for SpotRatio purposes.
+func (p workloadPods) effectiveSpot() int { return p.spot + p.pendingSpot }
 
 // desiredFallbackCondition computes the InFallback condition the WorkloadClass should have. It returns
 // (nil, false) when the condition should be absent, and (nil, true) when the current condition should be
@@ -78,7 +90,7 @@ func desiredFallbackCondition(wc *workloadsv1.WorkloadClass, pods workloadPods, 
 	latched := meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeInFallback)
 
 	switch {
-	case pods.fallback > 0:
+	case len(pods.fallback) > 0:
 		c.Status, c.Reason, c.Message = metav1.ConditionTrue, workloadsv1.ReasonFallbackActive, fallbackActiveMsg
 	case latched && reversion == workloadsv1.NoneReversionAction && pods.active > 0:
 		return nil, true
@@ -90,11 +102,11 @@ func desiredFallbackCondition(wc *workloadsv1.WorkloadClass, pods workloadPods, 
 	return c, false
 }
 
-// reconcileFallbackState computes and persists the InFallback condition for the WorkloadClass. It returns
-// the classification of the WorkloadClass's Pods so later steps (reversion) can reuse it.
-func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadPods, error) {
+// reconcileFallbackState computes and persists the InFallback condition for the WorkloadClass. policy is the
+// WorkloadClass's attached GKESpotPlacementPolicy, or nil. It returns the classification of the
+// WorkloadClass's Pods so later steps (reversion) can reuse it.
+func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass, policy *workloadsv1.GKESpotPlacementPolicy) (workloadPods, error) {
 	var pods workloadPods
-	var reversion workloadsv1.ReversionAction
 	if tracksFallback(wc) {
 		spotNodes, err := r.listSpotNodeNames(ctx)
 		if err != nil {
@@ -104,13 +116,9 @@ func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context,
 		if err != nil {
 			return pods, err
 		}
-		reversion, err = r.effectiveReversionAction(ctx, wc)
-		if err != nil {
-			return pods, err
-		}
 	}
 
-	desired, keep := desiredFallbackCondition(wc, pods, reversion)
+	desired, keep := desiredFallbackCondition(wc, pods, reversionActionFor(policy))
 	if keep {
 		return pods, nil
 	}
@@ -163,27 +171,36 @@ func conditionStatus(c *metav1.Condition) string {
 	return string(c.Status)
 }
 
-// effectiveReversionAction returns the reversion action from the WorkloadClass's attached GKESpotPlacementPolicy,
-// defaulting to None when the policy leaves it unset. Without an attached GKESpotPlacementPolicy there is no
-// reversion configuration, and reversion is treated as Lazy (matching the Pod placement webhook).
-func (r *GKESpotPlacementReconciler) effectiveReversionAction(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.ReversionAction, error) {
+// attachedPolicy returns the GKESpotPlacementPolicy the WorkloadClass references, or nil if it references none,
+// the policy has not attached (PlacementPluginAttached is not True), or the policy does not exist.
+func (r *GKESpotPlacementReconciler) attachedPolicy(ctx context.Context, wc *workloadsv1.WorkloadClass) (*workloadsv1.GKESpotPlacementPolicy, error) {
 	ref := wc.Spec.InfrastructureProfileRef
 	if !utils.ReferencesGKESpotPlacementPolicy(ref) ||
 		!meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached) {
-		return workloadsv1.LazyReversionAction, nil
+		return nil, nil
 	}
 
 	policy := &workloadsv1.GKESpotPlacementPolicy{}
 	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name}, policy); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			return workloadsv1.LazyReversionAction, nil
+			return nil, nil
 		}
-		return "", fmt.Errorf("failed to get GKESpotPlacementPolicy %s: %w", ref.Name, err)
+		return nil, fmt.Errorf("failed to get GKESpotPlacementPolicy %s: %w", ref.Name, err)
+	}
+	return policy, nil
+}
+
+// reversionActionFor returns the effective reversion action for a policy: the policy's action, defaulting to
+// None when unset. Without an attached policy there is no reversion configuration, and reversion is treated
+// as Lazy (matching the Pod placement webhook).
+func reversionActionFor(policy *workloadsv1.GKESpotPlacementPolicy) workloadsv1.ReversionAction {
+	if policy == nil {
+		return workloadsv1.LazyReversionAction
 	}
 	if policy.Spec.Reversion.Action == "" {
-		return workloadsv1.NoneReversionAction, nil
+		return workloadsv1.NoneReversionAction
 	}
-	return policy.Spec.Reversion.Action, nil
+	return policy.Spec.Reversion.Action
 }
 
 // listSpotNodeNames returns the names of all nodes labeled as GKE Spot nodes.
@@ -200,11 +217,10 @@ func (r *GKESpotPlacementReconciler) listSpotNodeNames(ctx context.Context) (map
 	return spotNodes, nil
 }
 
-// classifyWorkloadPods counts the active Pods the WorkloadClass applies to and how many of them are
-// Spot-targeted Pods scheduled on non-Spot nodes. A nil PodSelector, or the WorkloadClass being the namespace
-// default, selects all Pods in the namespace (see utils.WorkloadClassPodSelector). When multiple WorkloadClasses
-// exist in the namespace, each Pod is only counted for its best-matching WorkloadClass (matching the Pod
-// placement webhook and Pod watch mapper).
+// classifyWorkloadPods splits the active Pods the WorkloadClass applies to by placement. A nil PodSelector, or
+// the WorkloadClass being the namespace default, selects all Pods in the namespace (see
+// utils.WorkloadClassPodSelector). When multiple WorkloadClasses exist in the namespace, each Pod is only
+// counted for its best-matching WorkloadClass (matching the Pod placement webhook and Pod watch mapper).
 func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass, spotNodes map[string]bool) (workloadPods, error) {
 	var result workloadPods
 
@@ -239,10 +255,26 @@ func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, w
 			}
 		}
 		result.active++
-		if pod.Spec.NodeName != "" && !spotNodes[pod.Spec.NodeName] && utils.IsPodTargetedForSpot(pod) {
-			result.fallback++
+		targeted := utils.IsPodTargetedForSpot(pod)
+		switch {
+		case pod.Spec.NodeName == "":
+			if targeted {
+				result.pendingSpot++
+			}
+		case spotNodes[pod.Spec.NodeName]:
+			result.spot++
+		case targeted:
+			result.fallback = append(result.fallback, *pod)
 		}
 	}
+	// Oldest fallback Pods first (breaking ties by name), so reversion is deterministic and evicts the
+	// longest-running fallback first.
+	slices.SortFunc(result.fallback, func(a, b corev1.Pod) int {
+		return cmp.Or(
+			podFallbackStartTime(&a).Compare(podFallbackStartTime(&b)),
+			cmp.Compare(a.Name, b.Name),
+		)
+	})
 	return result, nil
 }
 
@@ -291,4 +323,30 @@ func (r *GKESpotPlacementReconciler) findWorkloadClassForPod(ctx context.Context
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(wc)}}
+}
+
+// findWorkloadClassesForPolicy enqueues all GKE-managed WorkloadClasses that reference the given
+// GKESpotPlacementPolicy and track fallback (e.g. when reversion.action or minDurationOnFallback changes).
+func (r *GKESpotPlacementReconciler) findWorkloadClassesForPolicy(ctx context.Context, obj client.Object) []reconcile.Request {
+	policy, ok := obj.(*workloadsv1.GKESpotPlacementPolicy)
+	if !ok || policy == nil {
+		return nil
+	}
+
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list WorkloadClasses for GKESpotPlacementPolicy", "policy", policy.Name)
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range workloadClasses.Items {
+		wc := &workloadClasses.Items[i]
+		ref := wc.Spec.InfrastructureProfileRef
+		if !utils.ReferencesGKESpotPlacementPolicy(ref) || ref.Name != policy.Name || !tracksFallback(wc) {
+			continue
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(wc)})
+	}
+	return requests
 }

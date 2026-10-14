@@ -453,3 +453,35 @@ func TestFindWorkloadClassForPod(t *testing.T) {
 		})
 	}
 }
+
+func TestFindWorkloadClassesForPolicy(t *testing.T) {
+	scheme := newGKESpotScheme()
+
+	matchingWC := newManagedWC(fallbackCS("100%"))
+	failWC := newManagedWC(&workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFail})
+	failWC.Name = "fail-wc"
+	otherPolicyWC := newManagedWC(fallbackCS("100%"))
+	otherPolicyWC.Name = "other-policy-wc"
+	otherPolicyWC.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{Kind: "GKESpotPlacementPolicy", Name: "other-policy"}
+	noRefWC := newManagedWC(fallbackCS("100%"))
+	noRefWC.Name = "no-ref-wc"
+	noRefWC.Spec.InfrastructureProfileRef = nil
+
+	r := &GKESpotPlacementReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(matchingWC, failWC, otherPolicyWC, noRefWC).Build(),
+		Scheme: scheme,
+	}
+
+	policy := newPolicy(workloadsv1.SpotReversionPolicy{Action: workloadsv1.ActiveReversionAction})
+	reqs := r.findWorkloadClassesForPolicy(context.Background(), policy)
+	if len(reqs) != 1 || reqs[0].Name != matchingWC.Name || reqs[0].Namespace != matchingWC.Namespace {
+		t.Errorf("expected a single reconcile request for %s/%s, got %v", matchingWC.Namespace, matchingWC.Name, reqs)
+	}
+
+	if reqs := r.findWorkloadClassesForPolicy(context.Background(), &workloadsv1.GKESpotPlacementPolicy{ObjectMeta: metav1.ObjectMeta{Name: "unused"}}); len(reqs) != 0 {
+		t.Errorf("expected 0 reconcile requests for unused policy, got %d", len(reqs))
+	}
+	if reqs := r.findWorkloadClassesForPolicy(context.Background(), nil); len(reqs) != 0 {
+		t.Errorf("expected 0 reconcile requests for nil object, got %d", len(reqs))
+	}
+}
