@@ -259,13 +259,16 @@ func forceDeletePod(ns, name string) {
 }
 
 // createExistingPod creates a Pod that is expected to stay around for the duration of the test and is
-// counted by the webhook as an existing Pod of the workload.
-func createExistingPod(pod *corev1.Pod) {
+// counted by the webhook as an existing Pod of the workload. It returns the created Pod.
+func createExistingPod(pod *corev1.Pod) *corev1.Pod {
 	GinkgoHelper()
+	var created *corev1.Pod
 	Eventually(func() error {
-		_, err := createPod(pod)
+		var err error
+		created, err = createPod(pod)
 		return err
 	}).Should(Succeed())
+	return created
 }
 
 // admitProbePod creates the Pod, returns the admitted (mutated) object, and immediately deletes it so it
@@ -736,29 +739,38 @@ var _ = Describe("Pod Placement Webhook", Ordered, func() {
 			expectPreferredSpotConsistently(app)
 		})
 
-		It("keeps new Pods on On-Demand when reversion is None and the WorkloadClass reports InFallback", func() {
+		It("latches InFallback for reversion None after the fallback Pod is gone, and releases it at zero Pods", func() {
 			const app = "fallback-condition"
+			By("creating a Spot-targeted Pod on a non-Spot node and another active Pod of the workload")
+			fallbackPod := createExistingPod(newPlacementPod(app, withSpotTolerationOpt(), onNode(nodeName)))
+			remainingPod := createExistingPod(newPlacementPod(app, asPendingOnDemandPod()))
+
 			Expect(applyObject(newPlacementPolicy(workloadsv1.GKESpotPlacementPolicySpec{
 				Reversion: workloadsv1.SpotReversionPolicy{Action: workloadsv1.NoneReversionAction},
 			}))).To(Succeed())
 			Expect(applyObject(newPlacementWorkloadClass(app, fallbackStrategy(), withSpotPolicyRef()))).To(Succeed())
 			expectWorkloadClassReady(app, placementNS, true)
 
-			By("verifying Pods target Spot before the InFallback condition is set")
-			Eventually(func(g Gomega) {
-				expectPreferredSpot(g, admitProbePod(g, newPlacementPod(app)))
-			}).Should(Succeed())
-
-			By("setting InFallback=True on the WorkloadClass status")
-			patch := fmt.Sprintf(`[{"op":"add","path":"/status/conditions/-","value":{"type":%q,"status":"True","reason":%q,"message":"e2e","lastTransitionTime":%q}}]`,
-				workloadsv1.ConditionTypeInFallback, workloadsv1.ReasonFallbackActive, time.Now().UTC().Format(time.RFC3339))
-			_, err := utils.Run(exec.Command("kubectl", "patch", "workloadclass", app, "-n", placementNS,
-				"--subresource=status", "--type=json", "-p", patch))
-			Expect(err).NotTo(HaveOccurred())
+			By("verifying the controller reports InFallback=True")
 			expectWorkloadClassCondition(app, placementNS, workloadsv1.ConditionTypeInFallback, "True")
 
-			Eventually(func(g Gomega) {
+			By("deleting the fallback Pod, so only the InFallback condition records the fallback")
+			forceDeletePod(placementNS, fallbackPod.Name)
+
+			By("verifying InFallback stays latched and new Pods stay on On-Demand")
+			Consistently(func(g Gomega) {
+				status, err := getConditionField("workloadclass", app, placementNS, workloadsv1.ConditionTypeInFallback, "status")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(status).To(Equal("True"))
 				expectOnDemandPlacement(g, admitProbePod(g, newPlacementPod(app)))
+			}, consistentlyDuration, consistentlyInterval).Should(Succeed())
+
+			By("deleting the remaining Pod so the workload scales to zero")
+			forceDeletePod(placementNS, remainingPod.Name)
+			expectWorkloadClassCondition(app, placementNS, workloadsv1.ConditionTypeInFallback, "False")
+
+			Eventually(func(g Gomega) {
+				expectPreferredSpot(g, admitProbePod(g, newPlacementPod(app)))
 			}).Should(Succeed())
 		})
 	})

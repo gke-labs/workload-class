@@ -31,13 +31,16 @@ const (
 
 // IsSpotNode reports whether the node carries the GKE Spot label.
 func IsSpotNode(node *corev1.Node) bool {
-	return node.Labels[SpotLabelKey] == SpotLabelValue
+	return node != nil && node.Labels[SpotLabelKey] == SpotLabelValue
 }
 
 // IsPodTargetedForSpot reports whether the Pod has been directed at Spot capacity (by the Pod placement
 // webhook), either via the Spot nodeSelector or the Spot toleration. Pods placed on On-Demand on purpose
 // carry neither.
 func IsPodTargetedForSpot(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
 	return pod.Spec.NodeSelector[SpotLabelKey] == SpotLabelValue ||
 		slices.ContainsFunc(pod.Spec.Tolerations, IsSpotToleration)
 }
@@ -52,7 +55,8 @@ func IsSpotToleration(t corev1.Toleration) bool {
 
 // IsPodActive reports whether the Pod is neither terminating nor in a terminal phase.
 func IsPodActive(pod *corev1.Pod) bool {
-	return pod.DeletionTimestamp == nil &&
+	return pod != nil &&
+		pod.DeletionTimestamp == nil &&
 		pod.Status.Phase != corev1.PodSucceeded &&
 		pod.Status.Phase != corev1.PodFailed
 }

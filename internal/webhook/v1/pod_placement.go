@@ -144,7 +144,7 @@ func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string)
 	if err := d.Client.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 		return false, false
 	}
-	return node.Labels[SpotLabelKey] == SpotLabelValue, true
+	return utils.IsSpotNode(node), true
 }
 
 // mutateForOnDemand pins the Pod to On-Demand (non-Spot) nodes.

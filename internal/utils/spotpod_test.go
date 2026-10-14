@@ -47,6 +47,9 @@ func TestIsPodTargetedForSpot(t *testing.T) {
 			}
 		})
 	}
+	if IsPodTargetedForSpot(nil) {
+		t.Errorf("expected nil Pod not to be targeted for Spot")
+	}
 }
 
 func TestIsPodActive(t *testing.T) {
@@ -69,6 +72,9 @@ func TestIsPodActive(t *testing.T) {
 			}
 		})
 	}
+	if IsPodActive(nil) {
+		t.Errorf("expected nil Pod not to be active")
+	}
 }
 
 func TestIsSpotNode(t *testing.T) {
@@ -78,5 +84,8 @@ func TestIsSpotNode(t *testing.T) {
 	}
 	if IsSpotNode(&corev1.Node{}) {
 		t.Errorf("expected unlabeled node not to be Spot")
+	}
+	if IsSpotNode(nil) {
+		t.Errorf("expected nil node not to be Spot")
 	}
 }

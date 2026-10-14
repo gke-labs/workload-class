@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 func newSpotCapacityScheme() *runtime.Scheme {
@@ -51,7 +52,7 @@ func spotNode(name string, ready, unschedulable bool) *corev1.Node {
 		status = corev1.ConditionTrue
 	}
 	return &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{spotNodeLabelKey: spotNodeLabelValue}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{utils.SpotLabelKey: utils.SpotLabelValue}},
 		Spec:       corev1.NodeSpec{Unschedulable: unschedulable},
 		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: status}}},
 	}
@@ -218,16 +219,18 @@ func TestFindWorkloadClassesForClusterAutoscalerStatus(t *testing.T) {
 	scheme := newSpotCapacityScheme()
 
 	spotWC := makeWC("spot-wc", metav1.Now())
-	spotWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{}
+	spotWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand}
+	failWC := makeWC("fail-wc", metav1.Now())
+	failWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFail}
 	onDemandWC := makeWC("on-demand-wc", metav1.Now())
 	onDemandWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeOnDemand}
 	noStrategyWC := makeWC("no-strategy-wc", metav1.Now())
 	otherPluginWC := makeWC("other-plugin-wc", metav1.Now())
-	otherPluginWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{}
+	otherPluginWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand}
 	otherPluginWC.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{Kind: "KarpenterSpotPolicy", Name: "k"}
 
 	r := &GKESpotPlacementReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(spotWC, onDemandWC, noStrategyWC, otherPluginWC).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(spotWC, failWC, onDemandWC, noStrategyWC, otherPluginWC).Build(),
 		Scheme: scheme,
 	}
 
@@ -255,12 +258,14 @@ func TestFindWorkloadClassesForSpotNode(t *testing.T) {
 	scheme := newSpotCapacityScheme()
 
 	spotWC := makeWC("spot-wc", metav1.Now())
-	spotWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{}
+	spotWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand}
+	failWC := makeWC("fail-wc", metav1.Now())
+	failWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFail}
 	onDemandWC := makeWC("on-demand-wc", metav1.Now())
 	onDemandWC.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeOnDemand}
 
 	r := &GKESpotPlacementReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(spotWC, onDemandWC).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(spotWC, failWC, onDemandWC).Build(),
 		Scheme: scheme,
 	}
 
