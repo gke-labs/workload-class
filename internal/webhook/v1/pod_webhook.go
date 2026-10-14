@@ -49,7 +49,7 @@ func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:webhook:path=/mutate-pod-placement,mutating=true,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod-v1.kb.io,admissionReviewVersions=v1
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods;namespaces,verbs=get;list;watch
-// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses;gkespotplacementpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses;gkespotplacementpolicies;workloadclassguardrails,verbs=get;list;watch
 
 // PodPlacementDefaulter mutates Pods on creation based on their best-matching WorkloadClass placement policy.
 type PodPlacementDefaulter struct {
@@ -156,7 +156,9 @@ func (d *PodPlacementDefaulter) fetchSpotPlacementPolicy(ctx context.Context, ip
 //   - Reversion None + FallbackToOnDemand + workload already in fallback: the Pod stays on On-Demand.
 //   - SpotRatio < 100%: the Pod is placed on Spot while the existing Spot count is below SpotRatio of the
 //     workload's Pods (including this one); otherwise it is placed on On-Demand.
-//   - Otherwise the Pod targets Spot, either strictly (Fail) or preferentially (FallbackToOnDemand).
+//   - Otherwise the Pod targets Spot, either strictly (Fail) or preferentially (FallbackToOnDemand). A
+//     FallbackToOnDemand Pod is downgraded to Fail when the workload is in fallback and a guardrail
+//     maxFallbackRatio would be exceeded (see fallbackBudgetExhausted).
 func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *corev1.Pod, wlc *workloadsv1.WorkloadClass, spotPolicy *workloadsv1.GKESpotPlacementPolicy) error {
 	cs := wlc.Spec.CapacityStrategy
 
@@ -194,21 +196,53 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 		}
 	}
 
+	var (
+		counts       existingPodCounts
+		countsLoaded bool
+		countsErr    error
+	)
+	getCounts := func() (existingPodCounts, error) {
+		if !countsLoaded {
+			counts, countsErr = d.countWorkloadClassPods(ctx, pod, wlc)
+			countsLoaded = true
+		}
+		return counts, countsErr
+	}
+
 	// If reversion action is None and the workload has already fallen back to On-Demand,
 	// keep new/recreated Pods on On-Demand permanently after fallback.
 	if reversionAction == workloadsv1.NoneReversionAction &&
-		fallbackAction == workloadsv1.FallbackActionFallbackToOnDemand &&
-		d.isWorkloadInFallback(ctx, pod, wlc) {
-		mutateForOnDemand(pod)
-		return nil
-	}
-
-	if spotRatio < 100 {
-		spotExisting, totalExisting := d.countExistingWorkloadClassPods(ctx, pod, wlc)
-		if !utils.ShouldUseSpot(spotExisting, totalExisting, spotRatio) {
+		fallbackAction == workloadsv1.FallbackActionFallbackToOnDemand {
+		inFallback := meta.IsStatusConditionTrue(wlc.Status.Conditions, workloadsv1.ConditionTypeInFallback)
+		if !inFallback {
+			c, err := getCounts()
+			if err != nil {
+				podlog.Error(err, "Failed to list Pods to determine fallback state", "workloadClass", wlc.Name, "namespace", pod.Namespace)
+			} else {
+				inFallback = c.fallback > 0
+			}
+		}
+		if inFallback {
 			mutateForOnDemand(pod)
 			return nil
 		}
+	}
+
+	if spotRatio < 100 {
+		c, err := getCounts()
+		if err != nil {
+			podlog.Error(err, "Failed to list Pods to compute Spot ratio", "workloadClass", wlc.Name, "namespace", pod.Namespace)
+		}
+		if !utils.ShouldUseSpot(c.effectiveSpot, c.total, spotRatio) {
+			mutateForOnDemand(pod)
+			return nil
+		}
+	}
+
+	// Guardrail maxFallbackRatio: once the workload is in fallback and the On-Demand budget is used up, new
+	// Pods must wait for Spot rather than add to the fallback footprint.
+	if fallbackAction == workloadsv1.FallbackActionFallbackToOnDemand && d.fallbackBudgetExhausted(ctx, pod, wlc, getCounts) {
+		fallbackAction = workloadsv1.FallbackActionFail
 	}
 
 	mutateForSpot(pod, fallbackAction, spotPolicy)

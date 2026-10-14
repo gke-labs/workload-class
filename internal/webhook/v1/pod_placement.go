@@ -18,6 +18,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +43,18 @@ const (
 	ComputeClassLabelKey = "cloud.google.com/compute-class"
 )
 
+// existingPodCounts holds placement counts for the active Pods currently selected by a WorkloadClass
+// (excluding the incoming Pod being admitted).
+type existingPodCounts struct {
+	// total is the number of active Pods selected by the WorkloadClass.
+	total int
+	// effectiveSpot is the number of Pods counted as Spot for SpotRatio purposes (scheduled on a Spot node, or
+	// targeted for Spot when unscheduled or the node cannot be fetched).
+	effectiveSpot int
+	// fallback is the number of Spot-targeted Pods scheduled on a known non-Spot node.
+	fallback int
+}
+
 // isWorkloadInFallback reports whether the WorkloadClass is currently running Pods on On-Demand fallback.
 // It honors the InFallback condition when set and otherwise inspects existing Pods: a Pod that was
 // targeted for Spot but is running on a non-Spot node indicates the workload has fallen back.
@@ -50,44 +63,76 @@ func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomi
 		return true
 	}
 
-	pods, err := d.listWorkloadClassPods(ctx, incomingPod, wc)
+	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc)
 	if err != nil {
 		podlog.Error(err, "Failed to list Pods to determine fallback state", "workloadClass", wc.Name, "namespace", incomingPod.Namespace)
 		return false
 	}
-
-	for _, existing := range pods {
-		if existing.Spec.NodeName == "" || !utils.IsPodTargetedForSpot(existing) {
-			continue
-		}
-		if isSpot, known := d.isNodeSpot(ctx, existing.Spec.NodeName); known && !isSpot {
-			return true
-		}
-	}
-	return false
+	return counts.fallback > 0
 }
 
 // countExistingWorkloadClassPods returns how many active Pods selected by the WorkloadClass are
 // (or are targeted to be) on Spot, and the total number of active selected Pods.
 func (d *PodPlacementDefaulter) countExistingWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (spotCount, totalCount int) {
-	pods, err := d.listWorkloadClassPods(ctx, incomingPod, wc)
+	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc)
 	if err != nil {
 		podlog.Error(err, "Failed to list Pods to compute Spot ratio", "workloadClass", wc.Name, "namespace", incomingPod.Namespace)
 		return 0, 0
 	}
+	return counts.effectiveSpot, counts.total
+}
 
+// countWorkloadClassPods classifies the active Pods selected by the WorkloadClass (excluding the incoming Pod)
+// in a single pass, caching node lookups so each distinct node is fetched at most once.
+func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (existingPodCounts, error) {
+	pods, err := d.listWorkloadClassPods(ctx, incomingPod, wc)
+	if err != nil {
+		return existingPodCounts{}, err
+	}
+
+	type nodeSpot struct {
+		isSpot bool
+		known  bool
+	}
+	nodes := make(map[string]nodeSpot)
+	lookupNode := func(nodeName string) (bool, bool) {
+		if n, ok := nodes[nodeName]; ok {
+			return n.isSpot, n.known
+		}
+		isSpot, known := d.isNodeSpot(ctx, nodeName)
+		nodes[nodeName] = nodeSpot{isSpot: isSpot, known: known}
+		return isSpot, known
+	}
+
+	var counts existingPodCounts
 	for _, existing := range pods {
-		totalCount++
-		if d.isPodEffectiveSpot(ctx, existing) {
-			spotCount++
+		counts.total++
+		targeted := utils.IsPodTargetedForSpot(existing)
+		if existing.Spec.NodeName == "" {
+			if targeted {
+				counts.effectiveSpot++
+			}
+			continue
+		}
+		isSpot, known := lookupNode(existing.Spec.NodeName)
+		switch {
+		case known && isSpot:
+			counts.effectiveSpot++
+		case known && !isSpot:
+			if targeted {
+				counts.fallback++
+			}
+		case targeted:
+			counts.effectiveSpot++
 		}
 	}
-	return spotCount, totalCount
+	return counts, nil
 }
 
 // listWorkloadClassPods lists active (non-terminating, non-terminal) Pods in the incoming Pod's namespace
 // that the WorkloadClass applies to, excluding the incoming Pod itself (see utils.WorkloadClassPodSelector: a
-// nil PodSelector, or the WorkloadClass being the namespace default, selects all Pods in the namespace).
+// nil PodSelector, or the WorkloadClass being the namespace default, selects all Pods in the namespace). When
+// multiple WorkloadClasses exist in the namespace, each Pod is only counted for its best-matching WorkloadClass.
 func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) ([]*corev1.Pod, error) {
 	selector, err := utils.WorkloadClassPodSelector(ctx, d.Client, wc)
 	if err != nil {
@@ -99,6 +144,12 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 		return nil, err
 	}
 
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := d.Client.List(ctx, wcs, client.InNamespace(incomingPod.Namespace)); err != nil {
+		return nil, err
+	}
+	checkBestMatch := len(wcs.Items) > 1
+
 	var pods []*corev1.Pod
 	for i := range podList.Items {
 		existing := &podList.Items[i]
@@ -108,21 +159,18 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 		if incomingPod.Name != "" && existing.Name == incomingPod.Name {
 			continue
 		}
+		if checkBestMatch {
+			bestMatch, err := utils.FindBestMatchWorkloadClass(ctx, d.Client, nil, existing)
+			if err != nil {
+				return nil, fmt.Errorf("failed to find best match WorkloadClass for Pod %s: %w", existing.Name, err)
+			}
+			if bestMatch == nil || bestMatch.Name != wc.Name {
+				continue
+			}
+		}
 		pods = append(pods, existing)
 	}
 	return pods, nil
-}
-
-// isPodEffectiveSpot reports whether the Pod counts as Spot for SpotRatio purposes. A scheduled Pod
-// is judged by its node's Spot label; an unscheduled Pod (or one whose node can't be fetched) is
-// judged by whether it is targeted for Spot.
-func (d *PodPlacementDefaulter) isPodEffectiveSpot(ctx context.Context, pod *corev1.Pod) bool {
-	if pod.Spec.NodeName != "" {
-		if isSpot, known := d.isNodeSpot(ctx, pod.Spec.NodeName); known {
-			return isSpot
-		}
-	}
-	return utils.IsPodTargetedForSpot(pod)
 }
 
 // isNodeSpot reports whether the named node carries the GKE Spot label. known is false when the
