@@ -290,6 +290,23 @@ func TestReconcile_InFallback(t *testing.T) {
 			pods:     []client.Object{spotTargetedPod("fallback-1", "ondemand-node-1")},
 			want:     "",
 		},
+		{
+			name: "overlapping selector ignores Pods owned by a more specific WorkloadClass",
+			cs:   fallbackCS("100%"), reversion: &lazy,
+			mutateWC: func(wc *workloadsv1.WorkloadClass) {
+				// Catch-all selector; specific-wc has a more specific selector {"app": "test"}.
+				wc.Spec.PodSelector = nil
+			},
+			pods: []client.Object{
+				func() *workloadsv1.WorkloadClass {
+					specific := newManagedWC(fallbackCS("100%"))
+					specific.Name = "specific-wc"
+					return specific
+				}(),
+				spotTargetedPod("fallback-1", "ondemand-node-1"),
+			},
+			want: metav1.ConditionFalse,
+		},
 	}
 
 	for _, tc := range testCases {

@@ -40,9 +40,6 @@ const (
 	ClusterAutoscalerStatusNamespace = "kube-system"
 	// ClusterAutoscalerStatusName is the name of the GKE cluster autoscaler status ConfigMap.
 	ClusterAutoscalerStatusName = "cluster-autoscaler-status"
-
-	spotNodeLabelKey   = "cloud.google.com/gke-spot"
-	spotNodeLabelValue = "true"
 )
 
 // clusterAutoscalerStatus is the subset of the cluster autoscaler's YAML status (the "status" key of
@@ -140,7 +137,7 @@ func isSpotNodeGroupAvailable(ng clusterAutoscalerNodeGroup) bool {
 // hasReadySpotNodes reports whether the cluster has at least one schedulable Spot node with Ready=True.
 func (r *GKESpotPlacementReconciler) hasReadySpotNodes(ctx context.Context) (bool, error) {
 	nodes := &corev1.NodeList{}
-	if err := r.List(ctx, nodes, client.MatchingLabels{spotNodeLabelKey: spotNodeLabelValue}); err != nil {
+	if err := r.List(ctx, nodes, client.MatchingLabels{utils.SpotLabelKey: utils.SpotLabelValue}); err != nil {
 		return false, fmt.Errorf("failed to list Spot nodes: %w", err)
 	}
 
@@ -155,12 +152,12 @@ func (r *GKESpotPlacementReconciler) hasReadySpotNodes(ctx context.Context) (boo
 // isSpotNodeObj reports whether obj is a Node carrying the GKE Spot label.
 func isSpotNodeObj(obj client.Object) bool {
 	node, ok := obj.(*corev1.Node)
-	return ok && node != nil && node.Labels[spotNodeLabelKey] == spotNodeLabelValue
+	return ok && utils.IsSpotNode(node)
 }
 
 // isReadySpotNode reports whether node is a schedulable GKE Spot node with Ready=True.
 func isReadySpotNode(node *corev1.Node) bool {
-	if node == nil || node.Labels[spotNodeLabelKey] != spotNodeLabelValue || node.Spec.Unschedulable {
+	if !utils.IsSpotNode(node) || node.Spec.Unschedulable {
 		return false
 	}
 	for _, cond := range node.Status.Conditions {
@@ -225,8 +222,8 @@ func spotNodeReadinessPredicate() predicate.Predicate {
 	}
 }
 
-// findWorkloadClassesForClusterAutoscalerStatus enqueues all GKE-managed WorkloadClasses that target Spot
-// capacity when the cluster autoscaler status ConfigMap changes.
+// findWorkloadClassesForClusterAutoscalerStatus enqueues all GKE-managed WorkloadClasses that track Spot
+// fallback when the cluster autoscaler status ConfigMap changes.
 func (r *GKESpotPlacementReconciler) findWorkloadClassesForClusterAutoscalerStatus(ctx context.Context, obj client.Object) []reconcile.Request {
 	if !isClusterAutoscalerStatus(obj) {
 		return nil
@@ -234,7 +231,7 @@ func (r *GKESpotPlacementReconciler) findWorkloadClassesForClusterAutoscalerStat
 	return r.enqueueSpotTargetingWorkloadClasses(ctx)
 }
 
-// findWorkloadClassesForSpotNode enqueues all GKE-managed WorkloadClasses that target Spot capacity when a
+// findWorkloadClassesForSpotNode enqueues all GKE-managed WorkloadClasses that track Spot fallback when a
 // GKE Spot node changes readiness.
 func (r *GKESpotPlacementReconciler) findWorkloadClassesForSpotNode(ctx context.Context, obj client.Object) []reconcile.Request {
 	if !isSpotNodeObj(obj) {
@@ -253,7 +250,7 @@ func (r *GKESpotPlacementReconciler) enqueueSpotTargetingWorkloadClasses(ctx con
 	var requests []reconcile.Request
 	for i := range workloadClasses.Items {
 		wc := &workloadClasses.Items[i]
-		if !utils.IsGKESpotManaged(wc) || !utils.TargetsSpot(wc) {
+		if !utils.IsGKESpotManaged(wc) || !tracksFallback(wc) {
 			continue
 		}
 		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(wc)})

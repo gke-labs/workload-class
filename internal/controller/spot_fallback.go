@@ -57,8 +57,8 @@ type workloadPods struct {
 	fallback int
 }
 
-// desiredFallbackCondition computes the InFallback condition the WorkloadClass should have. It returns nil when
-// the condition should be absent, and (nil, false) in the second value when the current condition should be
+// desiredFallbackCondition computes the InFallback condition the WorkloadClass should have. It returns
+// (nil, false) when the condition should be absent, and (nil, true) when the current condition should be
 // left untouched.
 //
 // The workload is in fallback when any Spot-targeted Pod (one carrying the Spot nodeSelector or toleration) is
@@ -95,6 +95,7 @@ func desiredFallbackCondition(wc *workloadsv1.WorkloadClass, pods workloadPods, 
 // the classification of the WorkloadClass's Pods so later steps (reversion) can reuse it.
 func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadPods, error) {
 	var pods workloadPods
+	var reversion workloadsv1.ReversionAction
 	if tracksFallback(wc) {
 		spotNodes, err := r.listSpotNodeNames(ctx)
 		if err != nil {
@@ -104,11 +105,10 @@ func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context,
 		if err != nil {
 			return pods, err
 		}
-	}
-
-	reversion, err := r.effectiveReversionAction(ctx, wc)
-	if err != nil {
-		return pods, err
+		reversion, err = r.effectiveReversionAction(ctx, wc)
+		if err != nil {
+			return pods, err
+		}
 	}
 
 	desired, keep := desiredFallbackCondition(wc, pods, reversion)
@@ -203,6 +203,8 @@ func (r *GKESpotPlacementReconciler) listSpotNodeNames(ctx context.Context) (map
 
 // classifyWorkloadPods counts the active Pods selected by the WorkloadClass and how many of them are
 // Spot-targeted Pods scheduled on non-Spot nodes. A nil PodSelector selects all Pods in the namespace.
+// When multiple WorkloadClasses exist in the namespace, each Pod is only counted for its best-matching
+// WorkloadClass (matching the Pod placement webhook and Pod watch mapper).
 func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass, spotNodes map[string]bool) (workloadPods, error) {
 	var result workloadPods
 
@@ -220,10 +222,25 @@ func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, w
 		return result, fmt.Errorf("failed to list Pods: %w", err)
 	}
 
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+		return result, fmt.Errorf("failed to list WorkloadClasses: %w", err)
+	}
+	checkBestMatch := len(wcs.Items) > 1
+
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !utils.IsPodActive(pod) {
 			continue
+		}
+		if checkBestMatch {
+			bestMatch, err := utils.FindBestMatchWorkloadClass(ctx, r.Client, nil, pod)
+			if err != nil {
+				return result, fmt.Errorf("failed to find best match WorkloadClass for Pod %s: %w", pod.Name, err)
+			}
+			if bestMatch == nil || bestMatch.Name != wc.Name {
+				continue
+			}
 		}
 		result.active++
 		if pod.Spec.NodeName != "" && !spotNodes[pod.Spec.NodeName] && utils.IsPodTargetedForSpot(pod) {
