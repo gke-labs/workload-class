@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
@@ -26,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -55,6 +57,7 @@ type GKESpotPlacementReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps;nodes,verbs=get;list;watch
 
 // Reconcile runs the GKE Spot placement runtime loop for a single WorkloadClass.
 func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -84,8 +87,19 @@ func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	// TODO: Spot capacity detection.
 	// TODO: InFallback tracking.
+
+	// Spot capacity drives reversion; for now the result is only logged. A failed
+	// check is logged rather than returned so it never blocks the rest of the loop.
+	if utils.TargetsSpot(wc) {
+		spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
+		if err != nil {
+			log.Error(err, "Failed to check Spot capacity")
+		} else {
+			log.V(1).Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
+		}
+	}
+
 	// TODO: Active reversion.
 	log.V(1).Info("Reconciled GKE Spot placement")
 
@@ -96,6 +110,16 @@ func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Req
 func (r *GKESpotPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}, builder.WithPredicates(gkeSpotManagedPredicate())).
+		Watches(
+			&corev1.ConfigMap{}, // Re-check Spot capacity when kube-system/cluster-autoscaler-status changes
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
+			builder.WithPredicates(clusterAutoscalerStatusPredicate()),
+		).
+		Watches(
+			&corev1.Node{}, // Re-check Spot capacity when a Spot node's schedulable+Ready state changes
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForSpotNode),
+			builder.WithPredicates(spotNodeReadinessPredicate()),
+		).
 		Named("gkespotplacement").
 		Complete(r)
 }
