@@ -100,8 +100,8 @@ type SpotReversionPolicy struct {
 
 	// MinDurationOnFallback sets the minimum duration a Pod must run on On-Demand fallback VMs
 	// before becoming eligible for Active reversion (e.g., "4h"), dampening churn when Spot capacity is unstable.
+	// When omitted, the controller applies a 5m floor; set it explicitly (including "0s") to override.
 	// +optional
-	// +kubebuilder:default="0s"
 	// +kubebuilder:validation:Type=string
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="minDurationOnFallback must be non-negative"
 	MinDurationOnFallback *metav1.Duration `json:"minDurationOnFallback,omitempty"`
