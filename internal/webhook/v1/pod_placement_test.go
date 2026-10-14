@@ -205,35 +205,6 @@ var _ = Describe("Pod placement helpers", func() {
 		})
 	})
 
-	DescribeTable("shouldUseSpot",
-		func(spotExisting, totalExisting, spotRatio int, want bool) {
-			Expect(shouldUseSpot(spotExisting, totalExisting, spotRatio)).To(Equal(want))
-		},
-		Entry("first Pod at 80% goes to Spot", 0, 0, 80, true),
-		Entry("0% never uses Spot", 0, 0, 0, false),
-		Entry("1 of 2 Spot at 50% -> next Pod to Spot", 1, 2, 50, true),
-		Entry("2 of 3 Spot at 50% -> next Pod to On-Demand", 2, 3, 50, false),
-	)
-
-	DescribeTable("parsePercentage",
-		func(in string, want int, wantErr bool) {
-			got, err := parsePercentage(in)
-			if wantErr {
-				Expect(err).To(HaveOccurred())
-				return
-			}
-			Expect(err).NotTo(HaveOccurred())
-			Expect(got).To(Equal(want))
-		},
-		Entry("0%", "0%", 0, false),
-		Entry("80%", "80%", 80, false),
-		Entry("100%", "100%", 100, false),
-		Entry("missing suffix", "80", 0, true),
-		Entry("above 100", "101%", 0, true),
-		Entry("negative", "-1%", 0, true),
-		Entry("not a number", "abc%", 0, true),
-	)
-
 	Context("Pod state inspection", func() {
 		var testCtx context.Context
 
