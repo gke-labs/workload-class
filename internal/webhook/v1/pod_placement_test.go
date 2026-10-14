@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 const (
@@ -109,7 +110,7 @@ func requiredTerms(pod *corev1.Pod) []corev1.NodeSelectorTerm {
 }
 
 func expectOnDemand(pod *corev1.Pod) {
-	ExpectWithOffset(1, isPodTargetedForSpot(pod)).To(BeFalse())
+	ExpectWithOffset(1, utils.IsPodTargetedForSpot(pod)).To(BeFalse())
 	terms := requiredTerms(pod)
 	ExpectWithOffset(1, terms).NotTo(BeEmpty())
 	for _, t := range terms {
@@ -169,7 +170,7 @@ var _ = Describe("Pod placement helpers", func() {
 
 			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, nil)
 
-			Expect(isPodTargetedForSpot(pod)).To(BeTrue())
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 			Expect(pod.Spec.NodeSelector).NotTo(HaveKey(SpotLabelKey))
 			Expect(pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(HaveLen(1))
 			Expect(requiredTerms(pod)).To(BeEmpty())
