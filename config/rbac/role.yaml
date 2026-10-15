@@ -18,16 +18,17 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods/eviction
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
   - events
   verbs:
   - create
   - patch
-- apiGroups:
-  - ""
-  resources:
-  - pods/eviction
-  verbs:
-  - create
 - apiGroups:
   - policy
   resources:
