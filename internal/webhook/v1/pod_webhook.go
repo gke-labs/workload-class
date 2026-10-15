@@ -49,6 +49,7 @@ func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:webhook:path=/mutate-pod-placement,mutating=true,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create,versions=v1,name=mpod-v1.kb.io,admissionReviewVersions=v1
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods;namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="";events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses;gkespotplacementpolicies;workloadclassguardrails,verbs=get;list;watch
 
 // PodPlacementDefaulter mutates Pods on creation based on their best-matching WorkloadClass placement policy.
