@@ -499,12 +499,15 @@ var _ = Describe("GKE Spot Placement runtime", Ordered, func() {
 			const app = "full-stack"
 
 			By("installing a guardrail that requires Spot, allows bounded fallback, and requires Active reversion")
+			// An absolute fallback budget of 2 admits both replicas below as fallback Pods regardless of whether
+			// the ReplicaSet's Pods are admitted before or after the first one binds, and still pins a 3rd Pod to
+			// strict Spot. A percentage budget can't do both: once 1 Pod is on fallback, a 2nd would be 2 of 2.
 			Eventually(func() error {
 				return applyManifest(runtimeGuardrail(`          enforcementMode: Required
           minSpotRatio: "50%"
           fallback:
             allowFallbackToOnDemand: true
-            maxFallbackRatio: "50%"
+            maxFallbackRatio: 2
           reversion:
             requiredReversionAction: Active
             maxFallbackDuration: "10m"`))
@@ -542,7 +545,7 @@ var _ = Describe("GKE Spot Placement runtime", Ordered, func() {
 			By("verifying the controller reports InFallback=True")
 			expectWorkloadClassCondition(app, runtimeNS, workloadsv1.ConditionTypeInFallback, "True")
 
-			By("verifying the fallback budget pins further Pods to strict Spot (3 of 3 would exceed 50%)")
+			By("verifying the fallback budget pins further Pods to strict Spot (a 3rd fallback Pod would exceed the budget of 2)")
 			Eventually(func(g Gomega) {
 				expectRequiredSpot(g, admitProbePod(g, runtimePod(app)))
 			}).Should(Succeed())
