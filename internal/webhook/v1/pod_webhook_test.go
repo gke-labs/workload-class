@@ -89,6 +89,31 @@ var _ = Describe("Pod Webhook", func() {
 			expectUnmutated(pod)
 		})
 
+		It("does nothing when the conditions were observed for an older generation", func() {
+			// The spec was edited (generation 3) but the controllers last reconciled generation 2.
+			conds := readyConditions()
+			for i := range conds {
+				conds[i].ObservedGeneration = 2
+			}
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, conds)
+			wlc.Generation = 3
+			pod := newIncomingPod()
+			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{})).Default(testCtx, pod)).To(Succeed())
+			expectUnmutated(pod)
+		})
+
+		It("mutates when the conditions were observed for the current generation", func() {
+			conds := readyConditions()
+			for i := range conds {
+				conds[i].ObservedGeneration = 3
+			}
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, conds)
+			wlc.Generation = 3
+			pod := newIncomingPod()
+			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{})).Default(testCtx, pod)).To(Succeed())
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
+		})
+
 		It("fails open when the GKESpotPlacementPolicy does not exist", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, readyConditions())
 			pod := newIncomingPod()
@@ -98,6 +123,14 @@ var _ = Describe("Pod Webhook", func() {
 	})
 
 	Context("When the WorkloadClass targets Spot", func() {
+		It("does not write CapacityStrategy defaults back into the (cached) WorkloadClass", func() {
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, readyConditions())
+			pod := newIncomingPod()
+			Expect(newDefaulter().mutatePodPlacement(testCtx, pod, wlc, nil)).To(Succeed())
+
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
+			Expect(wlc.Spec.CapacityStrategy.Type).To(BeEmpty())
+		})
 		It("requires Spot when fallback action is Fail (defaults)", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, readyConditions())
 			pod := newIncomingPod()

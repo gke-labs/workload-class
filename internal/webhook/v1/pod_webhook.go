@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -102,19 +103,25 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 	// Only mutate once the controllers have confirmed the WorkloadClass is valid against guardrails and,
 	// when a GKESpotPlacementPolicy is referenced, that it has attached. The WorkloadClass controller
 	// removes PlacementPluginAttached when there is no InfrastructureProfileRef, so it is only required
-	// when a profile is referenced. Missing or Unknown conditions are treated as not ready.
+	// when a profile is referenced. Missing or Unknown conditions are treated as not ready, as are conditions
+	// observed for an older generation: after a spec edit they describe the previous spec until the controllers
+	// reconcile, so mutating on them could apply an unvalidated CapacityStrategy.
 	requiredConds := []string{workloadsv1.ConditionTypeValidated}
 	if usesSpotPolicy {
 		requiredConds = append(requiredConds, workloadsv1.ConditionTypePlacementPluginAttached)
 	}
 	for _, cType := range requiredConds {
-		if !meta.IsStatusConditionTrue(bestWLC.Status.Conditions, cType) {
-			c := meta.FindStatusCondition(bestWLC.Status.Conditions, cType)
-			if c != nil {
-				log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", cType, "reason", c.Reason, "message", c.Message)
-			} else {
-				log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", cType)
-			}
+		c := meta.FindStatusCondition(bestWLC.Status.Conditions, cType)
+		switch {
+		case c == nil:
+			log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", cType)
+			return nil
+		case c.Status != metav1.ConditionTrue:
+			log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", cType, "reason", c.Reason, "message", c.Message)
+			return nil
+		case bestWLC.Generation > 0 && c.ObservedGeneration != bestWLC.Generation:
+			log.Info("WorkloadClass condition is stale; Pod will not be mutated", "condition", cType,
+				"observedGeneration", c.ObservedGeneration, "generation", bestWLC.Generation)
 			return nil
 		}
 	}
@@ -162,10 +169,12 @@ func (d *PodPlacementDefaulter) fetchSpotPlacementPolicy(ctx context.Context, ip
 func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *corev1.Pod, wlc *workloadsv1.WorkloadClass, spotPolicy *workloadsv1.GKESpotPlacementPolicy) error {
 	cs := wlc.Spec.CapacityStrategy
 
-	if cs.Type == "" {
-		cs.Type = workloadsv1.SpotPlacementTypeSpot
+	// wlc comes from the informer cache, so defaults are applied to locals rather than written back into it.
+	csType := cs.Type
+	if csType == "" {
+		csType = workloadsv1.SpotPlacementTypeSpot
 	}
-	if cs.Type == workloadsv1.SpotPlacementTypeOnDemand {
+	if csType == workloadsv1.SpotPlacementTypeOnDemand {
 		mutateForOnDemand(pod)
 		return nil
 	}
