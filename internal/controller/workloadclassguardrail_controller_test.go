@@ -389,6 +389,144 @@ func TestValidatePluginConstraints(t *testing.T) {
 			wantViolationCount: 1,
 			wantSubstring:      `invalid reversion.maxFallbackDuration "-10m0s"`,
 		},
+		{
+			name: "plugin_name_with_surrounding_whitespace_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: " " + workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"enforcementMode":"Required"}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      "must not have leading or trailing whitespace",
+		},
+		{
+			name: "nil_parameters_passes",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{Name: workloadsv1.PluginNameGKESpotPlacement, Parameters: nil},
+				},
+			},
+			wantViolationCount: 0,
+		},
+		{
+			name: "non_object_parameters_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name:       "karpenter-spot-placement",
+						Parameters: &apiextensionsv1.JSON{Raw: []byte(`[1, 2, 3]`)},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      "parameters must be a valid JSON object",
+		},
+		{
+			name: "null_parameters_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name:       workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{Raw: []byte(`null`)},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      "parameters must be a valid JSON object, got null",
+		},
+		{
+			name: "required_reversion_none_with_max_fallback_duration_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"reversion":{"requiredReversionAction":"None","maxFallbackDuration":"2h"}}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      "reversion.maxFallbackDuration cannot be set when reversion.requiredReversionAction is None",
+		},
+		{
+			name: "required_enforcement_with_zero_min_spot_ratio_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"enforcementMode":"Required","minSpotRatio":"0%"}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      `minSpotRatio "0%" contradicts enforcementMode Required`,
+		},
+		{
+			name: "forbidden_enforcement_with_positive_min_spot_ratio_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"enforcementMode":"Forbidden","minSpotRatio":"20%"}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      `minSpotRatio "20%" contradicts enforcementMode Forbidden`,
+		},
+		{
+			name: "forbidden_enforcement_with_zero_min_spot_ratio_passes",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"enforcementMode":"Forbidden","minSpotRatio":"0%"}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 0,
+		},
+		{
+			name: "fallback_disallowed_with_positive_max_fallback_ratio_fails",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"fallback":{"allowFallbackToOnDemand":false,"maxFallbackRatio":"20%"}}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 1,
+			wantSubstring:      "fallback.maxFallbackRatio 20% contradicts fallback.allowFallbackToOnDemand false",
+		},
+		{
+			name: "fallback_disallowed_with_zero_max_fallback_ratio_passes",
+			pc: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{
+					{
+						Name: workloadsv1.PluginNameGKESpotPlacement,
+						Parameters: &apiextensionsv1.JSON{
+							Raw: []byte(`{"fallback":{"allowFallbackToOnDemand":false,"maxFallbackRatio":0}}`),
+						},
+					},
+				},
+			},
+			wantViolationCount: 0,
+		},
 	}
 
 	for _, tc := range testCases {

@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -99,14 +100,23 @@ func validatePlacementPluginConstraint(c workloadsv1.PluginConstraint) []string 
 	if strings.TrimSpace(c.Name) == "" {
 		return []string{"placement pluginConstraint name must not be empty"}
 	}
+	// A name with stray whitespace would not match any known plugin (e.g. " gke-spot-placement") and its
+	// constraint would be silently ignored, so reject it rather than treating it as a third-party plugin.
+	if strings.TrimSpace(c.Name) != c.Name {
+		return []string{fmt.Sprintf("placement pluginConstraint name %q must not have leading or trailing whitespace", c.Name)}
+	}
 
 	if c.Parameters == nil || len(c.Parameters.Raw) == 0 {
 		return nil
 	}
 
+	// json.Unmarshal accepts a literal null without error and leaves rawObj nil, so check for that too.
 	var rawObj map[string]any
 	if err := json.Unmarshal(c.Parameters.Raw, &rawObj); err != nil {
 		return []string{fmt.Sprintf("pluginConstraint %q parameters must be a valid JSON object: %v", c.Name, err)}
+	}
+	if rawObj == nil {
+		return []string{fmt.Sprintf("pluginConstraint %q parameters must be a valid JSON object, got null", c.Name)}
 	}
 
 	if c.Name == workloadsv1.PluginNameGKESpotPlacement {
@@ -164,7 +174,59 @@ func validateGKESpotGuardrailParameters(raw []byte) []string {
 		}
 	}
 
+	violations = append(violations, validateGKESpotGuardrailCombinations(&params)...)
+
 	return violations
+}
+
+// validateGKESpotGuardrailCombinations rejects gke-spot-placement guardrail parameters that are individually
+// valid but contradict each other, so that no GKESpotPlacementPolicy or WorkloadClass could satisfy them.
+func validateGKESpotGuardrailCombinations(params *workloadsv1.GKESpotGuardrailParameters) []string {
+	var violations []string
+
+	if params.MinSpotRatio != nil {
+		if pct, ok := guardrailPercent(*params.MinSpotRatio); ok {
+			switch {
+			case params.EnforcementMode == workloadsv1.RequiredEnforcementMode && pct == 0:
+				violations = append(violations, `minSpotRatio "0%" contradicts enforcementMode Required: a WorkloadClass must use Spot`)
+			case params.EnforcementMode == workloadsv1.ForbiddenEnforcementMode && pct > 0:
+				violations = append(violations, fmt.Sprintf("minSpotRatio %q contradicts enforcementMode Forbidden: a WorkloadClass may not use Spot", *params.MinSpotRatio))
+			}
+		}
+	}
+
+	if f := params.Fallback; f != nil && f.AllowFallbackToOnDemand != nil && !*f.AllowFallbackToOnDemand &&
+		f.MaxFallbackRatio != nil && maxFallbackRatioPositive(*f.MaxFallbackRatio) {
+		violations = append(violations, fmt.Sprintf("fallback.maxFallbackRatio %s contradicts fallback.allowFallbackToOnDemand false", f.MaxFallbackRatio.String()))
+	}
+
+	// A guardrail requiring None reversion and setting maxFallbackDuration could never be satisfied: policies
+	// with None are rejected for the duration limit, and any other action does not match the required one.
+	if r := params.Reversion; r != nil && r.RequiredReversionAction != nil &&
+		*r.RequiredReversionAction == workloadsv1.NoneReversionAction && r.MaxFallbackDuration != nil {
+		violations = append(violations, "reversion.maxFallbackDuration cannot be set when reversion.requiredReversionAction is None")
+	}
+
+	return violations
+}
+
+// guardrailPercent parses an integer percentage such as "80%". ok is false if s is not a valid percentage
+// (such values are reported separately).
+func guardrailPercent(s string) (int, bool) {
+	if !percentagePattern.MatchString(s) {
+		return 0, false
+	}
+	v, err := strconv.Atoi(strings.TrimSuffix(s, "%"))
+	return v, err == nil
+}
+
+// maxFallbackRatioPositive reports whether a maxFallbackRatio allows any Pods on fallback.
+func maxFallbackRatioPositive(r intstr.IntOrString) bool {
+	if r.Type == intstr.Int {
+		return r.IntVal > 0
+	}
+	pct, ok := guardrailPercent(r.StrVal)
+	return ok && pct > 0
 }
 
 // SetupWithManager sets up the controller with the Manager.
