@@ -132,6 +132,16 @@ func fallbackStrategy() *workloadsv1.CapacityStrategy {
 	return &workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand}
 }
 
+// e2eMinDurationOnFallback is the minDurationOnFallback used by specs that expect Active reversion to evict
+// fallback Pods and the Deployment to be replenished.
+//
+// The Kind cluster has no Spot node, so a Pod recreated after a reversion eviction lands on the On-Demand node
+// again as a fallback Pod. With 0s it is evicted again as soon as it binds, in a loop, and the replacements are
+// almost always terminating when the test looks for them. A short floor lets the replacements run long enough
+// to be observed, while the original Pods (which have been on fallback since the spec set them up) still
+// cross it well within the eviction timeout.
+var e2eMinDurationOnFallback = &metav1.Duration{Duration: 30 * time.Second}
+
 func activePolicy(minDurationOnFallback *metav1.Duration) *workloadsv1.GKESpotPlacementPolicy {
 	return newPlacementPolicy(workloadsv1.GKESpotPlacementPolicySpec{
 		Reversion: workloadsv1.SpotReversionPolicy{Action: workloadsv1.ActiveReversionAction, MinDurationOnFallback: minDurationOnFallback},
@@ -363,7 +373,7 @@ var _ = Describe("GKE Spot Placement runtime", Ordered, func() {
 		It("evicts fallback Pods once Spot capacity returns, and not before", func() {
 			const app = "reversion-active"
 			setSpotCapacity(false)
-			names := setUpFallbackWorkload(app, activePolicy(&metav1.Duration{Duration: 0}), fallbackStrategy(), 2)
+			names := setUpFallbackWorkload(app, activePolicy(e2eMinDurationOnFallback), fallbackStrategy(), 2)
 
 			By("verifying nothing is evicted while Spot capacity is unavailable")
 			expectPodsUnchanged(app, names)
@@ -515,7 +525,7 @@ var _ = Describe("GKE Spot Placement runtime", Ordered, func() {
 			setSpotCapacity(false)
 
 			By("creating a GKESpotPlacementPolicy that satisfies the guardrail")
-			Expect(applyObject(activePolicy(&metav1.Duration{Duration: 0}))).To(Succeed())
+			Expect(applyObject(activePolicy(e2eMinDurationOnFallback))).To(Succeed())
 			Eventually(func(g Gomega) {
 				status, err := getConditionField("gkespotplacementpolicy", placementPolicyName, "", workloadsv1.ConditionTypeValidated, "status")
 				g.Expect(err).NotTo(HaveOccurred())
