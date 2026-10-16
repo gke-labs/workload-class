@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -49,6 +51,23 @@ func spotPodAt(name string, startTime time.Time) *corev1.Pod {
 	pod := newWorkloadPod(name, "spot-node-1", startTime)
 	pod.Spec.Tolerations = fallbackPodAt("", startTime).Spec.Tolerations
 	return pod
+}
+
+// maxFallbackGuardrail returns a WorkloadClassGuardrail whose gke-spot-placement constraint sets
+// reversion.maxFallbackDuration.
+func maxFallbackGuardrail(name, maxFallbackDuration string) *workloadsv1.WorkloadClassGuardrail {
+	raw := fmt.Sprintf(`{"reversion":{"maxFallbackDuration":%q}}`, maxFallbackDuration)
+	return &workloadsv1.WorkloadClassGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			PluginConstraints: &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{{
+					Name:       workloadsv1.PluginNameGKESpotPlacement,
+					Parameters: &apiextensionsv1.JSON{Raw: []byte(raw)},
+				}},
+			},
+		},
+	}
 }
 
 func remainingPodNames(t *testing.T, c client.Client) []string {
@@ -82,6 +101,8 @@ func TestReconcileSpotReversion(t *testing.T) {
 		reversion *workloadsv1.SpotReversionPolicy
 		windows   []workloadsv1.DisruptionWindow
 		mutateWC  func(wc *workloadsv1.WorkloadClass)
+		// guardrails are added to the cluster; used for maxFallbackDuration.
+		guardrails []client.Object
 		// rejectWith, if set, makes every eviction fail with this error.
 		rejectWith    error
 		pods          []client.Object
@@ -180,6 +201,77 @@ func TestReconcileSpotReversion(t *testing.T) {
 			wantRemaining: []string{"stray"},
 		},
 		{
+			name: "maxFallbackDuration forces eviction under Lazy once a Pod is over the limit",
+			cs:   fallbackCS("100%"), reversion: &workloadsv1.SpotReversionPolicy{Action: workloadsv1.LazyReversionAction},
+			guardrails:    []client.Object{maxFallbackGuardrail("default", "1h")},
+			pods:          []client.Object{fallbackPodAt("over-limit", now.Add(-2*time.Hour)), fallbackPodAt("under-limit", now.Add(-30*time.Minute))},
+			wantRemaining: []string{"under-limit"},
+			wantRequeue:   30 * time.Minute,
+		},
+		{
+			name: "maxFallbackDuration overrides minDurationOnFallback under Active",
+			cs:   fallbackCS("100%"),
+			reversion: &workloadsv1.SpotReversionPolicy{
+				Action: workloadsv1.ActiveReversionAction, MinDurationOnFallback: &metav1.Duration{Duration: 30 * time.Minute},
+			},
+			guardrails:    []client.Object{maxFallbackGuardrail("default", "10m")},
+			pods:          []client.Object{fallbackPodAt("fallback-1", now.Add(-15*time.Minute))},
+			wantRemaining: []string{},
+		},
+		{
+			name: "maxFallbackDuration forces eviction even when the Spot share is already met",
+			cs:   fallbackCS("50%"), reversion: &activeNoFloor,
+			guardrails: []client.Object{maxFallbackGuardrail("default", "1h")},
+			// 3 of 4 on Spot satisfies 50%; the over-limit fallback Pod is evicted anyway.
+			pods: []client.Object{
+				spotPodAt("spot-1", hourAgo), spotPodAt("spot-2", hourAgo), spotPodAt("spot-3", hourAgo),
+				fallbackPodAt("over-limit", now.Add(-2*time.Hour)),
+			},
+			wantRemaining: []string{"spot-1", "spot-2", "spot-3"},
+		},
+		{
+			name: "Active under the Spot share met requeues for maxFallbackDuration of the oldest fallback Pod",
+			cs:   fallbackCS("50%"), reversion: &activeNoFloor,
+			guardrails: []client.Object{maxFallbackGuardrail("default", "1h")},
+			pods: []client.Object{
+				spotPodAt("spot-1", hourAgo), spotPodAt("spot-2", hourAgo), spotPodAt("spot-3", hourAgo),
+				fallbackPodAt("under-limit", now.Add(-40*time.Minute)),
+			},
+			wantRemaining: []string{"spot-1", "spot-2", "spot-3", "under-limit"},
+			wantRequeue:   20 * time.Minute,
+		},
+		{
+			name: "the strictest maxFallbackDuration across guardrails applies",
+			cs:   fallbackCS("100%"), reversion: &workloadsv1.SpotReversionPolicy{Action: workloadsv1.LazyReversionAction},
+			guardrails:    []client.Object{maxFallbackGuardrail("lenient", "4h"), maxFallbackGuardrail("strict", "20m")},
+			pods:          []client.Object{fallbackPodAt("fallback-1", now.Add(-30*time.Minute))},
+			wantRemaining: []string{},
+		},
+		{
+			name: "forced eviction skips Pods without a controller owner",
+			cs:   fallbackCS("100%"), reversion: &workloadsv1.SpotReversionPolicy{Action: workloadsv1.LazyReversionAction},
+			guardrails: []client.Object{maxFallbackGuardrail("default", "10m")},
+			pods: func() []client.Object {
+				bare := fallbackPodAt("bare", hourAgo)
+				bare.OwnerReferences = nil
+				return []client.Object{bare}
+			}(),
+			wantRemaining: []string{"bare"},
+		},
+		{
+			name: "forced eviction still respects the disruption window",
+			cs:   fallbackCS("100%"), reversion: &workloadsv1.SpotReversionPolicy{Action: workloadsv1.LazyReversionAction},
+			guardrails: []client.Object{maxFallbackGuardrail("default", "10m")},
+			windows: []workloadsv1.DisruptionWindow{{
+				Name: "evening", DaysOfWeek: []string{"Friday"}, TimeZone: "Etc/UTC", StartTime: "22:00", EndTime: "23:59",
+			}},
+			rejectWith:        apierrors.NewForbidden(corev1.Resource("pods"), "fallback-1", nil),
+			pods:              []client.Object{fallbackPodAt("fallback-1", hourAgo), fallbackPodAt("fallback-2", hourAgo)},
+			wantRemaining:     []string{"fallback-1", "fallback-2"},
+			wantRequeue:       7 * time.Hour,
+			wantEvictAttempts: 1,
+		},
+		{
 			name: "rejected eviction outside the disruption window stops and requeues for the next window",
 			cs:   fallbackCS("100%"), reversion: &activeNoFloor,
 			windows: []workloadsv1.DisruptionWindow{{
@@ -260,7 +352,8 @@ func TestReconcileSpotReversion(t *testing.T) {
 				policy = newPolicy(*tc.reversion)
 			}
 
-			objects := append([]client.Object{spotNodeObj.DeepCopy(), onDemandNodeObj.DeepCopy(), wc}, tc.pods...)
+			objects := append([]client.Object{spotNode("spot-node-1", true, false), onDemandNodeObj.DeepCopy(), wc}, tc.pods...)
+			objects = append(objects, tc.guardrails...)
 			evictAttempts := 0
 			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...)
 			if tc.rejectWith != nil {
@@ -394,5 +487,28 @@ func TestMinPositiveDuration(t *testing.T) {
 		if got := minPositiveDuration(tc.a, tc.b); got != tc.want {
 			t.Errorf("minPositiveDuration(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+func TestFindWorkloadClassesForGuardrail(t *testing.T) {
+	scheme := newGKESpotScheme()
+
+	fallbackWC := newManagedWC(fallbackCS("100%"))
+	failWC := newManagedWC(&workloadsv1.CapacityStrategy{FallbackAction: workloadsv1.FallbackActionFail})
+	failWC.Name = "fail-wc"
+
+	r := &GKESpotPlacementReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(fallbackWC, failWC).Build(),
+		Scheme: scheme,
+	}
+
+	g := maxFallbackGuardrail("default", "1h")
+	reqs := r.findWorkloadClassesForGuardrail(context.Background(), g)
+	if len(reqs) != 1 || reqs[0].Name != fallbackWC.Name || reqs[0].Namespace != fallbackWC.Namespace {
+		t.Errorf("expected a single reconcile request for %s/%s, got %v", fallbackWC.Namespace, fallbackWC.Name, reqs)
+	}
+
+	if reqs := r.findWorkloadClassesForGuardrail(context.Background(), nil); len(reqs) != 0 {
+		t.Errorf("expected 0 reconcile requests for nil object, got %d", len(reqs))
 	}
 }
