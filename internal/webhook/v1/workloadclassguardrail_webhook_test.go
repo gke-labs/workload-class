@@ -20,6 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -97,6 +98,65 @@ var _ = Describe("WorkloadClassGuardrail Webhook", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("guardrail is too restrictive"))
 			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny creation if pluginConstraints are invalid", func() {
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-plugin-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					PluginConstraints: &workloadsv1.PluginConstraints{
+						Placement: []workloadsv1.PluginConstraint{{
+							Name: workloadsv1.PluginNameGKESpotPlacement,
+							Parameters: &apiextensionsv1.JSON{
+								Raw: []byte(`{"reversion":{"requiredReversionAction":"None","maxFallbackDuration":"2h"}}`),
+							},
+						}},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid pluginConstraints"))
+			Expect(err.Error()).To(ContainSubstring("reversion.maxFallbackDuration cannot be set when reversion.requiredReversionAction is None"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny an update that makes pluginConstraints invalid", func() {
+			oldObj := &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "plugin-guardrail"},
+			}
+			newObj := oldObj.DeepCopy()
+			newObj.Spec.PluginConstraints = &workloadsv1.PluginConstraints{
+				Placement: []workloadsv1.PluginConstraint{{
+					Name: workloadsv1.PluginNameGKESpotPlacement,
+					Parameters: &apiextensionsv1.JSON{
+						Raw: []byte(`{"enforcementMode":"InvalidMode"}`),
+					},
+				}},
+			}
+			warnings, err := validator.ValidateUpdate(ctx, oldObj, newObj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(`invalid enforcementMode "InvalidMode"`))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should admit a guardrail with valid pluginConstraints", func() {
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "valid-plugin-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					PluginConstraints: &workloadsv1.PluginConstraints{
+						Placement: []workloadsv1.PluginConstraint{{
+							Name: workloadsv1.PluginNameGKESpotPlacement,
+							Parameters: &apiextensionsv1.JSON{
+								Raw: []byte(`{"enforcementMode":"Required","minSpotRatio":"50%","reversion":{"requiredReversionAction":"Active","maxFallbackDuration":"2h"}}`),
+							},
+						}},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).To(BeEmpty())
 		})
 	})
 })
