@@ -138,8 +138,6 @@ func getConditionField(resource, name, ns, condType, field string) (string, erro
 }
 
 var _ = Describe("WorkloadClass and GKESpotPlacementPolicy Handshake", Ordered, func() {
-	var controllerPodName string
-
 	BeforeAll(func() {
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
@@ -195,21 +193,27 @@ var _ = Describe("WorkloadClass and GKESpotPlacementPolicy Handshake", Ordered, 
 	AfterEach(func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
+			// Look the pod up fresh on every failure so a failed lookup never reuses a stale name.
+			var controllerPodName string
 			podCmd := exec.Command("kubectl", "get", "pods", "-n", namespace, "-l", "control-plane=controller-manager", "-o", "jsonpath={.items[0].metadata.name}")
-			if podOutput, err := utils.Run(podCmd); err == nil && podOutput != "" {
+			if podOutput, err := utils.Run(podCmd); err == nil {
 				controllerPodName = strings.TrimSpace(podOutput)
 			}
 
 			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			if controllerLogs, err := utils.Run(cmd); err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
+			if controllerPodName == "" {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Skipping controller logs: no controller-manager pod found in namespace %s\n", namespace)
 			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
+				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
+				if controllerLogs, err := utils.Run(cmd); err == nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
+				}
 			}
 
 			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
+			cmd := exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
 			if eventsOutput, err := utils.Run(cmd); err == nil {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
 			} else {
