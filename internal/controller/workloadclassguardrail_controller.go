@@ -45,15 +45,16 @@ type WorkloadClassGuardrailReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
-func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	g := &workloadsv1.WorkloadClassGuardrail{}
 	if err := r.Get(ctx, req.NamespacedName, g); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	validationCondition := r.validate(ctx, g)
-	meta.SetStatusCondition(&g.Status.Conditions, validationCondition)
-	err := r.Status().Update(ctx, g)
+	if meta.SetStatusCondition(&g.Status.Conditions, validationCondition) {
+		err = r.Status().Update(ctx, g)
+	}
 
 	return ctrl.Result{}, err
 }
@@ -67,7 +68,7 @@ func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *work
 		violations = append(violations, err.Error())
 	}
 
-	return condition(violations)
+	return condition(g.Generation, violations)
 }
 
 // SetupWithManager sets up the controller with the Manager.

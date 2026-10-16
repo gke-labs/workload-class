@@ -201,7 +201,7 @@ const (
 
 	// ReasonValidationPassed indicates that the WorkloadClass passed all Guardrail checks.
 	ReasonValidationPassed = "ValidationPassed"
-	// ReasonValidationFailed indicates that the WorkloadClass failed one or more Guardrail checks.
+	// ReasonValidationFailed indicates that the WorkloadClass failed validation, either against Guardrails or due to the InfrastructureProfileRef.
 	ReasonValidationFailed = "ValidationFailed"
 	// ReasonNoGuardrails indicates that no Guardrails were found to validate against.
 	ReasonNoGuardrails = "NoGuardrails"
