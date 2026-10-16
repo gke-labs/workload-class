@@ -23,7 +23,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -201,20 +200,17 @@ func (r *GKESpotPlacementReconciler) listSpotNodeNames(ctx context.Context) (map
 	return spotNodes, nil
 }
 
-// classifyWorkloadPods counts the active Pods selected by the WorkloadClass and how many of them are
-// Spot-targeted Pods scheduled on non-Spot nodes. A nil PodSelector selects all Pods in the namespace.
-// When multiple WorkloadClasses exist in the namespace, each Pod is only counted for its best-matching
-// WorkloadClass (matching the Pod placement webhook and Pod watch mapper).
+// classifyWorkloadPods counts the active Pods the WorkloadClass applies to and how many of them are
+// Spot-targeted Pods scheduled on non-Spot nodes. A nil PodSelector, or the WorkloadClass being the namespace
+// default, selects all Pods in the namespace (see utils.WorkloadClassPodSelector). When multiple WorkloadClasses
+// exist in the namespace, each Pod is only counted for its best-matching WorkloadClass (matching the Pod
+// placement webhook and Pod watch mapper).
 func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass, spotNodes map[string]bool) (workloadPods, error) {
 	var result workloadPods
 
-	selector := labels.Everything()
-	if wc.Spec.PodSelector != nil {
-		var err error
-		selector, err = metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
-		if err != nil {
-			return result, fmt.Errorf("invalid podSelector: %w", err)
-		}
+	selector, err := utils.WorkloadClassPodSelector(ctx, r.Client, wc)
+	if err != nil {
+		return result, err
 	}
 
 	pods := &corev1.PodList{}
