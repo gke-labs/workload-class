@@ -35,6 +35,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies
   - workloadclasses
   - workloadclassguardrails
   verbs:
@@ -48,6 +49,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies/finalizers
   - workloadclasses/finalizers
   - workloadclassguardrails/finalizers
   verbs:
@@ -55,6 +57,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies/status
   - workloadclasses/status
   - workloadclassguardrails/status
   verbs:
