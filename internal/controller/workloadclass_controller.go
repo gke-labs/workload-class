@@ -18,16 +18,19 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,20 +67,26 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 1. Fetch Guardrails and validate
+	// 1.1 Fetch Guardrails and validate
 	validationCond, err := r.validateAgainstGuardrails(ctx, wc)
 	if err != nil {
 		log.Error(err, "Failed to validate against guardrails")
 		return ctrl.Result{}, err
 	}
-	meta.SetStatusCondition(&wc.Status.Conditions, validationCond)
 
-	// 1.1 Persist the status change
-	err = r.Status().Update(ctx, wc)
-	if err != nil {
-		log.Error(err, "Failed to update Status conditions")
-		return ctrl.Result{}, err
+	// 1.2 Check for plugin placement attachment conditions
+	changed, removed := false, false
+	pluginPlacementCondition := placementPluginCondition(ctx, wc)
+	if pluginPlacementCondition != nil {
+		changed = meta.SetStatusCondition(&wc.Status.Conditions, *pluginPlacementCondition)
+	} else {
+		// Clean up stale PluginPlacementAttached condition
+		removed = meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
 	}
+
+	// 1.3 If the plugin has not attached, mark the WorkloadClass as not yet validated
+	reconcileConditions(&validationCond, pluginPlacementCondition)
+	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
 	// 2. Check if other existing WorkloadClasses have the same PodSelector
 	overlappingClasses, err := r.validateSelectors(ctx, wc)
@@ -101,8 +110,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 3. Update Status if changed
-	if wc.Status.MaintenanceReadiness != readiness {
+	// 3. Update Status
+	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
 		wc.Status.MaintenanceReadiness = readiness
 		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
 		if err := r.Status().Update(ctx, wc); err != nil {
@@ -195,7 +204,7 @@ func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1
 
 	if err := r.Delete(ctx, pdb); err != nil {
 		// If it's already gone, that's a success for a delete operation
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to delete PDB: %w", err)
@@ -281,6 +290,63 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	return workloadsv1.ReadinessReady, nextWindow, nil
 }
 
+// placementPluginCondition returns a PlacementPluginAttached metav1.Condition from the WorkloadClass status if it matches
+// the current Generation. If no such Condition exists, a new one is created. If the WorkloadClass does not have an
+// InfrastructureProfileRef, no Condition is returned.
+func placementPluginCondition(ctx context.Context, wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	log := logf.FromContext(ctx)
+	if wc.Spec.InfrastructureProfileRef == nil {
+		log.Info(fmt.Sprintf("WorkloadClass %s/%s does not have an InfrastructureProfileRef set", wc.Namespace, wc.Name))
+		return nil
+	}
+
+	if existing := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached); existing != nil && existing.ObservedGeneration == wc.Generation {
+		log.Info(fmt.Sprintf("WorkloadClass %s/%s has a Placement Plugin condition. Status: %s, reason: %s, message: %s", wc.Namespace, wc.Name, existing.Status, existing.Reason, existing.Message))
+		cond := *existing
+		return &cond
+	}
+
+	// The placement plugin has not attached for the current generation
+	return &metav1.Condition{
+		Type:               workloadsv1.ConditionTypePlacementPluginAttached,
+		Status:             metav1.ConditionFalse,
+		Reason:             workloadsv1.ReasonPluginPending,
+		Message:            fmt.Sprintf("Waiting for plugin controller to reconcile %s", wc.Spec.InfrastructureProfileRef.Kind),
+		ObservedGeneration: wc.Generation,
+		LastTransitionTime: metav1.Now(),
+	}
+}
+
+const (
+	placementUnattachedMsg = "WorkloadClass references an infrastructure profile, but the plugin has not attached"
+	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
+)
+
+func reconcileConditions(validation, placement *metav1.Condition) {
+	if validation == nil || placement == nil || placement.Status == metav1.ConditionTrue {
+		return
+	}
+
+	addPlacementViolation(validation, placement)
+}
+
+func addPlacementViolation(validation, placement *metav1.Condition) {
+	violationMsg := placementUnattachedMsg
+	if placement.Message != "" {
+		violationMsg = fmt.Sprintf("%s: %s", placementUnattachedMsg, placement.Message)
+	}
+
+	if validation.Status == metav1.ConditionFalse {
+		validation.Message = validation.Message + "; " + violationMsg
+	} else {
+		validation.Message = violationMsg
+	}
+
+	validation.Status = metav1.ConditionFalse
+	validation.Reason = workloadsv1.ReasonValidationFailed
+	validation.LastTransitionTime = metav1.Now()
+}
+
 func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 {
 		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
@@ -334,6 +400,7 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 			Status:             metav1.ConditionTrue,
 			Reason:             workloadsv1.ReasonNoGuardrails,
 			Message:            "No Guardrails found to validate against",
+			ObservedGeneration: wc.Generation,
 			LastTransitionTime: metav1.Now(),
 		}, nil
 	}
@@ -359,7 +426,197 @@ func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context,
 		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, *maxNonDisruptionDurationDays))
 	}
 
-	return condition(violations), nil
+	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+
+	return condition(wc.Generation, violations), nil
+}
+
+// validateCapacityStrategy validates WorkloadClass.Spec.CapacityStrategy against the aggregated
+// capacity constraints across all WorkloadClassGuardrails.
+//
+// It aggregates the most restrictive constraints (EnforcementMode, MinSpotRatio, and whether
+// fallback to OnDemand is allowed) and checks:
+//   - If CapacityStrategy is omitted (nil), validation fails when EnforcementMode is Required.
+//   - When EnforcementMode is Required, CapacityStrategy.Type must be Spot and SpotRatio cannot be 0%.
+//   - When EnforcementMode is Forbidden, CapacityStrategy.Type cannot be Spot.
+//   - SpotRatio must be greater than or equal to the guardrail MinSpotRatio.
+//   - FallbackAction cannot be FallbackToOnDemand when guardrails disallow fallback to OnDemand.
+func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass, guardrails *workloadsv1.WorkloadClassGuardrailList) []string {
+	if guardrails == nil || len(guardrails.Items) == 0 {
+		return nil
+	}
+
+	var violations []string
+	enforcementMode, minSpotRatioPct, allowFallback, err := guardrailCapacityConstraints(ctx, guardrails.Items)
+	if err != nil {
+		violations = append(violations, fmt.Sprintf("failed to parse guardrail parameters: %v", err))
+	}
+
+	if wc.Spec.CapacityStrategy == nil {
+		if enforcementMode == workloadsv1.RequiredEnforcementMode {
+			violations = append(violations, "capacityStrategy is required when guardrail enforcementMode is Required")
+		}
+		return violations
+	}
+
+	cs := wc.Spec.CapacityStrategy
+
+	csType := cs.Type
+	if csType == "" {
+		csType = workloadsv1.SpotPlacementTypeSpot
+	}
+
+	spotRatio := 100
+	spotRatioValid := true
+	if csType == workloadsv1.SpotPlacementTypeOnDemand {
+		spotRatio = 0
+	} else if cs.SpotRatio != "" {
+		parsed, err := parsePercentage(cs.SpotRatio)
+		if err != nil {
+			violations = append(violations, fmt.Sprintf("invalid spotRatio %q: %v", cs.SpotRatio, err))
+			spotRatioValid = false
+		} else {
+			spotRatio = parsed
+		}
+	}
+
+	fallbackAction := cs.FallbackAction
+	if fallbackAction == "" {
+		fallbackAction = workloadsv1.FallbackActionFail
+	}
+
+	switch enforcementMode {
+	case workloadsv1.RequiredEnforcementMode:
+		if csType != workloadsv1.SpotPlacementTypeSpot {
+			violations = append(violations, fmt.Sprintf("capacityStrategy type %s is not allowed when guardrail enforcementMode is Required", csType))
+		} else if spotRatioValid && spotRatio == 0 {
+			violations = append(violations, "spotRatio cannot be 0% when guardrail enforcementMode is Required")
+		}
+	case workloadsv1.ForbiddenEnforcementMode:
+		if csType == workloadsv1.SpotPlacementTypeSpot {
+			violations = append(violations, fmt.Sprintf("capacityStrategy type %s is not allowed when guardrail enforcementMode is Forbidden", csType))
+		}
+	}
+
+	if csType == workloadsv1.SpotPlacementTypeSpot && spotRatioValid && minSpotRatioPct > 0 && spotRatio < minSpotRatioPct {
+		violations = append(violations, fmt.Sprintf("spotRatio %d%% is less than guardrail minSpotRatio %d%%", spotRatio, minSpotRatioPct))
+	}
+
+	if !allowFallback && fallbackAction == workloadsv1.FallbackActionFallbackToOnDemand {
+		violations = append(violations, "fallback action FallbackToOnDemand is not allowed when guardrail disallows fallback to OnDemand")
+	}
+
+	return violations
+}
+
+// guardrailCapacityConstraints returns the most restrictive capacity strategy constraints from all WorkloadClassGuardrails.
+// Capacity strategy constraints are: EnforcementMode, MinSpotRatio (as an integer percentage), and AllowFallbackToOnDemand.
+// If there are no guardrails, default least-restrictive constraints (Allowed, 0, true) are returned.
+func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.WorkloadClassGuardrail) (workloadsv1.EnforcementMode, int, bool, error) {
+	log := logf.FromContext(ctx)
+
+	enforcementMode := workloadsv1.AllowedEnforcementMode
+	minSpotRatioPct := 0
+	allowFallback := true
+
+	if len(guardrails) == 0 {
+		log.Info("WorkloadClassGuardrailList is empty, returning default CapacityStrategy constraints")
+		return enforcementMode, minSpotRatioPct, allowFallback, nil
+	}
+
+	var errs []error
+	for _, g := range guardrails {
+		if g.Spec.PluginConstraints == nil {
+			continue
+		}
+		if err := applyPlacementCapacityConstraints(ctx, g.Name, g.Spec.PluginConstraints.Placement, &enforcementMode, &minSpotRatioPct, &allowFallback); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return enforcementMode, minSpotRatioPct, allowFallback, errors.Join(errs...)
+}
+
+// applyPlacementCapacityConstraints inspects the placement plugin constraints of a single WorkloadClassGuardrail,
+// decodes any gke-spot-placement parameters, and updates the effective capacity constraints in-place to reflect
+// the most restrictive settings seen so far:
+//   - enforcementMode precedence: Forbidden > Required > Allowed
+//   - minSpotRatioPct: highest minimum spot percentage (0 if enforcementMode is Forbidden)
+//   - allowFallback: set to false if AllowFallbackToOnDemand is false or MaxFallbackRatio is 0 / "0%"
+func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string, placement []workloadsv1.PluginConstraint, enforcementMode *workloadsv1.EnforcementMode, minSpotRatioPct *int, allowFallback *bool) error {
+	log := logf.FromContext(ctx)
+
+	var errs []error
+	for _, c := range placement {
+		if c.Name != workloadsv1.PluginNameGKESpotPlacement || c.Parameters == nil || len(c.Parameters.Raw) == 0 {
+			continue
+		}
+
+		params, err := utils.ParseGKESpotGuardrailParameters(c.Parameters.Raw)
+		if err != nil {
+			log.Error(err, "Failed to decode GKESpotGuardrailParameters", "guardrail", guardrailName)
+			errs = append(errs, fmt.Errorf("guardrail %s: %w", guardrailName, err))
+			continue
+		}
+
+		switch params.EnforcementMode {
+		case "", workloadsv1.AllowedEnforcementMode:
+		case workloadsv1.ForbiddenEnforcementMode:
+			*enforcementMode = workloadsv1.ForbiddenEnforcementMode
+			*minSpotRatioPct = 0
+		case workloadsv1.RequiredEnforcementMode:
+			if *enforcementMode != workloadsv1.ForbiddenEnforcementMode {
+				*enforcementMode = workloadsv1.RequiredEnforcementMode
+			}
+		default:
+			// Fail closed rather than treating an unknown mode as Allowed.
+			errs = append(errs, fmt.Errorf("guardrail %s has invalid enforcementMode %q: must be one of Allowed, Required, Forbidden", guardrailName, params.EnforcementMode))
+		}
+
+		if params.MinSpotRatio != nil {
+			parsed, err := parsePercentage(*params.MinSpotRatio)
+			if err != nil {
+				log.Error(err, "Failed to parse GKESpotGuardrailParameters minSpotRatio", "guardrail", guardrailName)
+				errs = append(errs, fmt.Errorf("guardrail %s has invalid minSpotRatio %q: %w", guardrailName, *params.MinSpotRatio, err))
+				continue
+			}
+			if *enforcementMode != workloadsv1.ForbiddenEnforcementMode && parsed > *minSpotRatioPct {
+				*minSpotRatioPct = parsed
+			}
+		}
+
+		if params.Fallback != nil {
+			if params.Fallback.AllowFallbackToOnDemand != nil && !*params.Fallback.AllowFallbackToOnDemand {
+				*allowFallback = false
+			}
+			if params.Fallback.MaxFallbackRatio != nil {
+				mfr := params.Fallback.MaxFallbackRatio
+				isZero := (mfr.Type == intstr.Int && mfr.IntVal == 0) || (mfr.Type == intstr.String && (mfr.StrVal == "0%" || mfr.StrVal == "0"))
+				if isZero {
+					*allowFallback = false
+				}
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// parsePercentage parses an integer percentage string between "0%" and "100%" (e.g. "60%"). Guardrail plugin
+// parameters are stored as free-form JSON without CRD schema validation, so out-of-range ("150%", "-10%") or
+// un-suffixed ("60") values are rejected here rather than accepted silently.
+func parsePercentage(s string) (int, error) {
+	if !strings.HasSuffix(s, "%") {
+		return 0, fmt.Errorf("must end with %%")
+	}
+	v, err := strconv.Atoi(strings.TrimSuffix(s, "%"))
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 || v > 100 {
+		return 0, fmt.Errorf("must be between 0%% and 100%%")
+	}
+	return v, nil
 }
 
 // validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.
@@ -453,24 +710,23 @@ func (r *WorkloadClassReconciler) findWorkloadClassesToReconcile(ctx context.Con
 	return requests
 }
 
-func condition(violations []string) metav1.Condition {
-	if len(violations) > 0 {
-		return metav1.Condition{
-			Type:               workloadsv1.ConditionTypeValidated,
-			Status:             metav1.ConditionFalse,
-			Reason:             workloadsv1.ReasonValidationFailed,
-			Message:            strings.Join(violations, "; "),
-			LastTransitionTime: metav1.Now(),
-		}
-	}
-
-	return metav1.Condition{
+func condition(generation int64, violations []string) metav1.Condition {
+	condition := metav1.Condition{
 		Type:               workloadsv1.ConditionTypeValidated,
 		Status:             metav1.ConditionTrue,
 		Reason:             workloadsv1.ReasonValidationPassed,
-		Message:            "WorkloadClass adheres to all Guardrail constraints",
+		Message:            validationPassedMsg,
 		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: generation,
 	}
+
+	if len(violations) > 0 {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = workloadsv1.ReasonValidationFailed
+		condition.Message = strings.Join(violations, "; ")
+	}
+
+	return condition
 }
 
 func guardrailDisruptionConstraints(guardrails []workloadsv1.WorkloadClassGuardrail) ([][]string, *int32, *int32) {

@@ -11,10 +11,31 @@ spec:
     kind: WorkloadClass
     listKind: WorkloadClassList
     plural: workloadclasses
+    shortNames:
+    - wc
     singular: workloadclass
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.maintenanceReadiness
+      name: Maintenance
+      type: string
+    - jsonPath: .spec.capacityStrategy.type
+      name: Capacity
+      type: string
+    - jsonPath: .spec.capacityStrategy.spotRatio
+      name: SpotRatio
+      type: string
+    - jsonPath: .spec.infrastructureProfileRef.name
+      name: Profile
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Validated')].status
+      name: Validated
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
     schema:
       openAPIV3Schema:
         description: WorkloadClass is the Schema for the workloadclasses API
@@ -39,6 +60,36 @@ spec:
           spec:
             description: spec defines the desired state of WorkloadClass
             properties:
+              capacityStrategy:
+                description: |-
+                  CapacityStrategy defines portable, cloud-agnostic compute capacity and fallback intent
+                  (e.g., targeting Spot vs. On-Demand capacity, target Spot percentage, and stockout fallback behavior).
+                properties:
+                  action:
+                    default: Fail
+                    description: |-
+                      FallbackAction determines whether Pods remain Pending ("Fail") or schedule onto On-Demand ("FallbackToOnDemand")
+                      when Spot capacity is unavailable. Default: "Fail".
+                    enum:
+                    - Fail
+                    - FallbackToOnDemand
+                    type: string
+                  spotRatio:
+                    default: 100%
+                    description: |-
+                      SpotRatio is the target percentage of Pods to place on Spot capacity (e.g., "80%"). Default: "100%".
+                      Must be an integer percentage between "0%" and "100%".
+                    pattern: ^(100|[1-9]?[0-9])%$
+                    type: string
+                  type:
+                    default: Spot
+                    description: 'Type specifies whether the workload targets Spot
+                      or OnDemand capacity. Default: "Spot".'
+                    enum:
+                    - Spot
+                    - OnDemand
+                    type: string
+                type: object
               disruptionPolicy:
                 description: DisruptionPolicy specifies the policy governing pod disruptions.
                 properties:
@@ -129,6 +180,33 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                type: object
+              infrastructureProfileRef:
+                description: |-
+                  InfrastructureProfileRef references a cluster-scoped, provider-specific infrastructure profile CR
+                  (such as GKESpotPlacementPolicy) managed by Platform/SRE.
+                properties:
+                  group:
+                    description: Group is the API group of the infrastructure profile
+                      (e.g., "workloads.gke.io").
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: Kind is the resource kind of the infrastructure profile
+                      (e.g., "GKESpotPlacementPolicy").
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  name:
+                    description: Name is the metadata.name of the cluster-scoped infrastructure
+                      profile resource.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - kind
+                - name
                 type: object
               podSelector:
                 description: PodSelector matches the pods that this class applies
@@ -250,6 +328,10 @@ spec:
               maintenanceReadiness:
                 description: MaintenanceReadiness indicates if the workload is currently
                   ready for maintenance.
+                enum:
+                - Ready
+                - NotReady
+                - Overdue
                 type: string
             type: object
         required:
