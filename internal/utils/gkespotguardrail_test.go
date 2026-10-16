@@ -69,6 +69,9 @@ func TestParseGKESpotGuardrailParameters(t *testing.T) {
 		if got.Fallback.AllowFallbackToOnDemand != nil {
 			t.Errorf("Fallback.AllowFallbackToOnDemand = %v, want nil (omitted)", *got.Fallback.AllowFallbackToOnDemand)
 		}
+		if got.Fallback.MaxFallbackRatio != nil {
+			t.Errorf("Fallback.MaxFallbackRatio = %v, want nil (omitted)", got.Fallback.MaxFallbackRatio.String())
+		}
 		if got.Reversion != nil {
 			t.Errorf("Reversion = %+v, want nil (omitted)", got.Reversion)
 		}
