@@ -25,8 +25,11 @@ import (
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestGetSpecificity(t *testing.T) {
@@ -176,8 +179,8 @@ func TestUpdateBestMatch(t *testing.T) {
 		{
 			name:             "not_nil_best_match_N_specificty_spec_==_N_wc_is_not_older_no_update",
 			desc:             "A match has already been selected, the current WC being processed has the same specificity but is newer, no update to best match",
-			wc:               wc22,
-			bm:               wc2,
+			wc:               wc2,
+			bm:               wc22,
 			otherMatches:     map[string]int{},
 			maxSpec:          2,
 			wantBM:           wc22,
@@ -491,6 +494,39 @@ func TestBestMatchWorkloadClass_EmitEvent(t *testing.T) {
 			t.Error("Expected AmbiguousMatch event to be emitted, but none was found")
 		}
 	})
+}
+
+func TestBestMatchWorkloadClass_IgnoresOtherNamespaces(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add client-go scheme: %v", err)
+	}
+	if err := workloadsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add workloads scheme: %v", err)
+	}
+
+	newWC := func(name, namespace string, labels map[string]string) *workloadsv1.WorkloadClass {
+		return &workloadsv1.WorkloadClass{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec:       workloadsv1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: labels}},
+		}
+	}
+	// The WorkloadClass in another namespace is more specific, so it would win if it were considered.
+	sameNS := newWC("same-ns", "team-a", map[string]string{"app": "batch"})
+	otherNS := newWC("other-ns", "team-b", map[string]string{"app": "batch", "tier": "gpu"})
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sameNS, otherNS).Build()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "p", Namespace: "team-a", Labels: map[string]string{"app": "batch", "tier": "gpu"},
+	}}
+
+	got, err := FindBestMatchWorkloadClass(t.Context(), c, nil, pod)
+	if err != nil {
+		t.Fatalf("FindBestMatchWorkloadClass returned unexpected error: %v", err)
+	}
+	if got == nil || got.Name != sameNS.Name {
+		t.Errorf("FindBestMatchWorkloadClass() = %v, want %s (WorkloadClasses in other namespaces must be ignored)", got, sameNS.Name)
+	}
 }
 
 func mapsEqual(m1, m2 map[string]int) bool {

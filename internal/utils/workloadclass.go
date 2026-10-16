@@ -46,8 +46,10 @@ func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder e
 		return bestMatch, nil
 	}
 
+	// WorkloadClass is namespaced and only applies to Pods in its own namespace, so only list that namespace
+	// rather than every WorkloadClass in the cluster on each Pod admission or eviction.
 	wcs := &workloadsv1.WorkloadClassList{}
-	if err := c.List(ctx, wcs); err != nil {
+	if err := c.List(ctx, wcs, client.InNamespace(pod.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
 	}
 
@@ -56,7 +58,7 @@ func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder e
 	maxSpecificity := -1
 
 	for _, wc := range wcs.Items {
-		if wc.Namespace != "" && pod.Namespace != "" && wc.Namespace != pod.Namespace {
+		if wc.Namespace != pod.Namespace {
 			continue
 		}
 		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
@@ -134,9 +136,6 @@ func namespaceDefaultWorkloadClass(ctx context.Context, c client.Client, pod *co
 		if defaultClass, ok := ns.Labels[defaultClassLabel]; ok {
 			wc := &workloadsv1.WorkloadClass{}
 			if err := c.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err == nil {
-				return wc
-			}
-			if err := c.Get(ctx, client.ObjectKey{Name: defaultClass}, wc); err == nil {
 				return wc
 			}
 		}
