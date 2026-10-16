@@ -25,12 +25,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 )
 
 const (
@@ -96,16 +95,12 @@ func (d *PodPlacementDefaulter) countExistingWorkloadClassPods(ctx context.Conte
 }
 
 // listWorkloadClassPods lists active (non-terminating, non-terminal) Pods in the incoming Pod's namespace
-// that are selected by the WorkloadClass, excluding the incoming Pod itself. A nil PodSelector selects all
-// Pods in the namespace (e.g., a namespace-default WorkloadClass).
+// that the WorkloadClass applies to, excluding the incoming Pod itself (see utils.WorkloadClassPodSelector: a
+// nil PodSelector, or the WorkloadClass being the namespace default, selects all Pods in the namespace).
 func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) ([]*corev1.Pod, error) {
-	selector := labels.Everything()
-	if wc.Spec.PodSelector != nil {
-		var err error
-		selector, err = metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
-		if err != nil {
-			return nil, fmt.Errorf("invalid podSelector: %w", err)
-		}
+	selector, err := utils.WorkloadClassPodSelector(ctx, d.Client, wc)
+	if err != nil {
+		return nil, err
 	}
 
 	podList := &corev1.PodList{}
