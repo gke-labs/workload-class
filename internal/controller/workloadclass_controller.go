@@ -540,7 +540,7 @@ func guardrailCapacityConstraints(ctx context.Context, guardrails []workloadsv1.
 }
 
 // applyPlacementCapacityConstraints inspects the placement plugin constraints of a single WorkloadClassGuardrail,
-// decodes any gke.io/spot-placement parameters, and updates the effective capacity constraints in-place to reflect
+// decodes any gke-spot-placement parameters, and updates the effective capacity constraints in-place to reflect
 // the most restrictive settings seen so far:
 //   - enforcementMode precedence: Forbidden > Required > Allowed
 //   - minSpotRatioPct: highest minimum spot percentage (0 if enforcementMode is Forbidden)
@@ -564,6 +564,7 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 		}
 
 		switch params.EnforcementMode {
+		case "", workloadsv1.AllowedEnforcementMode:
 		case workloadsv1.ForbiddenEnforcementMode:
 			*enforcementMode = workloadsv1.ForbiddenEnforcementMode
 			*minSpotRatioPct = 0
@@ -571,6 +572,9 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 			if *enforcementMode != workloadsv1.ForbiddenEnforcementMode {
 				*enforcementMode = workloadsv1.RequiredEnforcementMode
 			}
+		default:
+			// Fail closed rather than treating an unknown mode as Allowed.
+			errs = append(errs, fmt.Errorf("guardrail %s has invalid enforcementMode %q: must be one of Allowed, Required, Forbidden", guardrailName, params.EnforcementMode))
 		}
 
 		if params.MinSpotRatio != nil {
@@ -602,9 +606,21 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 	return errors.Join(errs...)
 }
 
-// parsePercentage strips a trailing "%" from a percentage string (e.g. "60%") and parses the integer value.
+// parsePercentage parses an integer percentage string between "0%" and "100%" (e.g. "60%"). Guardrail plugin
+// parameters are stored as free-form JSON without CRD schema validation, so out-of-range ("150%", "-10%") or
+// un-suffixed ("60") values are rejected here rather than accepted silently.
 func parsePercentage(s string) (int, error) {
-	return strconv.Atoi(strings.TrimSuffix(s, "%"))
+	if !strings.HasSuffix(s, "%") {
+		return 0, fmt.Errorf("must end with %%")
+	}
+	v, err := strconv.Atoi(strings.TrimSuffix(s, "%"))
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 || v > 100 {
+		return 0, fmt.Errorf("must be between 0%% and 100%%")
+	}
+	return v, nil
 }
 
 // validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.

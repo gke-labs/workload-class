@@ -2040,6 +2040,46 @@ func TestGuardrailCapacityConstraints(t *testing.T) {
 			wantFallback:    true,
 			wantErr:         true,
 		},
+		{
+			name: "out_of_range_guardrail_min_spot_ratio_returns_error",
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "150%"}`,
+			},
+			wantEnforcement: workloadsv1.RequiredEnforcementMode,
+			wantMinRatio:    0,
+			wantFallback:    true,
+			wantErr:         true,
+		},
+		{
+			name: "negative_guardrail_min_spot_ratio_returns_error",
+			guardrailJSONs: []string{
+				`{"minSpotRatio": "-10%"}`,
+			},
+			wantEnforcement: workloadsv1.AllowedEnforcementMode,
+			wantMinRatio:    0,
+			wantFallback:    true,
+			wantErr:         true,
+		},
+		{
+			name: "unsuffixed_guardrail_min_spot_ratio_returns_error",
+			guardrailJSONs: []string{
+				`{"minSpotRatio": "60"}`,
+			},
+			wantEnforcement: workloadsv1.AllowedEnforcementMode,
+			wantMinRatio:    0,
+			wantFallback:    true,
+			wantErr:         true,
+		},
+		{
+			name: "invalid_guardrail_enforcement_mode_returns_error",
+			guardrailJSONs: []string{
+				`{"enforcementMode": "InvalidMode"}`,
+			},
+			wantEnforcement: workloadsv1.AllowedEnforcementMode,
+			wantMinRatio:    0,
+			wantFallback:    true,
+			wantErr:         true,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -2220,6 +2260,19 @@ func TestValidateCapacityStrategy(t *testing.T) {
 			},
 			wantViolations: []string{
 				`invalid spotRatio "invalid%": strconv.Atoi: parsing "invalid": invalid syntax`,
+			},
+		},
+		{
+			name: "out_of_range_guardrail_min_spot_ratio_fails_closed",
+			capacityStrategy: &workloadsv1.CapacityStrategy{
+				Type:      workloadsv1.SpotPlacementTypeSpot,
+				SpotRatio: "80%",
+			},
+			guardrailJSONs: []string{
+				`{"enforcementMode": "Required", "minSpotRatio": "150%"}`,
+			},
+			wantViolations: []string{
+				`failed to parse guardrail parameters: guardrail g-a has invalid minSpotRatio "150%": must be between 0% and 100%`,
 			},
 		},
 	}
