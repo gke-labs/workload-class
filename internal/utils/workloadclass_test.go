@@ -19,12 +19,14 @@ package utils
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
@@ -505,10 +507,10 @@ func TestBestMatchWorkloadClass_IgnoresOtherNamespaces(t *testing.T) {
 		t.Fatalf("failed to add workloads scheme: %v", err)
 	}
 
-	newWC := func(name, namespace string, labels map[string]string) *workloadsv1.WorkloadClass {
+	newWC := func(name, namespace string, matchLabels map[string]string) *workloadsv1.WorkloadClass {
 		return &workloadsv1.WorkloadClass{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-			Spec:       workloadsv1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: labels}},
+			Spec:       workloadsv1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: matchLabels}},
 		}
 	}
 	// The WorkloadClass in another namespace is more specific, so it would win if it were considered.
@@ -526,6 +528,110 @@ func TestBestMatchWorkloadClass_IgnoresOtherNamespaces(t *testing.T) {
 	}
 	if got == nil || got.Name != sameNS.Name {
 		t.Errorf("FindBestMatchWorkloadClass() = %v, want %s (WorkloadClasses in other namespaces must be ignored)", got, sameNS.Name)
+	}
+}
+
+func TestWorkloadClassPodSelector(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add client-go scheme: %v", err)
+	}
+	if err := workloadsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add workloads scheme: %v", err)
+	}
+
+	batchSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "batch"}}
+	newNS := func(defaultClass string) *corev1.Namespace {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
+		if defaultClass != "" {
+			ns.Labels = map[string]string{namespaceDefaultClassLabel: defaultClass}
+		}
+		return ns
+	}
+
+	testCases := []struct {
+		name          string
+		ns            *corev1.Namespace
+		podSelector   *metav1.LabelSelector
+		podLabels     map[string]string
+		wantSelected  bool
+		wantErrSubstr string
+	}{
+		{
+			name:         "selector_matches",
+			ns:           newNS(""),
+			podSelector:  batchSelector,
+			podLabels:    map[string]string{"app": "batch"},
+			wantSelected: true,
+		},
+		{
+			name:         "selector_does_not_match",
+			ns:           newNS(""),
+			podSelector:  batchSelector,
+			podLabels:    map[string]string{"app": "other"},
+			wantSelected: false,
+		},
+		{
+			name:         "nil_selector_selects_all",
+			ns:           newNS(""),
+			podLabels:    map[string]string{"app": "other"},
+			wantSelected: true,
+		},
+		{
+			name:         "namespace_default_selects_all_regardless_of_selector",
+			ns:           newNS("wc"),
+			podSelector:  batchSelector,
+			podLabels:    map[string]string{"app": "other"},
+			wantSelected: true,
+		},
+		{
+			name:         "other_namespace_default_uses_selector",
+			ns:           newNS("some-other-wc"),
+			podSelector:  batchSelector,
+			podLabels:    map[string]string{"app": "other"},
+			wantSelected: false,
+		},
+		{
+			name:         "missing_namespace_uses_selector",
+			podSelector:  batchSelector,
+			podLabels:    map[string]string{"app": "other"},
+			wantSelected: false,
+		},
+		{
+			name: "invalid_selector_returns_error",
+			ns:   newNS(""),
+			podSelector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "app", Operator: "Bogus"},
+			}},
+			wantErrSubstr: "invalid podSelector",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tc.ns != nil {
+				builder = builder.WithObjects(tc.ns)
+			}
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "team-a"},
+				Spec:       workloadsv1.WorkloadClassSpec{PodSelector: tc.podSelector},
+			}
+
+			selector, err := WorkloadClassPodSelector(t.Context(), builder.Build(), wc)
+			if tc.wantErrSubstr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Fatalf("WorkloadClassPodSelector() error = %v, want error containing %q", err, tc.wantErrSubstr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WorkloadClassPodSelector() returned unexpected error: %v", err)
+			}
+			if got := selector.Matches(labels.Set(tc.podLabels)); got != tc.wantSelected {
+				t.Errorf("selector.Matches(%v) = %v, want %v", tc.podLabels, got, tc.wantSelected)
+			}
+		})
 	}
 }
 
