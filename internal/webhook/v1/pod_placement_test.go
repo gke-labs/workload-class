@@ -260,6 +260,27 @@ var _ = Describe("Pod placement helpers", func() {
 			Expect(total).To(Equal(3))
 		})
 
+		It("counts every Pod in the namespace for the namespace-default WorkloadClass, regardless of its PodSelector", func() {
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name: testNamespace, Labels: map[string]string{"workloads.gke.io/default-class": testWLCName},
+			}}
+			// Not matched by the WorkloadClass's app=batch selector, but it belongs to the namespace default.
+			unlabeled := newExistingPod("other", "spot-node", true)
+			unlabeled.Labels = map[string]string{"app": "other"}
+
+			d := newDefaulter(
+				ns,
+				newExistingPod("batch-0", "spot-node", true),
+				unlabeled,
+				newNode("spot-node", true),
+			)
+
+			spot, total := d.countExistingWorkloadClassPods(testCtx, newIncomingPod(), wlc)
+			Expect(spot).To(Equal(2))
+			Expect(total).To(Equal(2))
+		})
+
 		It("detects fallback from the InFallback condition", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, []metav1.Condition{
 				{Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonFallbackActive},
