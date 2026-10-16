@@ -18,7 +18,6 @@ package v1
 
 import (
 	"context"
-	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -171,13 +170,13 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 		return nil
 	}
 
-	spotRatio := 100
-	if cs.SpotRatio != "" {
-		parsed, err := parsePercentage(cs.SpotRatio)
-		if err != nil {
-			return fmt.Errorf("invalid spotRatio %q: %w", cs.SpotRatio, err)
-		}
-		spotRatio = parsed
+	spotRatio, err := utils.SpotRatioPercent(cs.SpotRatio)
+	if err != nil {
+		return err
+	}
+	if spotRatio == 0 {
+		mutateForOnDemand(pod)
+		return nil
 	}
 
 	fallbackAction := cs.FallbackAction
@@ -206,7 +205,7 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 
 	if spotRatio < 100 {
 		spotExisting, totalExisting := d.countExistingWorkloadClassPods(ctx, pod, wlc)
-		if !shouldUseSpot(spotExisting, totalExisting, spotRatio) {
+		if !utils.ShouldUseSpot(spotExisting, totalExisting, spotRatio) {
 			mutateForOnDemand(pod)
 			return nil
 		}

@@ -18,10 +18,7 @@ package v1
 
 import (
 	"context"
-	"fmt"
 	"slices"
-	"strconv"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -44,12 +41,6 @@ const (
 	// ComputeClassLabelKey is the GKE node label / nodeSelector key used to target a Custom Compute Class.
 	ComputeClassLabelKey = "cloud.google.com/compute-class"
 )
-
-// shouldUseSpot reports whether the next Pod should go to Spot: true while existing Spot Pods are
-// below spotRatio percent of the workload's Pods, counting the new one.
-func shouldUseSpot(spotExisting, totalExisting, spotRatio int) bool {
-	return spotExisting*100 < (totalExisting+1)*spotRatio
-}
 
 // isWorkloadInFallback reports whether the WorkloadClass is currently running Pods on On-Demand fallback.
 // It honors the InFallback condition when set and otherwise inspects existing Pods: a Pod that was
@@ -305,19 +296,4 @@ func addPreferredSchedulingTerm(pod *corev1.Pod, term corev1.PreferredScheduling
 		na.PreferredDuringSchedulingIgnoredDuringExecution,
 		term,
 	)
-}
-
-// parsePercentage parses an integer percentage string between "0%" and "100%".
-func parsePercentage(s string) (int, error) {
-	if !strings.HasSuffix(s, "%") {
-		return 0, fmt.Errorf("must end with %%")
-	}
-	v, err := strconv.Atoi(strings.TrimSuffix(s, "%"))
-	if err != nil {
-		return 0, err
-	}
-	if v < 0 || v > 100 {
-		return 0, fmt.Errorf("must be between 0%% and 100%%")
-	}
-	return v, nil
 }

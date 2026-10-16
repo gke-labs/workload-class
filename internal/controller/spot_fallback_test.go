@@ -242,6 +242,14 @@ func TestReconcile_InFallback(t *testing.T) {
 			want: "",
 		},
 		{
+			name: "SpotRatio 0% removes the condition",
+			cs:   fallbackCS("0%"), reversion: &none,
+			mutateWC: func(wc *workloadsv1.WorkloadClass) {
+				wc.Status.Conditions = append(wc.Status.Conditions, inFallbackTrue())
+			},
+			want: "",
+		},
+		{
 			name: "leaving the plugin's scope removes the condition",
 			cs:   fallbackCS("100%"), reversion: &none,
 			mutateWC: func(wc *workloadsv1.WorkloadClass) {

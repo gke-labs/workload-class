@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -471,7 +470,7 @@ func validateCapacityStrategy(ctx context.Context, wc *workloadsv1.WorkloadClass
 	if csType == workloadsv1.SpotPlacementTypeOnDemand {
 		spotRatio = 0
 	} else if cs.SpotRatio != "" {
-		parsed, err := parsePercentage(cs.SpotRatio)
+		parsed, err := utils.ParsePercentage(cs.SpotRatio)
 		if err != nil {
 			violations = append(violations, fmt.Sprintf("invalid spotRatio %q: %v", cs.SpotRatio, err))
 			spotRatioValid = false
@@ -574,7 +573,7 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 		}
 
 		if params.MinSpotRatio != nil {
-			parsed, err := parsePercentage(*params.MinSpotRatio)
+			parsed, err := utils.ParsePercentage(*params.MinSpotRatio)
 			if err != nil {
 				log.Error(err, "Failed to parse GKESpotGuardrailParameters minSpotRatio", "guardrail", guardrailName)
 				errs = append(errs, fmt.Errorf("guardrail %s has invalid minSpotRatio %q: %w", guardrailName, *params.MinSpotRatio, err))
@@ -600,23 +599,6 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 	}
 
 	return errors.Join(errs...)
-}
-
-// parsePercentage parses an integer percentage string between "0%" and "100%" (e.g. "60%"). Guardrail plugin
-// parameters are stored as free-form JSON without CRD schema validation, so out-of-range ("150%", "-10%") or
-// un-suffixed ("60") values are rejected here rather than accepted silently.
-func parsePercentage(s string) (int, error) {
-	if !strings.HasSuffix(s, "%") {
-		return 0, fmt.Errorf("must end with %%")
-	}
-	v, err := strconv.Atoi(strings.TrimSuffix(s, "%"))
-	if err != nil {
-		return 0, err
-	}
-	if v < 0 || v > 100 {
-		return 0, fmt.Errorf("must be between 0%% and 100%%")
-	}
-	return v, nil
 }
 
 // validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.
