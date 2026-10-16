@@ -212,7 +212,7 @@ func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx 
 	for i := range workloadClasses.Items {
 		wc := &workloadClasses.Items[i]
 		ref := wc.Spec.InfrastructureProfileRef
-		if !referencesSpotPolicy(ref) || ref.Name != policyName {
+		if !utils.ReferencesGKESpotPlacementPolicy(ref) || ref.Name != policyName {
 			continue
 		}
 		if err := r.updateWorkloadClassStatus(ctx, wc, options); err != nil {
@@ -220,13 +220,6 @@ func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx 
 		}
 	}
 	return errors.Join(errs...)
-}
-
-func referencesSpotPolicy(ref *workloadsv1.InfrastructureProfileReference) bool {
-	if ref == nil || ref.Kind != workloadsv1.GKESpotPlacementPolicyKind {
-		return false
-	}
-	return ref.Group == "" || ref.Group == workloadsv1.GroupVersion.Group
 }
 
 func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context.Context, wc *workloadsv1.WorkloadClass, options statusOptions) error {
@@ -276,7 +269,7 @@ func (r *GKESpotPlacementPolicyReconciler) enqueueIfReferencesSpotPolicy(ctx con
 	}
 
 	infraProfileRef := wc.Spec.InfrastructureProfileRef
-	if !referencesSpotPolicy(infraProfileRef) {
+	if !utils.ReferencesGKESpotPlacementPolicy(infraProfileRef) {
 		return nil
 	}
 
