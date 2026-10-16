@@ -17,10 +17,9 @@ limitations under the License.
 package v1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // Constraints defines the guardrails for WorkloadClasses.
 type Constraints struct {
@@ -54,29 +53,48 @@ type Disruption struct {
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
 }
 
-// WorkloadClassGuardrailSpec defines the desired state of WorkloadClassGuardrail
+// PluginConstraints defines guardrail constraints grouped by plugin optimization intent.
+type PluginConstraints struct {
+	// Placement holds the list of plugin constraints for workload placement.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Placement []PluginConstraint `json:"placement,omitempty"`
+}
+
+// PluginConstraint defines constraints for a specific plugin controller.
+type PluginConstraint struct {
+	// Name identifies the target plugin controller (e.g., "gke-spot-placement").
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+
+	// AllowedConfigTemplate optionally specifies a policy template name (e.g., "K8sAllowedSpotRatio").
+	// +optional
+	AllowedConfigTemplate string `json:"allowedConfigTemplate,omitempty"`
+
+	// Parameters holds plugin-specific guardrail parameters as an arbitrary JSON/YAML object.
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	Parameters *apiextensionsv1.JSON `json:"parameters,omitempty"`
+}
+
+// WorkloadClassGuardrailSpec defines the desired state of WorkloadClassGuardrail.
 type WorkloadClassGuardrailSpec struct {
-	// Constraints defines the guardrails for WorkloadClasses.
+	// Constraints defines the core cloud-agnostic guardrails for WorkloadClasses.
+	// +required
 	Constraints Constraints `json:"constraints"`
+
+	// PluginConstraints defines guardrail constraints grouped by plugin optimization intent.
+	// +optional
+	PluginConstraints *PluginConstraints `json:"pluginConstraints,omitempty"`
 }
 
 // WorkloadClassGuardrailStatus defines the observed state of WorkloadClassGuardrail.
 type WorkloadClassGuardrailStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the WorkloadClassGuardrail resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// Conditions represent the latest observed state of the WorkloadClassGuardrail resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional

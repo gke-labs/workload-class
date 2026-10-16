@@ -18,6 +18,7 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // ReversionAction specifies the strategy for moving fallback workloads back to Spot capacity.
@@ -33,6 +34,21 @@ const (
 
 	// NoneReversionAction stays on On-Demand permanently after fallback (default).
 	NoneReversionAction ReversionAction = "None"
+)
+
+// EnforcementMode specifies whether Spot usage is Required, Allowed (default), or Forbidden
+// +kubebuilder:validation:Enum=Allowed;Required;Forbidden
+type EnforcementMode string
+
+const (
+	// AllowedEnforcementMode lets WorkloadClasses decide whether or not to use Spot placement.
+	AllowedEnforcementMode EnforcementMode = "Allowed"
+
+	// RequiredEnforcementMode forces WorkloadClasses to use Spot placement.
+	RequiredEnforcementMode EnforcementMode = "Required"
+
+	// ForbiddenEnforcementMode forbids WorkloadClasses from using Spot placement.
+	ForbiddenEnforcementMode EnforcementMode = "Forbidden"
 )
 
 const (
@@ -131,4 +147,59 @@ type GKESpotPlacementPolicyList struct {
 
 func init() {
 	SchemeBuilder.Register(&GKESpotPlacementPolicy{}, &GKESpotPlacementPolicyList{})
+}
+
+// GKESpotGuardrailParameters defines the schema for "gke-spot-placement" guardrail parameters.
+//
+// These parameters are stored as raw JSON in PluginConstraint.Parameters and are not part of
+// any CRD schema, so the API server does not apply defaults or validation to them. Instead,
+// the controllers decode them in Go: omitted fields are treated as "no restriction"
+// (e.g., an empty EnforcementMode behaves as Allowed, a nil AllowFallbackToOnDemand behaves as true),
+// and field values are validated by the WorkloadClassGuardrail controller.
+type GKESpotGuardrailParameters struct {
+	// EnforcementMode specifies whether Spot usage is Required, Allowed, or Forbidden.
+	// If omitted, it is treated as Allowed.
+	// +optional
+	EnforcementMode EnforcementMode `json:"enforcementMode,omitempty"`
+
+	// MinSpotRatio sets the minimum allowed Spot ratio as an integer percentage
+	// between "0%" and "100%" (e.g., "80%"). If omitted, no minimum is enforced.
+	// +optional
+	MinSpotRatio *string `json:"minSpotRatio,omitempty"`
+
+	// Fallback restricts On-Demand fallback configuration and capacity budget.
+	// +optional
+	Fallback *GKESpotFallbackConstraints `json:"fallback,omitempty"`
+
+	// Reversion mandates reversion behavior and maximum fallback duration.
+	// +optional
+	Reversion *GKESpotReversionConstraints `json:"reversion,omitempty"`
+}
+
+// GKESpotFallbackConstraints defines guardrail constraints on On-Demand fallback behavior when Spot capacity is unavailable.
+type GKESpotFallbackConstraints struct {
+	// AllowFallbackToOnDemand specifies whether workload owners are allowed to fall back to On-Demand capacity.
+	// If omitted, fallback is allowed.
+	// +optional
+	AllowFallbackToOnDemand *bool `json:"allowFallbackToOnDemand,omitempty"`
+
+	// MaxFallbackRatio is the budget control specifying the maximum percentage (e.g., "25%")
+	// or absolute number (e.g., 5) of Pods in the WorkloadClass allowed on On-Demand fallback concurrently.
+	// If omitted, no fallback budget is enforced.
+	// +optional
+	MaxFallbackRatio *intstr.IntOrString `json:"maxFallbackRatio,omitempty"`
+}
+
+// GKESpotReversionConstraints defines guardrail constraints on transitioning fallback workloads back to Spot capacity.
+type GKESpotReversionConstraints struct {
+	// RequiredReversionAction enforces a specific reversion strategy (e.g., must be "Active").
+	// If omitted, any reversion action is allowed.
+	// +optional
+	RequiredReversionAction *ReversionAction `json:"requiredReversionAction,omitempty"`
+
+	// MaxFallbackDuration sets an upper bound on how long a Pod can run on On-Demand fallback
+	// before reversion to Spot is forced (e.g., "30m", "2h"). Must be non-negative.
+	// If omitted, no upper bound is enforced.
+	// +optional
+	MaxFallbackDuration *metav1.Duration `json:"maxFallbackDuration,omitempty"`
 }
