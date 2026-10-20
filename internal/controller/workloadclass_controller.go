@@ -172,7 +172,6 @@ func (r *WorkloadClassReconciler) reconcilePDB(ctx context.Context, wc *workload
 }
 
 func (r *WorkloadClassReconciler) namespaceDefault(ctx context.Context, wc *workloadsv1.WorkloadClass) (string, error) {
-	const defaultClassLabel = "workloads.gke.io/default-class"
 	ns := &corev1.Namespace{}
 
 	// We use types.NamespacedName. Since Namespaces are cluster-scoped,
@@ -182,7 +181,7 @@ func (r *WorkloadClassReconciler) namespaceDefault(ctx context.Context, wc *work
 		return "", fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
 	}
 
-	if value, ok := ns.Labels[defaultClassLabel]; ok {
+	if value, ok := ns.Labels[workloadsv1.DefaultClassLabel]; ok {
 		return value, nil
 	}
 
