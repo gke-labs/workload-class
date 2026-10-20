@@ -25,9 +25,11 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -219,13 +221,13 @@ func TestUpdateBestMatch(t *testing.T) {
 }
 
 func TestNamespaceDefaultWorkloadClass(t *testing.T) {
-	const defaultClassAnnotation = "workloads.gke.io/default-class"
 	const namespace = "namespace"
+	now := metav1.Now()
 	wc := &workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "wc",
 			Namespace:         namespace,
-			CreationTimestamp: metav1.Time{Time: time.Now()},
+			CreationTimestamp: now,
 		},
 		Spec: workloadsv1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{
@@ -235,12 +237,15 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			},
 		},
 	}
+	deletingWC := wc.DeepCopy()
+	deletingWC.DeletionTimestamp = &now
+
 	nsDefault := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-default",
 			Namespace: namespace,
 			Labels: map[string]string{
-				defaultClassAnnotation: "wc",
+				workloadsv1.DefaultClassLabel: "wc",
 			},
 		},
 	}
@@ -253,8 +258,6 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			},
 		},
 	}
-	pod := &corev1.Pod{}
-	pod.Namespace = namespace
 
 	testCases := []struct {
 		name          string
@@ -262,12 +265,15 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 		getNSError    error
 		getNSResult   *corev1.Namespace
 		getWCError    error
+		getWCResult   *workloadsv1.WorkloadClass
 		wantBestMatch *workloadsv1.WorkloadClass
+		wantErr       bool
 	}{
 		{
 			name:       "error_getting_namespace",
-			desc:       "Error getting namespace, expect nil best match",
+			desc:       "Error getting namespace, expect nil best match and error",
 			getNSError: fmt.Errorf("error getting Namespace"),
+			wantErr:    true,
 		},
 		{
 			name:        "no_default_class_with_namespace",
@@ -275,15 +281,29 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			getNSResult: nsNoDefault,
 		},
 		{
+			name:        "default_wc_not_found",
+			desc:        "Namespace has a default WC label, but WC does not exist, expect nil best match and no error",
+			getNSResult: nsDefault,
+			getWCError:  apierrors.NewNotFound(schema.GroupResource{Group: "workloads.gke.io", Resource: "workloadclasses"}, "wc"),
+		},
+		{
+			name:        "default_wc_being_deleted",
+			desc:        "Namespace has a default WC that has a DeletionTimestamp, expect nil best match",
+			getNSResult: nsDefault,
+			getWCResult: deletingWC,
+		},
+		{
 			name:        "error_getting_wc",
-			desc:        "Namespace has a default WC, but error getting WC, expect nil best match",
+			desc:        "Namespace has a default WC, but unexpected error getting WC, expect nil best match and error",
 			getNSResult: nsDefault,
 			getWCError:  fmt.Errorf("error getting WorkloadClass"),
+			wantErr:     true,
 		},
 		{
 			name:          "success_getting_namespace_default",
 			desc:          "Namespace has WC, success getting WC, expect updated best match",
 			getNSResult:   nsDefault,
+			getWCResult:   wc,
 			wantBestMatch: wc,
 		},
 	}
@@ -291,16 +311,23 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := createTestClient(tc.getNSError, tc.getWCError, nil, tc.getNSResult, wc, nil)
-			gotWC := namespaceDefaultWorkloadClass(ctx, c, pod)
+			wcResult := tc.getWCResult
+			if wcResult == nil {
+				wcResult = wc
+			}
+			c := createTestClient(tc.getNSError, tc.getWCError, nil, tc.getNSResult, wcResult, nil)
+			gotWC, err := NamespaceDefaultWorkloadClass(ctx, c, namespace)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("NamespaceDefaultWorkloadClass() error = %v, wantErr: %v", err, tc.wantErr)
+			}
 			if (gotWC != nil) != (tc.wantBestMatch != nil) {
-				t.Errorf("namespaceDefaultWorkloadClass() returned an unexpected result, got: %v, want: %v", gotWC, tc.wantBestMatch)
+				t.Errorf("NamespaceDefaultWorkloadClass() returned an unexpected result, got: %v, want: %v", gotWC, tc.wantBestMatch)
 			}
 			if gotWC == nil {
 				return
 			}
 			if gotWC.Name != tc.wantBestMatch.Name {
-				t.Errorf("namespaceDefaultWorkloadClass() returned a different WorkloadClass than expected, got: %v, want: %v", gotWC, tc.wantBestMatch)
+				t.Errorf("NamespaceDefaultWorkloadClass() returned a different WorkloadClass than expected, got: %v, want: %v", gotWC, tc.wantBestMatch)
 			}
 		})
 	}
@@ -544,7 +571,7 @@ func TestWorkloadClassPodSelector(t *testing.T) {
 	newNS := func(defaultClass string) *corev1.Namespace {
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
 		if defaultClass != "" {
-			ns.Labels = map[string]string{namespaceDefaultClassLabel: defaultClass}
+			ns.Labels = map[string]string{workloadsv1.DefaultClassLabel: defaultClass}
 		}
 		return ns
 	}
@@ -630,6 +657,132 @@ func TestWorkloadClassPodSelector(t *testing.T) {
 			}
 			if got := selector.Matches(labels.Set(tc.podLabels)); got != tc.wantSelected {
 				t.Errorf("selector.Matches(%v) = %v, want %v", tc.podLabels, got, tc.wantSelected)
+			}
+		})
+	}
+}
+
+func TestBestMatchWorkloadClassForPod(t *testing.T) {
+	const namespace = "team-a"
+	now := metav1.Now()
+	older := metav1.NewTime(now.Add(-10 * time.Minute))
+
+	wcSpecific := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-specific",
+			Namespace:         namespace,
+			CreationTimestamp: now,
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "batch", "tier": "gpu"},
+			},
+		},
+	}
+	wcOlder := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-older",
+			Namespace:         namespace,
+			CreationTimestamp: older,
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "batch"},
+			},
+		},
+	}
+	wcNewer := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-newer",
+			Namespace:         namespace,
+			CreationTimestamp: now,
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "batch"},
+			},
+		},
+	}
+	wcDeleting := wcSpecific
+	wcDeleting.Name = "wc-deleting"
+	wcDeleting.DeletionTimestamp = &now
+
+	wcDefault := workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-default",
+			Namespace:         namespace,
+			CreationTimestamp: now,
+		},
+	}
+	wcDefaultDeleting := wcDefault
+	wcDefaultDeleting.DeletionTimestamp = &now
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: namespace,
+			Labels:    map[string]string{"app": "batch", "tier": "gpu"},
+		},
+	}
+
+	testCases := []struct {
+		name      string
+		pod       *corev1.Pod
+		defaultWC *workloadsv1.WorkloadClass
+		allWCs    []workloadsv1.WorkloadClass
+		wantName  string
+	}{
+		{
+			name:     "nil_pod_returns_nil",
+			pod:      nil,
+			allWCs:   []workloadsv1.WorkloadClass{wcSpecific},
+			wantName: "",
+		},
+		{
+			name:      "active_default_wc_takes_precedence",
+			pod:       pod,
+			defaultWC: &wcDefault,
+			allWCs:    []workloadsv1.WorkloadClass{wcSpecific, wcOlder},
+			wantName:  "wc-default",
+		},
+		{
+			name:      "deleting_default_wc_falls_back_to_selectors",
+			pod:       pod,
+			defaultWC: &wcDefaultDeleting,
+			allWCs:    []workloadsv1.WorkloadClass{wcSpecific, wcOlder},
+			wantName:  "wc-specific",
+		},
+		{
+			name:     "highest_specificity_wins",
+			pod:      pod,
+			allWCs:   []workloadsv1.WorkloadClass{wcOlder, wcSpecific, wcNewer},
+			wantName: "wc-specific",
+		},
+		{
+			name:     "equal_specificity_oldest_wins",
+			pod:      pod,
+			allWCs:   []workloadsv1.WorkloadClass{wcNewer, wcOlder},
+			wantName: "wc-older",
+		},
+		{
+			name:     "deleting_wc_in_list_is_ignored",
+			pod:      pod,
+			allWCs:   []workloadsv1.WorkloadClass{wcDeleting, wcOlder},
+			wantName: "wc-older",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := BestMatchWorkloadClassForPod(tc.pod, tc.defaultWC, tc.allWCs)
+			if tc.wantName == "" {
+				if got != nil {
+					t.Errorf("BestMatchWorkloadClassForPod() = %v, want nil", got.Name)
+				}
+				return
+			}
+			if got == nil || got.Name != tc.wantName {
+				t.Errorf("BestMatchWorkloadClassForPod() = %v, want %q", got, tc.wantName)
 			}
 		})
 	}
