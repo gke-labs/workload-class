@@ -196,6 +196,13 @@ const (
 )
 
 const (
+	// DefaultClassLabel is the Namespace label naming the namespace's default WorkloadClass.
+	DefaultClassLabel = "workloads.gke.io/default-class"
+
+	// PodUIDLabel is the label set on governed Pods and their Per-Pod PodDisruptionBudgets
+	// to associate each PDB with a single Pod instance by UID.
+	PodUIDLabel = "workloads.gke.io/pod-uid"
+
 	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails.
 	ConditionTypeValidated = "Validated"
 
