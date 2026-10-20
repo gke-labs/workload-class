@@ -1501,7 +1501,13 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			expectedPDB := utils.PDBBase(tc.wc)
+			expectedPDB := utils.PDBBase(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tc.wc.Name,
+					Namespace: tc.wc.Namespace,
+					UID:       tc.wc.UID,
+				},
+			})
 			if tc.pdbExists {
 				// Inject an existing, outdated, PDB into the fake cluster
 				existingPDB := &policyv1.PodDisruptionBudget{
@@ -1641,7 +1647,13 @@ func TestReconcilePDB(t *testing.T) {
 
 			// Purposefully inject a dummy PDB beforehand.
 			// If deletePDB is called, it will vanish. If createOrUpdatePDB is called, it will remain/be updated.
-			expectedPDB := utils.PDBBase(tc.wc)
+			expectedPDB := utils.PDBBase(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tc.wc.Name,
+					Namespace: tc.wc.Namespace,
+					UID:       tc.wc.UID,
+				},
+			})
 			dummyPDB := &policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace},
 			}
