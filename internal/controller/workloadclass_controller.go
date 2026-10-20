@@ -199,7 +199,13 @@ func oldestWorkloadClass(wc *workloadsv1.WorkloadClass, overlappingClasses []wor
 }
 
 func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
-	pdb := utils.PDBBase(wc)
+	pdb := utils.PDBBase(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      wc.Name,
+			Namespace: wc.Namespace,
+			UID:       wc.UID,
+		},
+	})
 
 	if err := r.Delete(ctx, pdb); err != nil {
 		// If it's already gone, that's a success for a delete operation
@@ -213,13 +219,20 @@ func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1
 }
 
 func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
-	pdb := utils.PDBBase(wc)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      wc.Name,
+			Namespace: wc.Namespace,
+			UID:       wc.UID,
+		},
+	}
+	pdb := utils.PDBBase(pod)
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
 		// Set owner reference so the PDB gets automatically deleted if the WorkloadClass is deleted
 		if err := controllerutil.SetControllerReference(wc, pdb, r.Scheme); err != nil {
 			return err
 		}
-		return utils.SyncPDBWithWorkloadClass(wc, pdb)
+		return utils.SyncPDBWithWorkloadClass(wc, pod, pdb, true)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to reconcile PDB: %w", err)
