@@ -36,8 +36,6 @@ import (
 // podlog is for logging in this package.
 var podlog = logf.Log.WithName("pod-resource")
 
-const workloadsGroup = "workloads.gke.io"
-
 // SetupPodWebhookWithManager registers the webhook for Pod in the manager.
 func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr, &corev1.Pod{}).
@@ -94,7 +92,7 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 	}
 
 	ipr := bestWLC.Spec.InfrastructureProfileRef
-	usesSpotPolicy := referencesGKESpotPlacementPolicy(ipr)
+	usesSpotPolicy := utils.ReferencesGKESpotPlacementPolicy(ipr)
 	if ipr != nil && !usesSpotPolicy {
 		log.V(1).Info("WorkloadClass references a different infrastructure profile; Pod will not be mutated", "kind", ipr.Kind, "group", ipr.Group)
 		return nil
@@ -143,12 +141,6 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 
 	log.Info("Mutated Pod placement", "targetSpot", isPodTargetedForSpot(pod))
 	return nil
-}
-
-func referencesGKESpotPlacementPolicy(ipr *workloadsv1.InfrastructureProfileReference) bool {
-	return ipr != nil &&
-		ipr.Kind == workloadsv1.GKESpotPlacementPolicyKind &&
-		(ipr.Group == "" || ipr.Group == workloadsGroup)
 }
 
 func (d *PodPlacementDefaulter) fetchSpotPlacementPolicy(ctx context.Context, ipr *workloadsv1.InfrastructureProfileReference) (*workloadsv1.GKESpotPlacementPolicy, error) {
