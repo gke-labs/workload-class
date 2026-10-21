@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -69,25 +70,32 @@ func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if !utils.IsGKESpotManaged(wc) {
-		// The predicate filters these out on events, but a WorkloadClass can be requeued from a watch mapping
-		// after its spec changed. Nothing to do.
-		return ctrl.Result{}, nil
+		// The predicate filters these out on events, but a WorkloadClass can be requeued from a watch mapping,
+		// or have just left the plugin's scope via a spec change. Drop any status this plugin owns.
+		return ctrl.Result{}, r.clearFallbackState(ctx, wc)
 	}
 
 	// Only act once the central controller has validated the WorkloadClass and, when a GKESpotPlacementPolicy
 	// is referenced, once the policy controller has attached it. Until then the Pod placement webhook does not
-	// mutate this WorkloadClass's Pods either.
-	if !meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeValidated) {
-		log.V(1).Info("WorkloadClass is not validated; skipping GKE Spot placement reconcile")
-		return ctrl.Result{}, nil
-	}
-	if utils.ReferencesGKESpotPlacementPolicy(wc.Spec.InfrastructureProfileRef) &&
-		!meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached) {
-		log.V(1).Info("GKESpotPlacementPolicy is not attached; skipping GKE Spot placement reconcile")
-		return ctrl.Result{}, nil
+	// mutate this WorkloadClass's Pods either, so any InFallback condition would be stale and is removed.
+	//
+	// The exception is PluginPending: the central controller resets PlacementPluginAttached to that state on
+	// every generation bump until the policy controller reconciles the new generation. That is transient and
+	// happens on any spec edit, so the condition (and with it a latched None fallback) is left untouched.
+	if !isReady(wc) {
+		if isPlacementPluginPending(wc) {
+			log.V(1).Info("Placement plugin is pending; leaving GKE Spot placement state untouched")
+			return ctrl.Result{}, nil
+		}
+		log.V(1).Info("WorkloadClass is not validated or its policy is not attached; clearing GKE Spot placement state")
+		return ctrl.Result{}, r.clearFallbackState(ctx, wc)
 	}
 
-	// TODO: InFallback tracking.
+	// Track whether Spot-targeted Pods have fallen back to On-Demand (InFallback condition).
+	if _, err := r.reconcileFallbackState(ctx, wc); err != nil {
+		log.Error(err, "Failed to reconcile Spot fallback state")
+		return ctrl.Result{}, err
+	}
 
 	// Spot capacity drives reversion; for now the result is only logged. A failed
 	// check is logged rather than returned so it never blocks the rest of the loop.
@@ -120,8 +128,31 @@ func (r *GKESpotPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForSpotNode),
 			builder.WithPredicates(spotNodeReadinessPredicate()),
 		).
+		Watches(
+			&corev1.Pod{}, // Re-evaluate InFallback when Pods are bound, terminate, or are deleted
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassForPod),
+			builder.WithPredicates(podPlacementChangePredicate()),
+		).
 		Named("gkespotplacement").
 		Complete(r)
+}
+
+// isReady reports whether the central controller has validated the WorkloadClass and, when it references a
+// GKESpotPlacementPolicy, whether the policy controller has attached it. This is the same gate the Pod
+// placement webhook applies before mutating Pods.
+func isReady(wc *workloadsv1.WorkloadClass) bool {
+	if !meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeValidated) {
+		return false
+	}
+	return !utils.ReferencesGKESpotPlacementPolicy(wc.Spec.InfrastructureProfileRef) ||
+		meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
+}
+
+// isPlacementPluginPending reports whether the WorkloadClass is waiting for its placement plugin to (re)attach,
+// i.e. PlacementPluginAttached is False with reason PluginPending.
+func isPlacementPluginPending(wc *workloadsv1.WorkloadClass) bool {
+	cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
+	return cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == workloadsv1.ReasonPluginPending
 }
 
 // gkeSpotManagedPredicate passes WorkloadClass events for WorkloadClasses the gke-spot-placement plugin is
