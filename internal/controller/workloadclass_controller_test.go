@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1482,6 +1483,9 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 					Namespace: "default",
 					UID:       "fake-uid-123",
 				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "batch-processor"}},
+				},
 			},
 			wantErr: false,
 		},
@@ -1494,6 +1498,9 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 					Namespace: "default",
 					UID:       "fake-uid-123",
 				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "batch-processor"}},
+				},
 			},
 			wantErr: false,
 		},
@@ -1501,13 +1508,7 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			expectedPDB := utils.PDBBase(&corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      tc.wc.Name,
-					Namespace: tc.wc.Namespace,
-					UID:       tc.wc.UID,
-				},
-			})
+			expectedPDB := workloadClassPDB(tc.wc)
 			if tc.pdbExists {
 				// Inject an existing, outdated, PDB into the fake cluster
 				existingPDB := &policyv1.PodDisruptionBudget{
@@ -1547,6 +1548,14 @@ func TestCreateOrUpdatePDB(t *testing.T) {
 					if savedPDB.OwnerReferences[0].UID != tc.wc.UID {
 						t.Errorf("Expected OwnerReference UID %q, got %q", tc.wc.UID, savedPDB.OwnerReferences[0].UID)
 					}
+				}
+
+				// The PDB must select the WorkloadClass' Pods, or it will not block any evictions.
+				if !reflect.DeepEqual(savedPDB.Spec.Selector, tc.wc.Spec.PodSelector) {
+					t.Errorf("Expected PDB selector %v, got %v", tc.wc.Spec.PodSelector, savedPDB.Spec.Selector)
+				}
+				if _, ok := savedPDB.Labels[utils.PodUIDLabel]; ok {
+					t.Errorf("Expected PDB to not have the %s label, got %v", utils.PodUIDLabel, savedPDB.Labels)
 				}
 			}
 		})
@@ -1647,13 +1656,7 @@ func TestReconcilePDB(t *testing.T) {
 
 			// Purposefully inject a dummy PDB beforehand.
 			// If deletePDB is called, it will vanish. If createOrUpdatePDB is called, it will remain/be updated.
-			expectedPDB := utils.PDBBase(&corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      tc.wc.Name,
-					Namespace: tc.wc.Namespace,
-					UID:       tc.wc.UID,
-				},
-			})
+			expectedPDB := workloadClassPDB(tc.wc)
 			dummyPDB := &policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace},
 			}

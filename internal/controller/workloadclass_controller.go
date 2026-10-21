@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -198,14 +199,20 @@ func oldestWorkloadClass(wc *workloadsv1.WorkloadClass, overlappingClasses []wor
 	return oldest
 }
 
-func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
-	pdb := utils.PDBBase(&corev1.Pod{
+// workloadClassPDB returns the single PDB (workload-<wc.Name>) managed for a WorkloadClass.
+//
+// TODO: Remove once the controller reconciles one PDB per Pod (workload-<pod.Name>).
+func workloadClassPDB(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      wc.Name,
+			Name:      utils.PDBName(wc.Name),
 			Namespace: wc.Namespace,
-			UID:       wc.UID,
 		},
-	})
+	}
+}
+
+func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+	pdb := workloadClassPDB(wc)
 
 	if err := r.Delete(ctx, pdb); err != nil {
 		// If it's already gone, that's a success for a delete operation
@@ -219,20 +226,23 @@ func (r *WorkloadClassReconciler) deletePDB(ctx context.Context, wc *workloadsv1
 }
 
 func (r *WorkloadClassReconciler) createOrUpdatePDB(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      wc.Name,
-			Namespace: wc.Namespace,
-			UID:       wc.UID,
-		},
-	}
-	pdb := utils.PDBBase(pod)
+	pdb := workloadClassPDB(wc)
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
 		// Set owner reference so the PDB gets automatically deleted if the WorkloadClass is deleted
 		if err := controllerutil.SetControllerReference(wc, pdb, r.Scheme); err != nil {
 			return err
 		}
-		return utils.SyncPDBWithWorkloadClass(wc, pod, pdb, true)
+
+		// SyncPDBWithWorkloadClass configures Per-Pod PDBs. Until the controller reconciles one PDB per Pod,
+		// reuse it for MaxUnavailable and UnhealthyPodEvictionPolicy, but keep this single PDB selecting all
+		// of the WorkloadClass' Pods rather than a single Pod UID.
+		placeholderPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: wc.Name, Namespace: wc.Namespace}}
+		if err := utils.SyncPDBWithWorkloadClass(wc, placeholderPod, pdb, true); err != nil {
+			return err
+		}
+		pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+		delete(pdb.Labels, utils.PodUIDLabel)
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to reconcile PDB: %w", err)
