@@ -383,30 +383,6 @@ func TestPodFallbackStartTime(t *testing.T) {
 	}
 }
 
-func TestSpotRatioPercent(t *testing.T) {
-	for _, tc := range []struct {
-		in      string
-		want    int
-		wantErr bool
-	}{
-		{in: "", want: 100},
-		{in: "80%", want: 80},
-		{in: "0%", want: 0},
-		{in: "abc%", wantErr: true},
-	} {
-		got, err := spotRatioPercent(&workloadsv1.CapacityStrategy{SpotRatio: tc.in})
-		if (err != nil) != tc.wantErr {
-			t.Errorf("spotRatioPercent(%q) error = %v, wantErr %v", tc.in, err, tc.wantErr)
-		}
-		if err == nil && got != tc.want {
-			t.Errorf("spotRatioPercent(%q) = %d, want %d", tc.in, got, tc.want)
-		}
-	}
-	if got, _ := spotRatioPercent(nil); got != 100 {
-		t.Errorf("spotRatioPercent(nil) = %d, want 100", got)
-	}
-}
-
 func TestMinPositiveDuration(t *testing.T) {
 	for _, tc := range []struct{ a, b, want time.Duration }{
 		{0, 0, 0},

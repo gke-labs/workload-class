@@ -27,14 +27,17 @@ func ReferencesGKESpotPlacementPolicy(ref *workloadsv1.InfrastructureProfileRefe
 }
 
 // TargetsSpot reports whether the WorkloadClass places any Pods on Spot capacity: it has a CapacityStrategy
-// whose Type is not OnDemand and whose SpotRatio is not "0%" (or "0"). An unset Type defaults to Spot and an
-// unset SpotRatio defaults to "100%".
+// whose Type is Spot (or unset, which defaults to Spot) and whose SpotRatio is above 0%.
 func TargetsSpot(wc *workloadsv1.WorkloadClass) bool {
 	if wc == nil || wc.Spec.CapacityStrategy == nil {
 		return false
 	}
 	cs := wc.Spec.CapacityStrategy
-	return cs.Type != workloadsv1.SpotPlacementTypeOnDemand && cs.SpotRatio != "0%" && cs.SpotRatio != "0"
+	if cs.Type != "" && cs.Type != workloadsv1.SpotPlacementTypeSpot {
+		return false
+	}
+	ratio, err := SpotRatioPercent(cs.SpotRatio)
+	return err == nil && ratio > 0
 }
 
 // IsGKESpotManaged reports whether the gke-spot-placement plugin is responsible for the WorkloadClass's Spot

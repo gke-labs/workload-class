@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -61,8 +60,9 @@ const (
 // It only acts when the WorkloadClass allows falling back to On-Demand and its attached GKESpotPlacementPolicy
 // has reversion action Active. Lazy and None never evict; without a policy, reversion is treated as Lazy.
 // Evictions stop once the Spot share of the workload (Pods on Spot nodes plus Pending Spot-targeted Pods)
-// reaches its SpotRatio. Pods younger than minDurationOnFallback (or defaultMinDurationOnFallback when
-// unset) are skipped, as are Pods without a controller owner, which would not be recreated.
+// satisfies its SpotRatio under the same rule the webhook applies at admission (utils.SpotShareMet). Pods
+// younger than minDurationOnFallback (or defaultMinDurationOnFallback when unset) are skipped, as are Pods
+// without a controller owner, which would not be recreated.
 //
 // Evictions go through the Eviction API, so they respect PodDisruptionBudgets and the disruption webhook. A
 // rejection outside the disruption window stops evictions until the next window; inside the window it is
@@ -76,7 +76,7 @@ func (r *GKESpotPlacementReconciler) reconcileSpotReversion(ctx context.Context,
 		return 0, nil
 	}
 
-	spotRatio, err := spotRatioPercent(wc.Spec.CapacityStrategy)
+	spotRatio, err := utils.SpotRatioPercent(wc.Spec.CapacityStrategy.SpotRatio)
 	if err != nil {
 		return 0, err
 	}
@@ -92,7 +92,7 @@ func (r *GKESpotPlacementReconciler) reconcileSpotReversion(ctx context.Context,
 	spotPods := pods.effectiveSpot()
 	var requeue time.Duration
 	for i := range pods.fallback {
-		if spotPods*100 >= pods.active*spotRatio {
+		if utils.SpotShareMet(spotPods, pods.active, spotRatio) {
 			break
 		}
 
@@ -137,18 +137,6 @@ func (r *GKESpotPlacementReconciler) reconcileSpotReversion(ctx context.Context,
 	}
 
 	return requeue, nil
-}
-
-// spotRatioPercent parses CapacityStrategy.SpotRatio (e.g. "80%") as an integer percentage, defaulting to 100.
-func spotRatioPercent(cs *workloadsv1.CapacityStrategy) (int, error) {
-	if cs == nil || cs.SpotRatio == "" {
-		return 100, nil
-	}
-	v, err := strconv.Atoi(strings.TrimSuffix(cs.SpotRatio, "%"))
-	if err != nil {
-		return 0, fmt.Errorf("invalid spotRatio %q: %w", cs.SpotRatio, err)
-	}
-	return v, nil
 }
 
 // disruptionWindowEnforced reports whether the WorkloadClass's temporal disruption windows are currently
