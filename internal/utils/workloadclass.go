@@ -129,11 +129,35 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 	return len(sel.MatchLabels) + len(sel.MatchExpressions)
 }
 
+// namespaceDefaultClassLabel is the Namespace label naming the namespace's default WorkloadClass.
+const namespaceDefaultClassLabel = "workloads.gke.io/default-class"
+
+// WorkloadClassPodSelector returns a selector for the Pods that a WorkloadClass applies to, for use when listing
+// or counting a WorkloadClass's Pods.
+//
+// The namespace's default WorkloadClass applies to every Pod in its namespace, regardless of its PodSelector,
+// because FindBestMatchWorkloadClass selects it for all of them. For any other WorkloadClass, the PodSelector is
+// used, and a nil PodSelector selects all Pods. Callers that must exclude Pods owned by a more specific
+// WorkloadClass should still filter the results through FindBestMatchWorkloadClass.
+func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workloadsv1.WorkloadClass) (labels.Selector, error) {
+	ns := &corev1.Namespace{}
+	if err := c.Get(ctx, client.ObjectKey{Name: wc.Namespace}, ns); err == nil && ns.Labels[namespaceDefaultClassLabel] == wc.Name {
+		return labels.Everything(), nil
+	}
+	if wc.Spec.PodSelector == nil {
+		return labels.Everything(), nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+	if err != nil {
+		return nil, fmt.Errorf("invalid podSelector: %w", err)
+	}
+	return selector, nil
+}
+
 func namespaceDefaultWorkloadClass(ctx context.Context, c client.Client, pod *corev1.Pod) *workloadsv1.WorkloadClass {
-	const defaultClassLabel = "workloads.gke.io/default-class"
 	ns := &corev1.Namespace{}
 	if err := c.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
-		if defaultClass, ok := ns.Labels[defaultClassLabel]; ok {
+		if defaultClass, ok := ns.Labels[namespaceDefaultClassLabel]; ok {
 			wc := &workloadsv1.WorkloadClass{}
 			if err := c.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err == nil {
 				return wc

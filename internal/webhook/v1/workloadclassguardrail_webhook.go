@@ -19,6 +19,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,8 +56,8 @@ type WorkloadClassGuardrailCustomValidator struct {
 func (v *WorkloadClassGuardrailCustomValidator) ValidateCreate(ctx context.Context, obj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
 	workloadclassguardraillog.Info("Validation for WorkloadClassGuardrail upon creation", "name", obj.GetName())
 
-	if err := utils.WeekdaysValid(obj.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
-		return []string{err.Error()}, err
+	if warnings, err := validateGuardrailSpec(obj); err != nil {
+		return warnings, err
 	}
 
 	return v.validateAgainstWorkloadClasses(ctx, obj)
@@ -66,11 +67,27 @@ func (v *WorkloadClassGuardrailCustomValidator) ValidateCreate(ctx context.Conte
 func (v *WorkloadClassGuardrailCustomValidator) ValidateUpdate(ctx context.Context, _, newObj *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
 	workloadclassguardraillog.Info("Validation for WorkloadClassGuardrail upon update", "name", newObj.GetName())
 
-	if err := utils.WeekdaysValid(newObj.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
-		return []string{err.Error()}, err
+	if warnings, err := validateGuardrailSpec(newObj); err != nil {
+		return warnings, err
 	}
 
 	return v.validateAgainstWorkloadClasses(ctx, newObj)
+}
+
+// validateGuardrailSpec checks the guardrail on its own, independent of existing WorkloadClasses. It applies the
+// same checks as the WorkloadClassGuardrail controller, so invalid guardrails are rejected at admission rather
+// than only surfacing later as Validated=False.
+func validateGuardrailSpec(g *workloadsv1.WorkloadClassGuardrail) (admission.Warnings, error) {
+	if err := utils.WeekdaysValid(g.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
+		return []string{err.Error()}, err
+	}
+
+	if violations := utils.ValidatePluginConstraints(g.Spec.PluginConstraints); len(violations) > 0 {
+		err := fmt.Errorf("invalid pluginConstraints: %s", strings.Join(violations, "; "))
+		return []string{err.Error()}, err
+	}
+
+	return nil, nil
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type WorkloadClassGuardrail.

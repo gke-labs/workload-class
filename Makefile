@@ -79,7 +79,12 @@ setup-test-e2e: kind ## Set up a Kind cluster for e2e tests if it does not exist
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	@# The e2e suites run `make deploy`, which rewrites config/manager/kustomization.yaml with the test image.
+	@# Snapshot it and restore it afterwards (pass or fail) so a test run never leaves the tree dirty.
+	@backup="$$(mktemp)"; cp config/manager/kustomization.yaml "$$backup"; \
+	if KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 30m; then status=0; else status=$$?; fi; \
+	cp "$$backup" config/manager/kustomization.yaml; rm -f "$$backup"; \
+	if [ $$status -ne 0 ]; then exit $$status; fi
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
