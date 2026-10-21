@@ -19,23 +19,28 @@ package utils
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
-
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
 
 const (
 	PDBNamePrefix    = "workload-"
-	BypassPod        = "workloads.gke.io/bypass-pod"
+	PodUIDLabel      = workloadsv1.PodUIDLabel
+	BypassOwner      = "workloads.gke.io/bypass-owner"
 	BypassExpiration = "workloads.gke.io/bypass-expiration"
 	ExpirationFormat = "2006-01-02 15:04:05.999999999 -0700 MST"
+
+	// DefaultLeaseDuration is the default PDB lease duration (30s) when a Pod's TerminationGracePeriodSeconds is not set.
+	DefaultLeaseDuration = 30 * time.Second
 
 	openType  = 1      // Type 1 is a string
 	openValue = "100%" // Allows 100% of Pods to be unavailable
@@ -44,26 +49,76 @@ const (
 	closedValue = 0 // Allows 0 Pods to be unavailable
 )
 
-// PDBName returns the name of the PDB based on the WorkloadClass name
-// PDBs made for WorkloadClasses will have the prefix `workload-`
-func PDBName(wcName string) string {
-	return PDBNamePrefix + wcName
+// PDBName returns the name of the Per-Pod PDB based on the Pod name.
+// PDBs managed by WorkloadClass have the prefix `workload-`.
+func PDBName(podName string) string {
+	return PDBNamePrefix + podName
 }
 
-// SyncPDBWithWorkloadClass configures the PDB to match the WorkloadClass' disruption policy
-func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget) error {
+// PodNameFromPDBName extracts the target Pod name from a WorkloadClass-managed PDB name.
+func PodNameFromPDBName(pdbName string) string {
+	return strings.TrimPrefix(pdbName, PDBNamePrefix)
+}
+
+// PDBBase returns a base Per-Pod PodDisruptionBudget configured for the given Pod,
+// including its name (`workload-<pod.Name>`), namespace, and `workloads.gke.io/pod-uid` label.
+func PDBBase(pod *corev1.Pod) *policyv1.PodDisruptionBudget {
+	if pod == nil {
+		return &policyv1.PodDisruptionBudget{}
+	}
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      PDBName(pod.Name),
+			Namespace: pod.Namespace,
+			Labels: map[string]string{
+				PodUIDLabel: string(pod.UID),
+			},
+		},
+	}
+}
+
+// SyncPDBWithWorkloadClass configures a Per-Pod PDB to match the governing WorkloadClass's disruption policy
+// and validation state for a specific Pod.
+//
+// If isValid is false (the WorkloadClass failed guardrail validation) or MaintenanceReadiness is Ready/Overdue,
+// MaxUnavailable is set to "100%". Otherwise (isValid is true and MaintenanceReadiness is NotReady),
+// MaxUnavailable is set to 0.
+func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pdb *policyv1.PodDisruptionBudget, isValid bool) error {
 	if wc == nil {
 		return fmt.Errorf("failed to sync PDB with WorkloadClass, WorkloadClass is nil")
 	}
-
+	if pod == nil {
+		return fmt.Errorf("failed to sync PDB with WorkloadClass, Pod is nil")
+	}
 	if pdb == nil {
-		pdb = PDBBase(wc)
+		return fmt.Errorf("failed to sync PDB with WorkloadClass, PDB is nil")
 	}
 
-	// Selectors must match exactly
-	pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+	if pdb.Name == "" {
+		pdb.Name = PDBName(pod.Name)
+	}
+	if pdb.Namespace == "" {
+		pdb.Namespace = pod.Namespace
+	}
 
-	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget
+	if pdb.Labels == nil {
+		pdb.Labels = map[string]string{}
+	}
+	pdb.Labels[PodUIDLabel] = string(pod.UID)
+
+	if pdb.Annotations != nil {
+		delete(pdb.Annotations, BypassOwner)
+		delete(pdb.Annotations, BypassExpiration)
+	}
+
+	// Scope the PDB selector strictly to this single Pod instance by UID.
+	pdb.Spec.Selector = &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			PodUIDLabel: string(pod.UID),
+		},
+	}
+
+	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget.
 	policy := policyv1.IfHealthyBudget
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
@@ -76,91 +131,206 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDi
 		IntVal: closedValue,
 	}
 
+	if !isValid {
+		pdb.Spec.MaxUnavailable = open
+		return nil
+	}
+
 	maxUnavailableMap := map[workloadsv1.MaintenanceReadiness]*intstr.IntOrString{
 		workloadsv1.ReadinessReady:    open,
 		workloadsv1.ReadinessNotReady: closed,
 		workloadsv1.ReadinessOverdue:  open,
 	}
 
-	// Set MaxUnavailable based on the WorkloadClass' MaintenanceReadiness
-	pdb.Spec.MaxUnavailable = maxUnavailableMap[wc.Status.MaintenanceReadiness]
+	if val, ok := maxUnavailableMap[wc.Status.MaintenanceReadiness]; ok {
+		pdb.Spec.MaxUnavailable = val
+	} else {
+		pdb.Spec.MaxUnavailable = closed
+	}
 
 	return nil
 }
 
-// AllowLease evaluates the PDB and determines whether or not to allow the disruption webhook to start a new lease.
-// A new lease is allowed if any of the following are true:
-//   - There is no PDB
-//   - There is no ongoing lease (including leases for other Pods)
-//   - There is an ongoing lease but it is invalid: it is missing an annotation OR the expiration time cannot be parsed
-//   - The lease has expired
-func AllowLease(pdb *policyv1.PodDisruptionBudget) bool {
-	// If the PDB is nil or there are no annotations, there cannot be an ongoing lease
+// BypassOwnerValue returns the value of the workloads.gke.io/bypass-owner annotation for a Subject.
+func BypassOwnerValue(subject workloadsv1.Subject) string {
+	if subject.Kind == "User" || subject.Kind == "Group" {
+		return subject.Name
+	}
+	return fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
+}
+
+// LeaseDurationForPod returns the PDB lease duration for a Pod based on its TerminationGracePeriodSeconds
+// (or DeletionGracePeriodSeconds), falling back to DefaultLeaseDuration (30s) when unset or non-positive.
+func LeaseDurationForPod(pod *corev1.Pod) time.Duration {
+	if pod != nil {
+		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds > 0 {
+			return time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
+		}
+		if pod.Spec.TerminationGracePeriodSeconds != nil && *pod.Spec.TerminationGracePeriodSeconds > 0 {
+			return time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
+		}
+	}
+	return DefaultLeaseDuration
+}
+
+// LeaseExpired returns true if the PDB lacks a valid, unexpired workloads.gke.io/bypass-expiration annotation.
+func LeaseExpired(pdb *policyv1.PodDisruptionBudget) bool {
 	if pdb == nil || len(pdb.Annotations) == 0 {
 		return true
 	}
 
-	_, hasBypassAnnotation := pdb.Annotations[BypassPod]
 	expirationString, hasExpirationAnnotation := pdb.Annotations[BypassExpiration]
-
-	// If an annotation is missing, there is either no lease or an ongoing lease that is invalid
-	if !hasBypassAnnotation || !hasExpirationAnnotation {
+	if !hasExpirationAnnotation {
 		return true
 	}
 
 	expirationTime, err := time.Parse(ExpirationFormat, expirationString)
 	if err != nil {
-		// If the time cannot be parsed, the lease is invalid
 		return true
 	}
 
-	if time.Now().Compare(expirationTime) >= 0 {
-		return true
-	}
-
-	return false
+	return time.Now().Compare(expirationTime) >= 0
 }
 
-// PDBWithLease configures a PDB with annotations to represent a temporary lease and sets MaxUnavailable to 100%
-func PDBWithLease(ctx context.Context, c client.Client, pdb *policyv1.PodDisruptionBudget, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) error {
-	if wc == nil {
-		return fmt.Errorf("failed to update PDB with lease, WorkloadClass is nil")
+// AllowLease evaluates a Per-Pod PDB and determines whether a new lease can be granted for the given Pod.
+//
+// A lease can only be granted on an existing PDB that is controlled by a WorkloadClass
+// (controller OwnerReference with Kind == "WorkloadClass"). If the PDB is nil or is not owned
+// by a WorkloadClass (e.g., a user-created PDB), AllowLease returns false.
+//
+// For a WorkloadClass-owned PDB, a new lease is allowed if any of the following are true:
+//   - The PDB's workloads.gke.io/pod-uid label does not match the Pod's UID (stale PDB from a prior Pod of the same name)
+//   - There is no ongoing lease (missing workloads.gke.io/bypass-owner annotation)
+//   - The lease has expired or has an unparseable expiration timestamp
+func AllowLease(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod) bool {
+	if pdb == nil || pod == nil {
+		return false
 	}
 
+	if !IsWorkloadClassManagedPDB(pdb) {
+		return false
+	}
+
+	if pdb.Labels[PodUIDLabel] != string(pod.UID) {
+		return true
+	}
+
+	if pdb.Annotations[BypassOwner] == "" {
+		return true
+	}
+
+	return LeaseExpired(pdb)
+}
+
+// SubjectAlreadyLeasing returns true if the PDB is managed by a WorkloadClass and the given subject
+// currently holds an active, unexpired lease for the exact Pod instance (matching UID).
+func SubjectAlreadyLeasing(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject workloadsv1.Subject) bool {
+	if pdb == nil || pod == nil {
+		return false
+	}
+	if !IsWorkloadClassManagedPDB(pdb) {
+		return false
+	}
+	if pdb.Labels[PodUIDLabel] != string(pod.UID) {
+		return false
+	}
+	owner := pdb.Annotations[BypassOwner]
+	if owner == "" || owner != BypassOwnerValue(subject) {
+		return false
+	}
+	return !LeaseExpired(pdb)
+}
+
+// PDBWithLease configures a Per-Pod PDB with temporary lease annotations (workloads.gke.io/bypass-owner and
+// workloads.gke.io/bypass-expiration), scopes its selector to the Pod's UID, and opens MaxUnavailable to 100%.
+func PDBWithLease(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject workloadsv1.Subject) error {
 	if pdb == nil {
-		pdb = PDBBase(wc)
+		return fmt.Errorf("failed to update PDB with lease, PDB is nil")
+	}
+	if pod == nil {
+		return fmt.Errorf("failed to update PDB with lease, Pod is nil")
 	}
 
-	// Selectors must match exactly
-	pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
+	if pdb.Name == "" {
+		pdb.Name = PDBName(pod.Name)
+	}
+	if pdb.Namespace == "" {
+		pdb.Namespace = pod.Namespace
+	}
 
-	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget
+	if pdb.Labels == nil {
+		pdb.Labels = map[string]string{}
+	}
+	pdb.Labels[PodUIDLabel] = string(pod.UID)
+
+	pdb.Spec.Selector = &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			PodUIDLabel: string(pod.UID),
+		},
+	}
+
 	policy := policyv1.IfHealthyBudget
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
-	// Disable the PDB - set maxUnavailable to 100%
 	pdb.Spec.MaxUnavailable = &intstr.IntOrString{
 		Type:   openType,
 		StrVal: openValue,
 	}
 
-	// Add lease annotations
-	if len(pdb.Annotations) == 0 {
+	if pdb.Annotations == nil {
 		pdb.Annotations = map[string]string{}
 	}
-
-	pdb.Annotations[BypassPod] = pod.Name
-	pdb.Annotations[BypassExpiration] = time.Now().Add(5 * time.Second).Format(ExpirationFormat)
+	pdb.Annotations[BypassOwner] = BypassOwnerValue(subject)
+	pdb.Annotations[BypassExpiration] = time.Now().Add(LeaseDurationForPod(pod)).Format(ExpirationFormat)
 
 	return nil
 }
 
-// PDBBase returns a basic PDB, configured based on the WorkloadClass
-func PDBBase(wc *workloadsv1.WorkloadClass) *policyv1.PodDisruptionBudget {
-	return &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("workload-%s", wc.Name),
-			Namespace: wc.Namespace,
-		},
+// IsWorkloadClassManagedPDB returns true if the PDB has a controller OwnerReference
+// with Kind == "WorkloadClass".
+func IsWorkloadClassManagedPDB(pdb *policyv1.PodDisruptionBudget) bool {
+	if pdb == nil {
+		return false
 	}
+	owner := metav1.GetControllerOf(pdb)
+	return owner != nil && owner.Kind == "WorkloadClass"
+}
+
+// ListUserCreatedPDBs lists all PodDisruptionBudgets in the given namespace that are not managed by WorkloadClass.
+func ListUserCreatedPDBs(ctx context.Context, c client.Client, namespace string) ([]policyv1.PodDisruptionBudget, error) {
+	pdbList := &policyv1.PodDisruptionBudgetList{}
+	if err := c.List(ctx, pdbList, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list PodDisruptionBudgets in namespace %s: %w", namespace, err)
+	}
+
+	var userPDBs []policyv1.PodDisruptionBudget
+	for _, pdb := range pdbList.Items {
+		if !IsWorkloadClassManagedPDB(&pdb) {
+			userPDBs = append(userPDBs, pdb)
+		}
+	}
+	return userPDBs, nil
+}
+
+// IsPodCoveredByUserPDB returns true if any user-created PodDisruptionBudget in userPDBs
+// is in the Pod's namespace and has a selector that matches the Pod's labels.
+func IsPodCoveredByUserPDB(pod *corev1.Pod, userPDBs []policyv1.PodDisruptionBudget) bool {
+	if pod == nil {
+		return false
+	}
+	podLabels := labels.Set(pod.Labels)
+	for i := range userPDBs {
+		pdb := &userPDBs[i]
+		if pdb.Namespace != pod.Namespace || IsWorkloadClassManagedPDB(pdb) || pdb.Spec.Selector == nil {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		if selector.Matches(podLabels) {
+			return true
+		}
+	}
+	return false
 }
