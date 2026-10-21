@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -59,6 +60,7 @@ type GKESpotPlacementReconciler struct {
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps;nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 
 // Reconcile runs the GKE Spot placement runtime loop for a single WorkloadClass.
 func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -91,33 +93,56 @@ func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, r.clearFallbackState(ctx, wc)
 	}
 
+	var policy *workloadsv1.GKESpotPlacementPolicy
+	if tracksFallback(wc) {
+		var err error
+		policy, err = r.attachedPolicy(ctx, wc)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Track whether Spot-targeted Pods have fallen back to On-Demand (InFallback condition).
-	if _, err := r.reconcileFallbackState(ctx, wc); err != nil {
+	pods, err := r.reconcileFallbackState(ctx, wc, policy)
+	if err != nil {
 		log.Error(err, "Failed to reconcile Spot fallback state")
 		return ctrl.Result{}, err
 	}
 
-	// Spot capacity drives reversion; for now the result is only logged. A failed
-	// check is logged rather than returned so it never blocks the rest of the loop.
-	if utils.TargetsSpot(wc) {
+	// Active reversion: when Pods are running on On-Demand fallback, check whether Spot capacity is back and
+	// evict them so they are recreated on Spot. A failed capacity check is logged rather than returned so it
+	// never blocks the rest of the loop.
+	var requeue time.Duration
+	if len(pods.fallback) > 0 {
 		spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
 		if err != nil {
 			log.Error(err, "Failed to check Spot capacity")
 		} else {
 			log.V(1).Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
 		}
+
+		if spotCapacityAvailable {
+			requeue, err = r.reconcileSpotReversion(ctx, wc, policy, pods, time.Now().UTC())
+			if err != nil {
+				log.Error(err, "Failed to reconcile Spot reversion")
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
-	// TODO: Active reversion.
-	log.V(1).Info("Reconciled GKE Spot placement")
-
-	return ctrl.Result{}, nil
+	log.V(1).Info("Reconciled GKE Spot placement", "requeueAfter", requeue)
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *GKESpotPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}, builder.WithPredicates(gkeSpotManagedPredicate())).
+		Watches(
+			&workloadsv1.GKESpotPlacementPolicy{}, // Re-evaluate fallback/reversion when the referenced policy changes
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForPolicy),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
 		Watches(
 			&corev1.ConfigMap{}, // Re-check Spot capacity when kube-system/cluster-autoscaler-status changes
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForClusterAutoscalerStatus),
