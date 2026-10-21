@@ -58,7 +58,7 @@ type GKESpotPlacementReconciler struct {
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies;workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps;nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/eviction,verbs=create
 
@@ -109,25 +109,12 @@ func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Active reversion: when Pods are running on On-Demand fallback, check whether Spot capacity is back and
-	// evict them so they are recreated on Spot. A failed capacity check is logged rather than returned so it
-	// never blocks the rest of the loop.
-	var requeue time.Duration
-	if len(pods.fallback) > 0 {
-		spotCapacityAvailable, err := r.checkSpotCapacity(ctx)
-		if err != nil {
-			log.Error(err, "Failed to check Spot capacity")
-		} else {
-			log.V(1).Info("Checked Spot capacity", "spotCapacityAvailable", spotCapacityAvailable)
-		}
-
-		if spotCapacityAvailable {
-			requeue, err = r.reconcileSpotReversion(ctx, wc, policy, pods, time.Now().UTC())
-			if err != nil {
-				log.Error(err, "Failed to reconcile Spot reversion")
-				return ctrl.Result{}, err
-			}
-		}
+	// Spot reversion: when Pods are running on On-Demand fallback, evict them once Spot capacity is back so
+	// they are recreated on Spot.
+	requeue, err := r.reconcileSpotReversion(ctx, wc, policy, pods, time.Now().UTC())
+	if err != nil {
+		log.Error(err, "Failed to reconcile Spot reversion")
+		return ctrl.Result{}, err
 	}
 
 	log.V(1).Info("Reconciled GKE Spot placement", "requeueAfter", requeue)
@@ -141,6 +128,11 @@ func (r *GKESpotPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&workloadsv1.GKESpotPlacementPolicy{}, // Re-evaluate fallback/reversion when the referenced policy changes
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForPolicy),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
+		Watches(
+			&workloadsv1.WorkloadClassGuardrail{}, // Re-evaluate maxFallbackDuration when guardrails change
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForGuardrail),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Watches(
