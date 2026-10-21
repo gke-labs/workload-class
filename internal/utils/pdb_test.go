@@ -612,3 +612,29 @@ func TestUserCreatedPDBHelpers(t *testing.T) {
 		t.Errorf("IsPodCoveredByUserPDB(unmatchedPod) = true, want false")
 	}
 }
+
+func TestIsPDBOpen(t *testing.T) {
+	open := intstr.FromString("100%")
+	half := intstr.FromString("50%")
+	closed := intstr.FromInt32(0)
+
+	tests := []struct {
+		name string
+		pdb  *policyv1.PodDisruptionBudget
+		want bool
+	}{
+		{name: "nil_pdb", pdb: nil, want: false},
+		{name: "nil_max_unavailable", pdb: &policyv1.PodDisruptionBudget{}, want: false},
+		{name: "closed", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &closed}}, want: false},
+		{name: "partially_open", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &half}}, want: false},
+		{name: "open", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &open}}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPDBOpen(tt.pdb); got != tt.want {
+				t.Errorf("IsPDBOpen() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
