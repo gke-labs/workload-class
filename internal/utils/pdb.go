@@ -256,6 +256,14 @@ func SubjectAlreadyLeasing(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, s
 	return !LeaseExpired(pdb)
 }
 
+// IsPDBOpen returns true if the PDB's MaxUnavailable is set to "100%", meaning it does not block evictions.
+func IsPDBOpen(pdb *policyv1.PodDisruptionBudget) bool {
+	if pdb == nil || pdb.Spec.MaxUnavailable == nil {
+		return false
+	}
+	return pdb.Spec.MaxUnavailable.Type == intstr.String && pdb.Spec.MaxUnavailable.StrVal == openValue
+}
+
 // PDBWithLease configures a Per-Pod PDB with temporary lease annotations (workloads.gke.io/bypass-owner and
 // workloads.gke.io/bypass-expiration), scopes its selector to the Pod's UID, and opens MaxUnavailable to 100%.
 func PDBWithLease(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject workloadsv1.Subject) error {
