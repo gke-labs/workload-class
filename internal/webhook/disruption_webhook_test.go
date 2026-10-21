@@ -20,15 +20,22 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
+	"github.com/gke-labs/workload-class/internal/utils"
 	admissionv1 "k8s.io/api/admission/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -81,6 +88,7 @@ func TestHandle(t *testing.T) {
 				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
 					{Name: "maintenance", DaysOfWeek: []string{outOfWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "America/Toronto"},
 				},
+				AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{{Kind: rbacv1.UserKind, Name: adminUsername}},
 			},
 		},
 	}
@@ -213,13 +221,22 @@ func TestHandle(t *testing.T) {
 			want:              admission.Allowed("Emergency override active"),
 		},
 		{
-			name:            "allowedUser",
-			desc:            "Allowed user, admission Allowed",
+			name:            "allowedUserOutOfWindow",
+			desc:            "Out of window, allowed user, admission Allowed",
+			req:             evictionRequest,
+			getWCResp:       wcOutOfWindow,
+			podCreationTime: podNowCreationTime,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Allowed("Disruption allowed for authorized user"),
+		},
+		{
+			name:            "allowedUserInWindowBypassesMinInitialRun",
+			desc:            "In window, Pod is too new, but identities are checked first, so an allowed user is admitted",
 			req:             evictionRequest,
 			getWCResp:       wc,
 			podCreationTime: podNowCreationTime,
 			readiness:       workloadsv1.ReadinessNotReady,
-			want:            admission.Allowed("Disruption allowed for authorized user: VPA"),
+			want:            admission.Allowed("Disruption allowed for authorized user"),
 		},
 		{
 			name:            "overdue",
@@ -232,7 +249,7 @@ func TestHandle(t *testing.T) {
 		},
 		{
 			name:            "notInWindowNotOverdue",
-			desc:            "Not in window, not overdue, admission Denied",
+			desc:            "Not in window, not overdue, user not allowed outside of window, admission Denied",
 			req:             evictionRequestNonMatchingUser,
 			podCreationTime: podNowCreationTime,
 			getWCResp:       wcOutOfWindow,
@@ -253,6 +270,7 @@ func TestHandle(t *testing.T) {
 			name:            "inWindowNotOverduePodNotTooNew",
 			desc:            "In window, not overdue, Pod not too new, admission Allowed",
 			req:             evictionRequestNonMatchingUser,
+			getWCResp:       wc,
 			readiness:       workloadsv1.ReadinessNotReady,
 			podCreationTime: time.Now().AddDate(0, 0, -4),
 			want:            admission.Allowed("Eviction allowed by WorkloadClass policy"),
@@ -293,6 +311,206 @@ func TestHandle(t *testing.T) {
 			}
 			if admissionResponse.Result.Message != tc.want.Result.Message {
 				t.Errorf("Handle() returned an unexpected message: got %v, want %v", admissionResponse.Result.Message, tc.want.Result.Message)
+			}
+		})
+	}
+}
+
+func TestHandle_AuthorizedSubjectLease(t *testing.T) {
+	const (
+		namespace     = "namespace"
+		adminUsername = "admin@mycompany.com"
+		otherOwner    = "system:serviceaccount:kube-system:cluster-autoscaler"
+		podName       = "podrick"
+		podUID        = types.UID("podrick-uid")
+	)
+	labels := map[string]string{"labelA": "valueA"}
+	adminSubject := workloadsv1.Subject{Kind: rbacv1.UserKind, Name: adminUsername}
+
+	// The WorkloadClass is outside of its disruption window and allows adminUsername to disrupt outside of it.
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc",
+			Namespace:         namespace,
+			CreationTimestamp: metav1.Time{Time: time.Now()},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: labels},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "maintenance", DaysOfWeek: []string{time.Now().AddDate(0, 0, 1).Weekday().String()}, StartTime: "00:00", EndTime: "23:59", TimeZone: "America/Toronto"},
+				},
+				AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{adminSubject},
+			},
+		},
+		Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: workloadsv1.ReadinessNotReady},
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			UID:       podUID,
+			Labels:    labels,
+		},
+	}
+
+	isController := true
+	closed := intstr.FromInt32(0)
+	open := intstr.FromString("100%")
+	newPDB := func(owned bool, podUIDLabel types.UID, maxUnavailable intstr.IntOrString, leaseOwner string, leaseExpiry time.Duration) *policyv1.PodDisruptionBudget {
+		pdb := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      utils.PDBName(podName),
+				Namespace: namespace,
+				Labels:    map[string]string{utils.PodUIDLabel: string(podUIDLabel)},
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &maxUnavailable},
+		}
+		if owned {
+			pdb.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: "workloads.gke.io/v1",
+				Kind:       "WorkloadClass",
+				Name:       wc.Name,
+				Controller: &isController,
+			}}
+		}
+		if leaseOwner != "" {
+			pdb.Annotations = map[string]string{
+				utils.BypassOwner:      leaseOwner,
+				utils.BypassExpiration: time.Now().Add(leaseExpiry).Format(utils.ExpirationFormat),
+			}
+		}
+		return pdb
+	}
+
+	testCases := []struct {
+		name            string
+		pdb             *policyv1.PodDisruptionBudget
+		getPDBErr       error
+		nilTracker      bool
+		inWindow        bool
+		wantAllowed     bool
+		wantMsgContains string
+		wantQueued      bool
+	}{
+		{
+			// Identities are checked before the window, so a closed PDB (e.g., the WorkloadClass is NotReady
+			// in-window because a Pod has not met MinInitialRunDurationDays) is still leased for allowed subjects.
+			name:            "in_window_closed_pdb_queues_lease",
+			pdb:             newPDB(true, podUID, closed, "", 0),
+			inWindow:        true,
+			wantAllowed:     true,
+			wantMsgContains: "lease on PDB",
+			wantQueued:      true,
+		},
+		{
+			name:        "no_pdb_allows_without_lease",
+			pdb:         nil,
+			wantAllowed: true,
+		},
+		{
+			name:        "error_getting_pdb_allows_without_lease",
+			getPDBErr:   fmt.Errorf("error getting PDB"),
+			wantAllowed: true,
+		},
+		{
+			name:        "user_created_pdb_with_same_name_is_not_leased",
+			pdb:         newPDB(false, podUID, closed, "", 0),
+			wantAllowed: true,
+		},
+		{
+			name:        "closed_pdb_without_lease_queues_lease",
+			pdb:         newPDB(true, podUID, closed, "", 0),
+			wantAllowed: true,
+			wantQueued:  true,
+		},
+		{
+			name:        "closed_pdb_with_expired_lease_queues_lease",
+			pdb:         newPDB(true, podUID, closed, otherOwner, -time.Minute),
+			wantAllowed: true,
+			wantQueued:  true,
+		},
+		{
+			name:        "stale_lease_for_previous_pod_instance_queues_lease",
+			pdb:         newPDB(true, types.UID("old-uid"), open, otherOwner, time.Minute),
+			wantAllowed: true,
+			wantQueued:  true,
+		},
+		{
+			name:        "subject_already_leasing_allows_without_new_lease",
+			pdb:         newPDB(true, podUID, open, adminUsername, time.Minute),
+			wantAllowed: true,
+		},
+		{
+			name:            "other_subject_leasing_denies",
+			pdb:             newPDB(true, podUID, open, otherOwner, time.Minute),
+			wantAllowed:     false,
+			wantMsgContains: "has an ongoing lease held by " + otherOwner,
+		},
+		{
+			name:        "open_pdb_without_lease_allows_without_lease",
+			pdb:         newPDB(true, podUID, open, "", 0),
+			wantAllowed: true,
+		},
+		{
+			name:        "nil_tracker_allows_without_lease",
+			pdb:         newPDB(true, podUID, closed, "", 0),
+			nilTracker:  true,
+			wantAllowed: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testWC := wc.DeepCopy()
+			if tc.inWindow {
+				testWC.Spec.DisruptionPolicy.AllowedDisruptionWindows[0].DaysOfWeek = []string{time.Now().Weekday().String()}
+			}
+			listResp := &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*testWC}}
+			c := createClient(nil, nil, nil, nil, ns, testWC, listResp, pod)
+			c.getPDBResult = tc.pdb
+			c.getPDBError = tc.getPDBErr
+
+			tracker := utils.NewPendingLeaseTracker(1)
+			v := &DisruptionWebhook{Client: c, LeaseTracker: tracker}
+			if tc.nilTracker {
+				v.LeaseTracker = nil
+			}
+
+			req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Name:        podName,
+				Namespace:   namespace,
+				SubResource: "eviction",
+				UserInfo:    authv1.UserInfo{Username: adminUsername},
+			}}
+			resp := v.Handle(t.Context(), req)
+
+			if resp.Allowed != tc.wantAllowed {
+				t.Fatalf("Handle() allowed = %v, want %v (response: %+v)", resp.Allowed, tc.wantAllowed, resp.Result)
+			}
+			if tc.wantMsgContains != "" && (resp.Result == nil || !strings.Contains(resp.Result.Message, tc.wantMsgContains)) {
+				t.Errorf("Handle() message = %+v, want it to contain %q", resp.Result, tc.wantMsgContains)
+			}
+
+			leases := tracker.Drain(types.NamespacedName{Namespace: namespace, Name: wc.Name})
+			if !tc.wantQueued {
+				if len(leases) != 0 {
+					t.Errorf("Handle() queued leases %+v, want none", leases)
+				}
+				return
+			}
+			want := []utils.PendingLease{{PodName: podName, PodUID: podUID, Subject: adminSubject}}
+			if len(leases) != 1 || leases[0] != want[0] {
+				t.Errorf("Handle() queued leases %+v, want %+v", leases, want)
+			}
+			select {
+			case ev := <-tracker.Events():
+				if ev.Object.GetName() != wc.Name || ev.Object.GetNamespace() != namespace {
+					t.Errorf("Handle() signaled %s/%s, want %s/%s", ev.Object.GetNamespace(), ev.Object.GetName(), namespace, wc.Name)
+				}
+			default:
+				t.Error("Handle() did not signal the WorkloadClass controller")
 			}
 		})
 	}
@@ -679,6 +897,10 @@ type fakeClient struct {
 
 	getWorkloadClassError  error
 	getWorkloadClassResult *workloadsv1.WorkloadClass
+
+	// getPDBResult is returned for PodDisruptionBudget Gets. If nil, a NotFound error is returned.
+	getPDBError  error
+	getPDBResult *policyv1.PodDisruptionBudget
 }
 
 func createClient(getNSErr, getWCErr, listWCErr, getPodErr error, getNSResult *corev1.Namespace, getWCResult *workloadsv1.WorkloadClass, listWCResult *workloadsv1.WorkloadClassList, getPodResult *corev1.Pod) fakeClient {
@@ -716,6 +938,14 @@ func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 			return fc.getPodError
 		}
 		fc.getPodResult.DeepCopyInto(typedObj)
+	case *policyv1.PodDisruptionBudget:
+		if fc.getPDBError != nil {
+			return fc.getPDBError
+		}
+		if fc.getPDBResult == nil {
+			return apierrors.NewNotFound(schema.GroupResource{Group: "policy", Resource: "poddisruptionbudgets"}, key.Name)
+		}
+		fc.getPDBResult.DeepCopyInto(typedObj)
 	default:
 		return fmt.Errorf("unknown object type")
 	}
