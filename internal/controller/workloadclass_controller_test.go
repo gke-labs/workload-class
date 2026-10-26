@@ -29,9 +29,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
@@ -161,8 +163,9 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Delete(ctx, gr)).To(Succeed())
 
 			By("Cleanup PDB")
+			// envtest does not run the garbage collector, so owned PDBs must be deleted explicitly.
 			pdbKey := types.NamespacedName{
-				Name:      "workload-" + workloadClassName,
+				Name:      utils.PDBName(podName),
 				Namespace: defaultNamespace,
 			}
 			pdb := &policyv1.PodDisruptionBudget{}
@@ -561,108 +564,121 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 
 		// PDB Reconciliation Tests
-		It("should create a PDB when successfully reconciled", func() {
-			By("Reconciling")
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
+		podPDBKey := types.NamespacedName{Name: utils.PDBName(podName), Namespace: defaultNamespace}
 
-			By("Verifying the PDB was created in the API server")
-			// Get the WC and ask the helper for the exact PDB name
+		selectPod := func() {
+			GinkgoHelper()
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			expectedPDBName := "workload-" + wc.Name
-			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+		}
+
+		reconcileWC := func(key types.NamespacedName) {
+			GinkgoHelper()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		It("should create a Per-Pod PDB for each governed Pod when successfully reconciled", func() {
+			selectPod()
+
+			By("Reconciling")
+			reconcileWC(typeNamespacedName)
+
+			By("Verifying the Pod's PDB was created and selects only that Pod")
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNamePod, pod)).To(Succeed())
+			Expect(pod.Labels).To(HaveKeyWithValue(utils.PodUIDLabel, string(pod.UID)))
 
 			pdb := &policyv1.PodDisruptionBudget{}
-			// Use Eventually to wait for the cache to sync!
 			Eventually(func() error {
-				return k8sClient.Get(ctx, pdbKey, pdb)
-			}, "10s", "1s").Should(Succeed(), "Failed to find PDB with name %s", expectedPDBName)
+				return k8sClient.Get(ctx, podPDBKey, pdb)
+			}, "10s", "1s").Should(Succeed(), "Failed to find PDB %s", podPDBKey.Name)
 
+			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(map[string]string{utils.PodUIDLabel: string(pod.UID)}))
 			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
 			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(workloadClassName))
 		})
 
-		It("should delete the PDB if validation fails", func() {
-			By("First reconciling to ensure PDB is created initially")
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
+		It("should open the PDBs instead of deleting them if validation fails", func() {
+			selectPod()
 
-			// Wait for it to exist in the cache first!
-			wc := &workloadsv1.WorkloadClass{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			expectedPDBName := "workload-" + wc.Name
-			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
-
+			By("First reconciling to ensure the PDB is created initially")
+			reconcileWC(typeNamespacedName)
 			Eventually(func() error {
-				return k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+				return k8sClient.Get(ctx, podPDBKey, &policyv1.PodDisruptionBudget{})
 			}, "10s", "1s").Should(Succeed())
 
 			By("Making the WorkloadClass invalid (exceeding guardrails)")
+			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Break validation
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Reconciling again")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
+			reconcileWC(typeNamespacedName)
 
-			By("Verifying the PDB was deleted because of validation failure")
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
-				return errors.IsNotFound(err)
-			}, "10s", "1s").Should(BeTrue(), "Expected PDB %s to be deleted", expectedPDBName)
+			By("Verifying the PDB was opened because of validation failure")
+			Eventually(func() (string, error) {
+				pdb := &policyv1.PodDisruptionBudget{}
+				if err := k8sClient.Get(ctx, podPDBKey, pdb); err != nil {
+					return "", err
+				}
+				return pdb.Spec.MaxUnavailable.String(), nil
+			}, "10s", "1s").Should(Equal("100%"))
 		})
 
-		It("should delete the PDB if another WorkloadClass is the namespace default", func() {
-			By("First reconciling to ensure PDB is created initially")
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
+		It("should hand the Pod's PDB over to the namespace default WorkloadClass", func() {
+			selectPod()
 
-			wc := &workloadsv1.WorkloadClass{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			expectedPDBName := "workload-" + wc.Name
-			pdbKey := types.NamespacedName{Name: expectedPDBName, Namespace: wc.Namespace}
-
+			By("First reconciling to ensure the PDB is created initially")
+			reconcileWC(typeNamespacedName)
 			Eventually(func() error {
-				return k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+				return k8sClient.Get(ctx, podPDBKey, &policyv1.PodDisruptionBudget{})
 			}, "10s", "1s").Should(Succeed())
 
-			By("Setting another WorkloadClass as the namespace default")
+			By("Creating another WorkloadClass and setting it as the namespace default")
+			defaultWCKey := types.NamespacedName{Name: "some-other-class", Namespace: defaultNamespace}
+			defaultWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: defaultWCKey.Name, Namespace: defaultNamespace},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+				},
+			}
+			Expect(k8sClient.Create(ctx, defaultWC)).To(Succeed())
+
 			ns := &corev1.Namespace{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)).To(Succeed())
-
 			if ns.Labels == nil {
 				ns.Labels = make(map[string]string)
 			}
-			ns.Labels["workloads.gke.io/default-class"] = "some-other-class"
+			ns.Labels[workloadsv1.DefaultClassLabel] = defaultWCKey.Name
 			Expect(k8sClient.Update(ctx, ns)).To(Succeed())
 
 			defer func() {
+				_ = k8sClient.Delete(ctx, defaultWC)
 				_ = k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)
-				delete(ns.Labels, "workloads.gke.io/default-class")
+				delete(ns.Labels, workloadsv1.DefaultClassLabel)
 				_ = k8sClient.Update(ctx, ns)
 			}()
 
-			By("Reconciling again")
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling the namespace default WorkloadClass, which adopts the PDB")
+			reconcileWC(defaultWCKey)
+			Eventually(func() (string, error) {
+				pdb := &policyv1.PodDisruptionBudget{}
+				if err := k8sClient.Get(ctx, podPDBKey, pdb); err != nil {
+					return "", err
+				}
+				return metav1.GetControllerOf(pdb).Name, nil
+			}, "10s", "1s").Should(Equal(defaultWCKey.Name))
 
-			By("Verifying the PDB was deleted because this class is not the default")
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
-				return errors.IsNotFound(err)
-			}, "10s", "1s").Should(BeTrue(), "Expected PDB %s to be deleted", expectedPDBName)
+			By("Reconciling the original WorkloadClass, which no longer touches the PDB")
+			reconcileWC(typeNamespacedName)
+			pdb := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, pdb)).To(Succeed())
+			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(defaultWCKey.Name))
 		})
 
 		It("should set PlacementPluginAttached=False and Validated=False when InfrastructureProfileRef is set and plugin has not attached", func() {
@@ -700,13 +716,12 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(validatedCond.Message).To(ContainSubstring("WorkloadClass references an infrastructure profile, but the plugin has not attached"))
 
 			By("Verifying no PDB is created while plugin has not attached")
-			pdbKey := types.NamespacedName{Name: "workload-" + updatedWC.Name, Namespace: updatedWC.Namespace}
-			err = k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+			err = k8sClient.Get(ctx, podPDBKey, &policyv1.PodDisruptionBudget{})
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
 		It("should preserve PlacementPluginAttached=True, mark Validated=True, and create PDB when plugin has attached for current generation", func() {
-			By("Updating WorkloadClass with an InfrastructureProfileRef")
+			By("Updating WorkloadClass with an InfrastructureProfileRef and a PodSelector matching the Pod")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
@@ -714,6 +729,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 				Kind:  "GKESpotPlacementPolicy",
 				Name:  "gke-t2d-spot-profile",
 			}
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
 			By("Simulating the plugin controller attaching for the current generation")
@@ -749,9 +765,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationPassed))
 
 			By("Verifying the PDB is created")
-			pdbKey := types.NamespacedName{Name: "workload-" + updatedWC.Name, Namespace: updatedWC.Namespace}
 			Eventually(func() error {
-				return k8sClient.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{})
+				return k8sClient.Get(ctx, podPDBKey, &policyv1.PodDisruptionBudget{})
 			}, "10s", "1s").Should(Succeed())
 		})
 
@@ -1244,452 +1259,408 @@ func TestValidateSelectors(t *testing.T) {
 	}
 }
 
-func TestNamespaceDefault(t *testing.T) {
+func newTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
 	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-
-	testCases := []struct {
-		name      string
-		namespace *corev1.Namespace
-		wc        *workloadsv1.WorkloadClass
-		want      string
-		wantErr   bool
-	}{
-		{
-			name: "namespace_has_the_default_class_label",
-			namespace: &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-ns",
-					Labels: map[string]string{
-						"workloads.gke.io/default-class": "critical-batch",
-					},
-				},
-			},
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "some-class",
-					Namespace: "test-ns",
-				},
-			},
-			want:    "critical-batch",
-			wantErr: false,
-		},
-		{
-			name: "namespace_does_not_have_the_default_class_label",
-			namespace: &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-ns",
-					Labels: map[string]string{
-						"unrelated-label": "true",
-					},
-				},
-			},
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "some-class",
-					Namespace: "test-ns",
-				},
-			},
-			want:    "",
-			wantErr: false,
-		},
-		{
-			name: "namespace_is_missing_entirely",
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "some-class",
-					Namespace: "missing-ns",
-				},
-			},
-			want:    "",
-			wantErr: true,
-		},
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, policyv1.AddToScheme, workloadsv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("failed to build scheme: %v", err)
+		}
 	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			if tc.namespace != nil {
-				clientBuilder = clientBuilder.WithObjects(tc.namespace)
-			}
-			fakeClient := clientBuilder.Build()
+	return scheme
+}
 
-			reconciler := &WorkloadClassReconciler{
-				Client: fakeClient,
-			}
+// newTestWC returns a WorkloadClass in the "default" namespace. A nil selector leaves PodSelector unset.
+func newTestWC(name string, selector map[string]string, created metav1.Time, readiness workloadsv1.MaintenanceReadiness, valid bool) *workloadsv1.WorkloadClass {
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			UID:               types.UID("uid-" + name), // Required for owner references
+			CreationTimestamp: created,
+		},
+		Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: readiness},
+	}
+	if selector != nil {
+		wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: selector}
+	}
+	reason := workloadsv1.ReasonValidationPassed
+	status := metav1.ConditionTrue
+	if !valid {
+		reason, status = workloadsv1.ReasonValidationFailed, metav1.ConditionFalse
+	}
+	wc.Status.Conditions = []metav1.Condition{{Type: workloadsv1.ConditionTypeValidated, Status: status, Reason: reason}}
+	return wc
+}
 
-			got, err := reconciler.namespaceDefault(context.Background(), tc.wc)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("namespaceDefault() error = %v, wantErr %v", err, tc.wantErr)
-				return
-			}
-			if got != tc.want {
-				t.Errorf("namespaceDefault() got = %q, want %q", got, tc.want)
-			}
-		})
+func newTestPod(name string, podLabels map[string]string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      name,
+		Namespace: "default",
+		UID:       types.UID("uid-" + name),
+		Labels:    podLabels,
+	}}
+}
+
+// newOwnedPDB returns a Per-Pod PDB for the Pod, controlled by the WorkloadClass.
+func newOwnedPDB(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, maxUnavailable intstr.IntOrString) *policyv1.PodDisruptionBudget {
+	isController := true
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      utils.PDBName(pod.Name),
+			Namespace: pod.Namespace,
+			Labels:    map[string]string{utils.PodUIDLabel: string(pod.UID)},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: workloadsv1.GroupVersion.String(),
+				Kind:       "WorkloadClass",
+				Name:       wc.Name,
+				UID:        wc.UID,
+				Controller: &isController,
+			}},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: &maxUnavailable,
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{utils.PodUIDLabel: string(pod.UID)}},
+		},
 	}
 }
 
-func TestOldestWorkloadClass(t *testing.T) {
+func validCondition() metav1.Condition {
+	return metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonValidationPassed}
+}
+
+func invalidCondition() metav1.Condition {
+	return metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed}
+}
+
+func TestReconcilePDBs(t *testing.T) {
 	now := metav1.Now()
-	oneHourAgo := metav1.NewTime(now.Add(-1 * time.Hour))
-	twoHoursAgo := metav1.NewTime(now.Add(-2 * time.Hour))
+	older := metav1.NewTime(now.Add(-time.Hour))
+	closed := intstr.FromInt32(0)
+	open := intstr.FromString("100%")
+	webLabels := map[string]string{"app": "web"}
 
-	testCases := []struct {
-		name               string
-		wc                 *workloadsv1.WorkloadClass
-		overlappingClasses []workloadsv1.WorkloadClass
-		wantName           string
-	}{
-		{
-			name: "target_wc_is_oldest_empty_overlapping_list",
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{Name: "target-wc", CreationTimestamp: oneHourAgo},
-			},
-			overlappingClasses: []workloadsv1.WorkloadClass{},
-			wantName:           "target-wc",
-		},
-		{
-			name: "target_wc_is_older_than_all_overlapping_classes",
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{Name: "target-wc", CreationTimestamp: twoHoursAgo},
-			},
-			overlappingClasses: []workloadsv1.WorkloadClass{
-				{ObjectMeta: metav1.ObjectMeta{Name: "overlap-1", CreationTimestamp: oneHourAgo}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "overlap-2", CreationTimestamp: now}},
-			},
-			wantName: "target-wc",
-		},
-		{
-			name: "an_overlapping_class_is_oldest",
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{Name: "target-wc", CreationTimestamp: oneHourAgo},
-			},
-			overlappingClasses: []workloadsv1.WorkloadClass{
-				{ObjectMeta: metav1.ObjectMeta{Name: "overlap-1", CreationTimestamp: now}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "overlap-oldest", CreationTimestamp: twoHoursAgo}},
-			},
-			wantName: "overlap-oldest",
-		},
-		{
-			name: "ties_in_timestamp_return_first_checked",
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{Name: "target-wc", CreationTimestamp: oneHourAgo},
-			},
-			overlappingClasses: []workloadsv1.WorkloadClass{
-				{ObjectMeta: metav1.ObjectMeta{Name: "overlap-tie", CreationTimestamp: oneHourAgo}},
-			},
-			wantName: "target-wc",
-		},
+	ns := func(defaultClass string) *corev1.Namespace {
+		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+		if defaultClass != "" {
+			n.Labels = map[string]string{workloadsv1.DefaultClassLabel: defaultClass}
+		}
+		return n
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := oldestWorkloadClass(tc.wc, tc.overlappingClasses)
-
-			if got.Name != tc.wantName {
-				t.Errorf("oldestWorkloadClass() returned %q, want %q", got.Name, tc.wantName)
-			}
-		})
+	type wantPDB struct {
+		owner          string // WorkloadClass name of the controller owner reference
+		maxUnavailable string
+		// leftForAdoption means the reconciled WorkloadClass still owns the PDB but no longer governs the Pod,
+		// and leaves the PDB for the governing WorkloadClass to adopt.
+		leftForAdoption bool
 	}
-}
-
-func TestDeletePDB(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = policyv1.AddToScheme(scheme)
-	testCases := []struct {
-		name      string
-		pdbExists bool
-		wc        *workloadsv1.WorkloadClass
-		wantErr   bool
-	}{
-		{
-			name:      "successful_deletion",
-			pdbExists: true,
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-wc",
-					Namespace: "default",
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name:      "pdb_already_gone",
-			pdbExists: false,
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "missing-wc",
-					Namespace: "default",
-				},
-			},
-			wantErr: false, // The IsNotFound error should be swallowed
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			if tc.pdbExists {
-				existingPDB := &policyv1.PodDisruptionBudget{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      tc.wc.Name,
-						Namespace: tc.wc.Namespace,
-					},
-				}
-				clientBuilder = clientBuilder.WithObjects(existingPDB)
-			}
-			fakeClient := clientBuilder.Build()
-			reconciler := &WorkloadClassReconciler{
-				Client: fakeClient,
-			}
-
-			err := reconciler.deletePDB(context.Background(), tc.wc)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("deletePDB() error = %v, wantErr %v", err, tc.wantErr)
-				return
-			}
-			// Verify that the PDB was actually deleted from the cluster
-			if err == nil {
-				checkPDB := &policyv1.PodDisruptionBudget{}
-				errCheck := fakeClient.Get(context.Background(), types.NamespacedName{
-					Name:      "workload-" + tc.wc.Name,
-					Namespace: tc.wc.Namespace,
-				}, checkPDB)
-
-				if !errors.IsNotFound(errCheck) {
-					t.Errorf("Expected PDB to be deleted (IsNotFound error), but got: %v", errCheck)
-				}
-			}
-		})
-	}
-}
-
-func TestCreateOrUpdatePDB(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = policyv1.AddToScheme(scheme)
-	_ = workloadsv1.AddToScheme(scheme)
 
 	testCases := []struct {
 		name      string
-		pdbExists bool
 		wc        *workloadsv1.WorkloadClass
+		condition metav1.Condition
+		objects   []client.Object
 		wantErr   bool
+		wantPDBs  map[string]*wantPDB // PDB name -> expected PDB, or nil if it must not exist
 	}{
 		{
-			name:      "creates_pdb_when_missing",
-			pdbExists: false,
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-wc",
-					Namespace: "default",
-					UID:       "fake-uid-123",
-				},
-				Spec: workloadsv1.WorkloadClassSpec{
-					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "batch-processor"}},
-				},
+			name:      "creates_per_pod_pdbs_for_governed_pods_only",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns(""),
+				newTestPod("web-1", webLabels),
+				newTestPod("web-2", webLabels),
+				newTestPod("other", map[string]string{"app": "other"}),
 			},
-			wantErr: false,
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "web", maxUnavailable: "0"},
+				"workload-web-2": {owner: "web", maxUnavailable: "0"},
+				"workload-other": nil,
+			},
 		},
 		{
-			name:      "updates_existing_pdb",
-			pdbExists: true,
-			wc: &workloadsv1.WorkloadClass{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-wc",
-					Namespace: "default",
-					UID:       "fake-uid-123",
-				},
-				Spec: workloadsv1.WorkloadClassSpec{
-					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "batch-processor"}},
+			name:      "ready_workload_class_opens_pdbs",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessReady, true),
+			condition: validCondition(),
+			objects:   []client.Object{ns(""), newTestPod("web-1", webLabels)},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": {owner: "web", maxUnavailable: "100%"}},
+		},
+		{
+			name:      "skips_pod_covered_by_user_pdb_and_deletes_its_existing_pdb",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: func() []client.Object {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				covered := newTestPod("web-1", map[string]string{"app": "web", "tier": "frontend"})
+				userPDB := &policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{Name: "user-frontend", Namespace: "default"},
+					Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"tier": "frontend"}}},
+				}
+				return []client.Object{ns(""), covered, newTestPod("web-2", webLabels), userPDB, newOwnedPDB(wc, covered, closed)}
+			}(),
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": nil,
+				"workload-web-2": {owner: "web", maxUnavailable: "0"},
+			},
+		},
+		{
+			name:      "deletes_pdb_of_deleted_pod",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns(""),
+				newOwnedPDB(newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true), newTestPod("gone", webLabels), closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-gone": nil},
+		},
+		{
+			name:      "invalid_workload_class_opens_owned_pdbs_without_creating_new_ones",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, false),
+			condition: invalidCondition(),
+			objects: []client.Object{
+				ns(""),
+				newTestPod("web-1", webLabels),
+				newTestPod("web-2", webLabels),
+				newOwnedPDB(newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, false), newTestPod("web-1", webLabels), closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "web", maxUnavailable: "100%"},
+				"workload-web-2": nil,
+			},
+		},
+		{
+			name:      "shadowed_by_namespace_default_leaves_pdb_for_default_to_adopt",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns("ns-default"),
+				newTestWC("ns-default", nil, now, workloadsv1.ReadinessReady, true),
+				newTestPod("web-1", webLabels),
+				newOwnedPDB(newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true), newTestPod("web-1", webLabels), closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "web", maxUnavailable: "0", leftForAdoption: true}},
+		},
+		{
+			name:      "namespace_default_governs_all_pods_and_adopts_existing_pdbs",
+			wc:        newTestWC("ns-default", nil, now, workloadsv1.ReadinessReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns("ns-default"),
+				newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+				newTestPod("web-1", webLabels),
+				newTestPod("other", map[string]string{"app": "other"}),
+				newOwnedPDB(newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true), newTestPod("web-1", webLabels), closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "ns-default", maxUnavailable: "100%"},
+				"workload-other": {owner: "ns-default", maxUnavailable: "100%"},
+			},
+		},
+		{
+			name:      "more_specific_workload_class_adopts_pdb",
+			wc:        newTestWC("web-frontend", map[string]string{"app": "web", "tier": "frontend"}, now, workloadsv1.ReadinessReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns(""),
+				newTestWC("web", webLabels, older, workloadsv1.ReadinessNotReady, true),
+				newTestPod("web-1", map[string]string{"app": "web", "tier": "frontend"}),
+				newOwnedPDB(newTestWC("web", webLabels, older, workloadsv1.ReadinessNotReady, true),
+					newTestPod("web-1", map[string]string{"app": "web", "tier": "frontend"}), closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "web-frontend", maxUnavailable: "100%"}},
+		},
+		{
+			name:      "less_specific_workload_class_deletes_nothing_it_does_not_govern",
+			wc:        newTestWC("web", webLabels, older, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns(""),
+				newTestWC("web-frontend", map[string]string{"app": "web", "tier": "frontend"}, now, workloadsv1.ReadinessReady, true),
+				newTestPod("web-1", map[string]string{"app": "web", "tier": "frontend"}),
+				newOwnedPDB(newTestWC("web-frontend", map[string]string{"app": "web", "tier": "frontend"}, now, workloadsv1.ReadinessReady, true),
+					newTestPod("web-1", map[string]string{"app": "web", "tier": "frontend"}), open),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "web-frontend", maxUnavailable: "100%"}},
+		},
+		{
+			name:      "refuses_to_modify_user_pdb_with_the_same_name",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: []client.Object{
+				ns(""),
+				newTestPod("web-1", webLabels),
+				&policyv1.PodDisruptionBudget{
+					ObjectMeta: metav1.ObjectMeta{Name: "workload-web-1", Namespace: "default"},
+					Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unrelated"}}},
 				},
 			},
-			wantErr: false,
+			wantErr:  true,
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: ""}},
+		},
+		{
+			name: "deleting_workload_class_is_skipped",
+			wc: func() *workloadsv1.WorkloadClass {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				wc.DeletionTimestamp = &now
+				return wc
+			}(),
+			condition: validCondition(),
+			objects:   []client.Object{ns(""), newTestPod("web-1", webLabels)},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
 		},
 	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			expectedPDB := workloadClassPDB(tc.wc)
-			if tc.pdbExists {
-				// Inject an existing, outdated, PDB into the fake cluster
-				existingPDB := &policyv1.PodDisruptionBudget{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      expectedPDB.Name,
-						Namespace: expectedPDB.Namespace,
-					},
-				}
-				clientBuilder = clientBuilder.WithObjects(existingPDB)
-			}
-			fakeClient := clientBuilder.Build()
-			reconciler := &WorkloadClassReconciler{
-				Client: fakeClient,
-				Scheme: scheme,
-			}
+			scheme := newTestScheme(t)
+			wcForClient := tc.wc.DeepCopy()
+			wcForClient.DeletionTimestamp = nil // The fake client rejects objects with a DeletionTimestamp and no finalizers.
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(tc.objects, wcForClient)...).Build()
+			r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
 
-			err := reconciler.createOrUpdatePDB(context.Background(), tc.wc)
+			err := r.reconcilePDBs(t.Context(), tc.wc, tc.condition)
 			if (err != nil) != tc.wantErr {
-				t.Errorf("createOrUpdatePDB() error = %v, wantErr %v", err, tc.wantErr)
-				return
+				t.Fatalf("reconcilePDBs() error = %v, wantErr %v", err, tc.wantErr)
 			}
 
-			if err == nil {
-				savedPDB := &policyv1.PodDisruptionBudget{}
-				errGet := fakeClient.Get(context.Background(), types.NamespacedName{
-					Name:      expectedPDB.Name,
-					Namespace: expectedPDB.Namespace,
-				}, savedPDB)
-
-				if errGet != nil {
-					t.Fatalf("Expected PDB to exist in the API server, but got error: %v", errGet)
-				}
-
-				if len(savedPDB.OwnerReferences) == 0 {
-					t.Errorf("Expected PDB to have an OwnerReference to the WorkloadClass, but found none")
-				} else {
-					if savedPDB.OwnerReferences[0].UID != tc.wc.UID {
-						t.Errorf("Expected OwnerReference UID %q, got %q", tc.wc.UID, savedPDB.OwnerReferences[0].UID)
+			for name, want := range tc.wantPDBs {
+				pdb := &policyv1.PodDisruptionBudget{}
+				err := c.Get(t.Context(), client.ObjectKey{Name: name, Namespace: "default"}, pdb)
+				if want == nil {
+					if !errors.IsNotFound(err) {
+						t.Errorf("PDB %s: expected it to not exist, got err=%v", name, err)
 					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("PDB %s: expected it to exist, got err=%v", name, err)
 				}
 
-				// The PDB must select the WorkloadClass' Pods, or it will not block any evictions.
-				if !reflect.DeepEqual(savedPDB.Spec.Selector, tc.wc.Spec.PodSelector) {
-					t.Errorf("Expected PDB selector %v, got %v", tc.wc.Spec.PodSelector, savedPDB.Spec.Selector)
+				owner := metav1.GetControllerOf(pdb)
+				if want.owner == "" {
+					if owner != nil {
+						t.Errorf("PDB %s: expected no controller, got %s", name, owner.Name)
+					}
+					continue
 				}
-				if _, ok := savedPDB.Labels[utils.PodUIDLabel]; ok {
-					t.Errorf("Expected PDB to not have the %s label, got %v", utils.PodUIDLabel, savedPDB.Labels)
+				if owner == nil || owner.Name != want.owner {
+					t.Errorf("PDB %s: controller = %v, want %s", name, owner, want.owner)
+				}
+				if got := pdb.Spec.MaxUnavailable.String(); got != want.maxUnavailable {
+					t.Errorf("PDB %s: maxUnavailable = %s, want %s", name, got, want.maxUnavailable)
+				}
+
+				// The PDB must select exactly its Pod, and the Pod must carry the matching label.
+				podName := utils.PodNameFromPDBName(name)
+				pod := &corev1.Pod{}
+				if err := c.Get(t.Context(), client.ObjectKey{Name: podName, Namespace: "default"}, pod); err != nil {
+					t.Fatalf("Pod %s: %v", podName, err)
+				}
+				wantSelector := &metav1.LabelSelector{MatchLabels: map[string]string{utils.PodUIDLabel: string(pod.UID)}}
+				if !reflect.DeepEqual(pdb.Spec.Selector, wantSelector) {
+					t.Errorf("PDB %s: selector = %v, want %v", name, pdb.Spec.Selector, wantSelector)
+				}
+				// Only a valid WorkloadClass labels the Pods it governs.
+				governs := want.owner == tc.wc.Name && !want.leftForAdoption && tc.condition.Reason == workloadsv1.ReasonValidationPassed
+				if governs && pod.Labels[utils.PodUIDLabel] != string(pod.UID) {
+					t.Errorf("Pod %s: %s label = %q, want %q", podName, utils.PodUIDLabel, pod.Labels[utils.PodUIDLabel], pod.UID)
 				}
 			}
 		})
 	}
 }
 
-func TestReconcilePDB(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = policyv1.AddToScheme(scheme)
-	_ = workloadsv1.AddToScheme(scheme)
-
-	now := metav1.Now()
-	oneHourAgo := metav1.NewTime(now.Add(-1 * time.Hour))
+func TestPodPredicate(t *testing.T) {
+	pod := newTestPod("web-1", map[string]string{"app": "web"})
+	labeled := pod.DeepCopy()
+	labeled.Labels[utils.PodUIDLabel] = string(pod.UID)
+	relabeled := labeled.DeepCopy()
+	relabeled.Labels["app"] = "other"
+	terminating := labeled.DeepCopy()
+	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	statusOnly := labeled.DeepCopy()
+	statusOnly.Status.Phase = corev1.PodRunning
 
 	testCases := []struct {
-		name               string
-		namespace          *corev1.Namespace
-		wc                 *workloadsv1.WorkloadClass
-		condition          metav1.Condition
-		overlappingClasses []workloadsv1.WorkloadClass
-		wantErr            bool
-		wantPDBExists      bool // true if we expect createOrUpdatePDB to run, false for deletePDB
+		name     string
+		old, new *corev1.Pod
+		want     bool
 	}{
-		{
-			name:          "deletes_pdb_if_validation_fails",
-			namespace:     &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:            makeWC("test-wc", now),
-			condition:     metav1.Condition{Reason: "ValidationError"}, // Anything other than ReasonValidationPassed
-			wantPDBExists: false,                                       // Calls deletePDB
-		},
-		{
-			name:      "errors_if_namespace_missing",
-			namespace: nil, // Namespace Get will fail
-			wc:        makeWC("test-wc", now),
-			condition: metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			wantErr:   true,
-		},
-		{
-			name: "creates_pdb_if_this_wc_is_namespace_default",
-			namespace: &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "default",
-					Labels: map[string]string{"workloads.gke.io/default-class": "test-wc"},
-				},
-			},
-			wc:            makeWC("test-wc", now),
-			condition:     metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			wantPDBExists: true,
-		},
-		{
-			name: "deletes_pdb_if_another_wc_is_namespace_default",
-			namespace: &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "default",
-					Labels: map[string]string{"workloads.gke.io/default-class": "some-other-wc"},
-				},
-			},
-			wc:            makeWC("test-wc", now),
-			condition:     metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			wantPDBExists: false,
-		},
-		{
-			name:               "creates_pdb_if_no_default_and_no_overlaps",
-			namespace:          &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:                 makeWC("test-wc", now),
-			condition:          metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			overlappingClasses: nil,
-			wantPDBExists:      true,
-		},
-		{
-			name:      "creates_pdb_if_no_default_and_this_is_oldest_overlap",
-			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:        makeWC("oldest-wc", oneHourAgo),
-			condition: metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			overlappingClasses: []workloadsv1.WorkloadClass{
-				*makeWC("newer-wc", now),
-			},
-			wantPDBExists: true,
-		},
-		{
-			name:      "deletes_pdb_if_no_default_and_this_is_not_oldest_overlap",
-			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-			wc:        makeWC("newer-wc", now),
-			condition: metav1.Condition{Reason: workloadsv1.ReasonValidationPassed},
-			overlappingClasses: []workloadsv1.WorkloadClass{
-				*makeWC("oldest-wc", oneHourAgo),
-			},
-			wantPDBExists: false,
-		},
+		{name: "pod_uid_label_added_by_controller_is_ignored", old: pod, new: labeled, want: false},
+		{name: "status_only_change_is_ignored", old: labeled, new: statusOnly, want: false},
+		{name: "label_change_triggers", old: labeled, new: relabeled, want: true},
+		{name: "terminating_triggers", old: labeled, new: terminating, want: true},
+		{name: "pod_uid_label_removed_triggers", old: labeled, new: pod, want: true},
+	}
+
+	p := podPredicate()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
+				t.Errorf("podPredicate().Update() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	if !p.Create(event.CreateEvent{Object: pod}) || !p.Delete(event.DeleteEvent{Object: pod}) {
+		t.Error("podPredicate() should pass Create and Delete events")
+	}
+}
+
+func TestNamespaceDefaultClassPredicate(t *testing.T) {
+	withDefault := func(value string) *corev1.Namespace {
+		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: map[string]string{"other": "label"}}}
+		if value != "" {
+			n.Labels[workloadsv1.DefaultClassLabel] = value
+		}
+		return n
+	}
+
+	p := namespaceDefaultClassPredicate()
+	testCases := []struct {
+		name     string
+		old, new *corev1.Namespace
+		want     bool
+	}{
+		{name: "default_added", old: withDefault(""), new: withDefault("wc"), want: true},
+		{name: "default_changed", old: withDefault("wc"), new: withDefault("other-wc"), want: true},
+		{name: "default_removed", old: withDefault("wc"), new: withDefault(""), want: true},
+		{name: "unrelated_change", old: withDefault("wc"), new: withDefault("wc"), want: false},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			clientBuilder := fake.NewClientBuilder().WithScheme(scheme)
-			if tc.namespace != nil {
-				clientBuilder = clientBuilder.WithObjects(tc.namespace)
-			}
-
-			// Purposefully inject a dummy PDB beforehand.
-			// If deletePDB is called, it will vanish. If createOrUpdatePDB is called, it will remain/be updated.
-			expectedPDB := workloadClassPDB(tc.wc)
-			dummyPDB := &policyv1.PodDisruptionBudget{
-				ObjectMeta: metav1.ObjectMeta{Name: expectedPDB.Name, Namespace: expectedPDB.Namespace},
-			}
-			clientBuilder = clientBuilder.WithObjects(dummyPDB)
-			fakeClient := clientBuilder.Build()
-			reconciler := &WorkloadClassReconciler{
-				Client: fakeClient,
-				Scheme: scheme,
-			}
-
-			err := reconciler.reconcilePDB(context.Background(), tc.wc, tc.condition, tc.overlappingClasses)
-			if (err != nil) != tc.wantErr {
-				t.Errorf("reconcilePDB() error = %v, wantErr %v", err, tc.wantErr)
-				return
-			}
-
-			if tc.wantErr {
-				return
-			}
-
-			checkPDB := &policyv1.PodDisruptionBudget{}
-			errGet := fakeClient.Get(context.Background(), types.NamespacedName{
-				Name:      expectedPDB.Name,
-				Namespace: expectedPDB.Namespace,
-			}, checkPDB)
-			pdbExists := errGet == nil
-			if !pdbExists && !errors.IsNotFound(errGet) {
-				t.Fatalf("Unexpected error getting PDB: %v", errGet)
-			}
-			if pdbExists != tc.wantPDBExists {
-				t.Errorf("Expected PDB existence: %v, but was: %v", tc.wantPDBExists, pdbExists)
+			if got := p.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
+				t.Errorf("namespaceDefaultClassPredicate().Update() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+	if !p.Create(event.CreateEvent{Object: withDefault("wc")}) || p.Create(event.CreateEvent{Object: withDefault("")}) {
+		t.Error("namespaceDefaultClassPredicate().Create() should pass only Namespaces with a default class")
+	}
+}
+
+func TestFindWorkloadClassesForPod(t *testing.T) {
+	now := metav1.Now()
+	webLabels := map[string]string{"app": "web"}
+	scheme := newTestScheme(t)
+	web := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+	previous := newTestWC("previous", map[string]string{"app": "previous"}, now, workloadsv1.ReadinessNotReady, true)
+	pod := newTestPod("web-1", webLabels)
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+		web, previous, pod,
+		newOwnedPDB(previous, pod, intstr.FromInt32(0)), // The Pod's PDB is still owned by the WorkloadClass it used to match.
+	).Build()
+	r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
+
+	got := map[string]bool{}
+	for _, req := range r.findWorkloadClassesForPod(t.Context(), pod) {
+		got[req.Name] = true
+	}
+	if want := map[string]bool{"web": true, "previous": true}; !reflect.DeepEqual(got, want) {
+		t.Errorf("findWorkloadClassesForPod() = %v, want %v", got, want)
 	}
 }
 

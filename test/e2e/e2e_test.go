@@ -198,22 +198,22 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Validating the PDB allows disruptions")
-			Eventually(func() (string, error) {
-				cmd := exec.Command("kubectl", "get", "pdb", "workload-critical-batch", "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					return "", err
-				}
-				return strings.TrimSpace(output), nil
-			}, time.Minute, 2*time.Second).Should(Equal("100%"), "The PDB should allow 100% unavailable pods within the disruption window")
-
 			By("Fetching the dynamically generated pod name")
 			cmd = exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].metadata.name}")
 			podNameOutput, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to get the pod name")
 			podName := strings.TrimSpace(podNameOutput)
 			Expect(podName).NotTo(BeEmpty())
+
+			By("Validating the Pod's PDB allows disruptions")
+			Eventually(func() (string, error) {
+				cmd := exec.Command("kubectl", "get", "pdb", "workload-"+podName, "-n", "sample", "-o", "jsonpath={.spec.maxUnavailable}")
+				output, err := utils.Run(cmd)
+				if err != nil {
+					return "", err
+				}
+				return strings.TrimSpace(output), nil
+			}, time.Minute, 2*time.Second).Should(Equal("100%"), "The PDB should allow 100% unavailable pods within the disruption window")
 
 			By("Attempting to evict the Pod via the eviction subresource")
 			evictionURL := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", podName)
