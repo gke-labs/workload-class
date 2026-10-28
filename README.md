@@ -203,7 +203,7 @@ In addition to the webhook, the controller expresses each workload's disruption 
 A pod is governed by its best-match `WorkloadClass`, using the same precedence as the webhook: the namespace default if one is set, otherwise the most specific matching `podSelector` (the oldest wins ties). The controller creates a PDB for every governed pod, except:
 
 - **Pods already covered by a user-created PDB.** If any PDB not managed by a `WorkloadClass` selects a pod, the user's PDB takes precedence and the controller doesn't create one. If a user creates such a PDB later, the controller deletes its PDB for the pod, and recreates it if the user's PDB is removed.
-- **Terminating pods.**
+- **Terminating or completed pods.**
 
 > **NOTE:** A `WorkloadClass` without a `podSelector` only governs pods when it is the namespace default.
 
@@ -229,7 +229,7 @@ workload-test-deployment-5f8c7d9b6c-x2k4p   N/A             0                 0 
 
 ### Ownership and Cleanup
 
-Each PDB is owned by its pod's `WorkloadClass` through a controller owner reference, so deleting the `WorkloadClass` deletes its PDBs. The controller also deletes a pod's PDB when the pod is deleted or starts terminating, when a user-created PDB starts covering it, or when no `WorkloadClass` governs it anymore.
+Each PDB is owned by its pod's `WorkloadClass` through a controller owner reference, so deleting the `WorkloadClass` deletes its PDBs. The controller also deletes a pod's PDB when the pod is deleted, starts terminating, or reaches a terminal phase, when a user-created PDB starts covering it, or when no `WorkloadClass` governs it anymore.
 
 When a pod's best-match `WorkloadClass` changes, for example because a namespace default is set or a more specific `WorkloadClass` is created, the new `WorkloadClass` takes ownership of the existing PDB rather than deleting and recreating it. The controller never modifies a user-created PDB, even one that happens to be named `workload-<pod name>`.
 
