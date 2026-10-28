@@ -18,6 +18,7 @@ package utils
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ import (
 
 const (
 	PDBNamePrefix    = "workload-"
+	MaxPDBNameLength = 253
 	PodUIDLabel      = workloadsv1.PodUIDLabel
 	BypassOwner      = "workloads.gke.io/bypass-owner"
 	BypassExpiration = "workloads.gke.io/bypass-expiration"
@@ -50,9 +52,18 @@ const (
 )
 
 // PDBName returns the name of the Per-Pod PDB based on the Pod name.
-// PDBs managed by WorkloadClass have the prefix `workload-`.
+// PDBs managed by WorkloadClass have the prefix `workload-`. If adding the prefix
+// exceeds the 253-character Kubernetes DNS-1123 subdomain limit, the name is
+// truncated and suffixed with a deterministic 8-character SHA-256 hash of podName.
 func PDBName(podName string) string {
-	return PDBNamePrefix + podName
+	name := PDBNamePrefix + podName
+	if len(name) <= MaxPDBNameLength {
+		return name
+	}
+	sum := sha256.Sum256([]byte(podName))
+	suffix := fmt.Sprintf("-%x", sum[:4])
+	prefix := strings.TrimRight(name[:MaxPDBNameLength-len(suffix)], "-.")
+	return prefix + suffix
 }
 
 // PodNameFromPDBName extracts the target Pod name from a WorkloadClass-managed PDB name.
@@ -153,10 +164,14 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pd
 
 // BypassOwnerValue returns the value of the workloads.gke.io/bypass-owner annotation for a Subject.
 func BypassOwnerValue(subject workloadsv1.Subject) string {
-	if subject.Kind == "User" || subject.Kind == "Group" {
-		return subject.Name
+	switch subject.Kind {
+	case "User":
+		return "user:" + subject.Name
+	case "Group":
+		return "group:" + subject.Name
+	default:
+		return fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
 	}
-	return fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
 }
 
 // LeaseDurationForPod returns the PDB lease duration for a Pod based on its TerminationGracePeriodSeconds

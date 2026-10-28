@@ -18,6 +18,7 @@ package utils
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,27 @@ func TestPDBNameHelpers(t *testing.T) {
 	base := PDBBase(pod)
 	if base.Name != "workload-pod-1" || base.Namespace != "team-a" || base.Labels[PodUIDLabel] != "uid-123" {
 		t.Errorf("PDBBase(pod) = %+v, want Name=workload-pod-1, Namespace=team-a, Labels[%s]=uid-123", base, PodUIDLabel)
+	}
+
+	// Pod names up to 244 characters keep the exact "workload-<podName>" name (253 chars).
+	exactMaxPod := strings.Repeat("a", 244)
+	if got := PDBName(exactMaxPod); len(got) != MaxPDBNameLength || got != PDBNamePrefix+exactMaxPod {
+		t.Errorf("PDBName(244-char pod) len = %d, want %d", len(got), MaxPDBNameLength)
+	}
+
+	// Pod names > 244 characters are truncated with a deterministic hash suffix to stay <= 253 characters.
+	longPodA := strings.Repeat("a", 250) + "-1"
+	longPodB := strings.Repeat("a", 250) + "-2"
+	nameA := PDBName(longPodA)
+	nameB := PDBName(longPodB)
+	if len(nameA) > MaxPDBNameLength {
+		t.Errorf("PDBName(longPodA) len = %d, want <= %d", len(nameA), MaxPDBNameLength)
+	}
+	if nameA == nameB {
+		t.Errorf("PDBName(longPodA) == PDBName(longPodB) (%q), want distinct names", nameA)
+	}
+	if PDBName(longPodA) != nameA {
+		t.Errorf("PDBName(longPodA) is not deterministic")
 	}
 }
 
@@ -383,7 +405,7 @@ func TestAllowLeaseAndSubjectAlreadyLeasing(t *testing.T) {
 					OwnerReferences: wcOwnerRefs,
 					Labels:          map[string]string{PodUIDLabel: "pod-uid-1"},
 					Annotations: map[string]string{
-						BypassOwner:      "user-a",
+						BypassOwner:      "user:user-a",
 						BypassExpiration: time.Now().Add(1 * time.Hour).Format(ExpirationFormat),
 					},
 				},
@@ -391,6 +413,23 @@ func TestAllowLeaseAndSubjectAlreadyLeasing(t *testing.T) {
 			pod:                pod,
 			wantAllowLease:     false,
 			wantSubjectALeased: true,
+			wantSubjectBLeased: false,
+		},
+		{
+			name: "group_with_same_name_as_user_does_not_match_user_subject",
+			pdb: &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: wcOwnerRefs,
+					Labels:          map[string]string{PodUIDLabel: "pod-uid-1"},
+					Annotations: map[string]string{
+						BypassOwner:      BypassOwnerValue(workloadsv1.Subject{Kind: "Group", Name: "user-a"}),
+						BypassExpiration: time.Now().Add(1 * time.Hour).Format(ExpirationFormat),
+					},
+				},
+			},
+			pod:                pod,
+			wantAllowLease:     false,
+			wantSubjectALeased: false,
 			wantSubjectBLeased: false,
 		},
 		{
