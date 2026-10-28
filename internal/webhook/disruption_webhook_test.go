@@ -320,14 +320,16 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 	const (
 		namespace     = "namespace"
 		adminUsername = "admin@mycompany.com"
+		adminGroup    = "sre-oncall"
 		otherOwner    = "system:serviceaccount:kube-system:cluster-autoscaler"
 		podName       = "podrick"
 		podUID        = types.UID("podrick-uid")
 	)
 	labels := map[string]string{"labelA": "valueA"}
 	adminSubject := workloadsv1.Subject{Kind: rbacv1.UserKind, Name: adminUsername}
+	adminGroupSubject := workloadsv1.Subject{Kind: rbacv1.GroupKind, Name: adminGroup}
 
-	// The WorkloadClass is outside of its disruption window and allows adminUsername to disrupt outside of it.
+	// The WorkloadClass is outside of its disruption window and allows adminUsername and adminGroup to disrupt outside of it.
 	wc := &workloadsv1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "wc",
@@ -340,7 +342,7 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
 					{Name: "maintenance", DaysOfWeek: []string{time.Now().AddDate(0, 0, 1).Weekday().String()}, StartTime: "00:00", EndTime: "23:59", TimeZone: "America/Toronto"},
 				},
-				AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{adminSubject},
+				AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{adminSubject, adminGroupSubject},
 			},
 		},
 		Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: workloadsv1.ReadinessNotReady},
@@ -439,7 +441,12 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 		},
 		{
 			name:        "subject_already_leasing_allows_without_new_lease",
-			pdb:         newPDB(true, podUID, open, adminUsername, time.Minute),
+			pdb:         newPDB(true, podUID, open, utils.BypassOwnerValue(adminSubject), time.Minute),
+			wantAllowed: true,
+		},
+		{
+			name:        "second_matching_subject_group_already_leasing_allows_without_new_lease",
+			pdb:         newPDB(true, podUID, open, utils.BypassOwnerValue(adminGroupSubject), time.Minute),
 			wantAllowed: true,
 		},
 		{
@@ -482,7 +489,7 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 				Name:        podName,
 				Namespace:   namespace,
 				SubResource: "eviction",
-				UserInfo:    authv1.UserInfo{Username: adminUsername},
+				UserInfo:    authv1.UserInfo{Username: adminUsername, Groups: []string{adminGroup}},
 			}}
 			resp := v.Handle(t.Context(), req)
 

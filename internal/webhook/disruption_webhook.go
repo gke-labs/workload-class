@@ -94,14 +94,18 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// Identity-Based Filtering
+	var matchingSubjects []workloadsv1.Subject
 	for _, allowedSubject := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
 		allowed, err := matchesIdentity(req.UserInfo, allowedSubject)
 		if err != nil {
 			log.Error(err, "Failed to check if UserInfo matches allowed Subject", "subject", allowedSubject)
 		}
 		if allowed {
-			return v.handleAuthorizedSubject(ctx, bestWC, pod, allowedSubject)
+			matchingSubjects = append(matchingSubjects, allowedSubject)
 		}
+	}
+	if len(matchingSubjects) > 0 {
+		return v.handleAuthorizedSubject(ctx, bestWC, pod, matchingSubjects)
 	}
 
 	// Temporal Enforcement
@@ -143,7 +147,8 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 //   - If another subject holds an active lease for this Pod, the eviction is denied.
 //   - If the PDB for this Pod instance is already open, the eviction is allowed without requesting a lease.
 //   - Otherwise, a lease is requested from the controller and the eviction is allowed.
-func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) admission.Response {
+func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subjects []workloadsv1.Subject) admission.Response {
+	subject := subjects[0]
 	log := logf.FromContext(ctx).WithValues("pod", pod.Name, "namespace", pod.Namespace, "workloadClass", wc.Name, "subject", subject)
 
 	pdbName := utils.PDBName(pod.Name)
@@ -160,8 +165,10 @@ func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *wor
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
 
-	if utils.SubjectAlreadyLeasing(pdb, pod, subject) {
-		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s, PDB %s already leased for this Pod", subject, pdbName))
+	for _, s := range subjects {
+		if utils.SubjectAlreadyLeasing(pdb, pod, s) {
+			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s, PDB %s already leased for this Pod", s, pdbName))
+		}
 	}
 
 	if !utils.AllowLease(pdb, pod) {
