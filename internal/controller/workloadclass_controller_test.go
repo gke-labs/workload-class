@@ -1571,6 +1571,7 @@ func TestReconcilePDBs(t *testing.T) {
 					Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unrelated"}}},
 				},
 			},
+			leases:   []utils.PendingLease{{PodName: "web-1", PodUID: "uid-web-1", Subject: subject}},
 			wantErr:  true,
 			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: ""}},
 		},
@@ -1631,11 +1632,17 @@ func TestReconcilePDBs(t *testing.T) {
 			wcForClient := tc.wc.DeepCopy()
 			wcForClient.DeletionTimestamp = nil // The fake client rejects objects with a DeletionTimestamp and no finalizers.
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(tc.objects, wcForClient)...).Build()
-			r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
+			tracker := utils.NewPendingLeaseTracker(16)
+			r := &WorkloadClassReconciler{Client: c, Scheme: scheme, LeaseTracker: tracker}
 
 			requeue, err := r.reconcilePDBs(t.Context(), tc.wc, tc.condition, tc.leases)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("reconcilePDBs() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && len(tc.leases) > 0 {
+				if drained := tracker.Drain(client.ObjectKeyFromObject(tc.wc)); !reflect.DeepEqual(drained, tc.leases) {
+					t.Errorf("failed reconcilePDBs() should re-enqueue unapplied leases: got %v, want %v", drained, tc.leases)
+				}
 			}
 
 			if tc.wantRequeue == 0 && requeue != 0 {

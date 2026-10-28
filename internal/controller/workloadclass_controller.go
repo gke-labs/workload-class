@@ -179,6 +179,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 
 	pdbs := &policyv1.PodDisruptionBudgetList{}
 	if err := r.List(ctx, pdbs, client.InNamespace(wc.Namespace)); err != nil {
+		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
 	}
 	var owned, userPDBs []policyv1.PodDisruptionBudget
@@ -198,15 +199,18 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 
 	defaultWC, err := utils.NamespaceDefaultWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
+		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, err
 	}
 	wcs := &workloadsv1.WorkloadClassList{}
 	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
 
 	governed, err := r.governedPods(ctx, wc, defaultWC, wcs.Items, userPDBs)
 	if err != nil {
+		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, err
 	}
 
@@ -221,6 +225,11 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 	for _, pod := range governed {
 		governedPDBs[utils.PDBName(pod.Name)] = true
 		remaining, err := r.reconcilePodPDB(ctx, wc, pod, leases)
+		if err != nil {
+			if lease, ok := leases[pod.Name]; ok && lease.PodUID == pod.UID {
+				r.reenqueueLeases(wc, lease)
+			}
+		}
 		errs = append(errs, err)
 		requeue = minPositiveDuration(requeue, remaining)
 	}
@@ -333,6 +342,13 @@ func activeLeaseRemaining(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod) ti
 		return 0
 	}
 	return utils.LeaseTimeRemaining(pdb)
+}
+
+func (r *WorkloadClassReconciler) reenqueueLeases(wc *workloadsv1.WorkloadClass, leases ...utils.PendingLease) {
+	for _, lease := range leases {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: lease.PodName, Namespace: wc.Namespace, UID: lease.PodUID}}
+		r.LeaseTracker.Enqueue(wc, pod, lease.Subject)
+	}
 }
 
 // openOwnedPDBs opens the PDBs owned by an invalid WorkloadClass, and deletes those whose Pod no longer exists,
