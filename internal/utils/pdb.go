@@ -190,21 +190,27 @@ func LeaseDurationForPod(pod *corev1.Pod) time.Duration {
 
 // LeaseExpired returns true if the PDB lacks a valid, unexpired workloads.gke.io/bypass-expiration annotation.
 func LeaseExpired(pdb *policyv1.PodDisruptionBudget) bool {
+	return LeaseTimeRemaining(pdb) <= 0
+}
+
+// LeaseTimeRemaining returns the time until the PDB's workloads.gke.io/bypass-expiration annotation expires,
+// or 0 if the annotation is missing, cannot be parsed, or has already expired.
+func LeaseTimeRemaining(pdb *policyv1.PodDisruptionBudget) time.Duration {
 	if pdb == nil || len(pdb.Annotations) == 0 {
-		return true
+		return 0
 	}
 
 	expirationString, hasExpirationAnnotation := pdb.Annotations[BypassExpiration]
 	if !hasExpirationAnnotation {
-		return true
+		return 0
 	}
 
 	expirationTime, err := time.Parse(ExpirationFormat, expirationString)
 	if err != nil {
-		return true
+		return 0
 	}
 
-	return time.Now().Compare(expirationTime) >= 0
+	return max(time.Until(expirationTime), 0)
 }
 
 // AllowLease evaluates a Per-Pod PDB and determines whether a new lease can be granted for the given Pod.

@@ -42,6 +42,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
@@ -52,6 +53,11 @@ type WorkloadClassReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
+
+	// LeaseTracker holds Per-Pod PDB lease requests from the disruption webhook. The reconciler watches its
+	// event channel and applies the pending leases of a WorkloadClass when reconciling it. If nil, no leases
+	// are applied.
+	LeaseTracker *utils.PendingLeaseTracker
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -70,6 +76,10 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	wc := &workloadsv1.WorkloadClass{}
 	if err := r.Get(ctx, req.NamespacedName, wc); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Discard any lease requests for a deleted WorkloadClass.
+			r.LeaseTracker.Drain(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -124,8 +134,11 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// 4. Reconcile the Per-Pod PDBs
-	if err := r.reconcilePDBs(ctx, wc, validationCond); err != nil {
+	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
+	// Leases are drained only now, so earlier failures (e.g., status update conflicts) do not discard them.
+	pendingLeases := r.LeaseTracker.Drain(req.NamespacedName)
+	leaseRequeue, err := r.reconcilePDBs(ctx, wc, validationCond, pendingLeases)
+	if err != nil {
 		r.Recorder.Eventf(
 			wc,
 			nil,
@@ -138,7 +151,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: nextReconcile}, nil
+	// Requeue at the next readiness change, or when the earliest active lease expires so its PDB is re-synced.
+	return ctrl.Result{RequeueAfter: minPositiveDuration(nextReconcile, leaseRequeue)}, nil
 }
 
 // reconcilePDBs reconciles the Per-Pod PDBs (workload-<pod.Name>) of the Pods governed by the WorkloadClass.
@@ -147,21 +161,25 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // most specific matching WorkloadClass) and the Pod is not already covered by a user-created PDB.
 //
 //   - If the WorkloadClass is invalid, its existing PDBs are opened (MaxUnavailable = 100%) rather than deleted.
+//   - Pending leases from the disruption webhook are applied to the PDBs of the requested Pods.
+//   - PDBs with an active lease are left untouched until the lease expires.
 //   - Owned PDBs whose Pod no longer exists, is terminating or in a terminal phase, is covered by a user-created PDB,
 //     or is no longer governed by any valid WorkloadClass are deleted. PDBs of Pods governed by another WorkloadClass
 //     are left for that WorkloadClass to adopt.
-func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition) error {
+//
+// It returns the time until the earliest active lease expires, or 0 if there are none.
+func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, pendingLeases []utils.PendingLease) (time.Duration, error) {
 	log := logf.FromContext(ctx)
 
 	if !wc.DeletionTimestamp.IsZero() {
 		// Owned PDBs are garbage collected through their owner references.
 		log.Info("WorkloadClass is being deleted, skipping PDB reconciliation")
-		return nil
+		return 0, nil
 	}
 
 	pdbs := &policyv1.PodDisruptionBudgetList{}
 	if err := r.List(ctx, pdbs, client.InNamespace(wc.Namespace)); err != nil {
-		return fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
+		return 0, fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
 	}
 	var owned, userPDBs []policyv1.PodDisruptionBudget
 	for _, pdb := range pdbs.Items {
@@ -175,28 +193,36 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 
 	if condition.Reason != workloadsv1.ReasonValidationPassed {
 		log.Info("WorkloadClass is invalid, opening its PDBs")
-		return r.openOwnedPDBs(ctx, wc, owned, userPDBs)
+		return 0, r.openOwnedPDBs(ctx, wc, owned, userPDBs)
 	}
 
 	defaultWC, err := utils.NamespaceDefaultWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	wcs := &workloadsv1.WorkloadClassList{}
 	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
-		return fmt.Errorf("failed to list WorkloadClasses: %w", err)
+		return 0, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
 
 	governed, err := r.governedPods(ctx, wc, defaultWC, wcs.Items, userPDBs)
 	if err != nil {
-		return err
+		return 0, err
+	}
+
+	leases := make(map[string]utils.PendingLease, len(pendingLeases))
+	for _, lease := range pendingLeases {
+		leases[lease.PodName] = lease
 	}
 
 	var errs []error
+	var requeue time.Duration
 	governedPDBs := make(map[string]bool, len(governed))
 	for _, pod := range governed {
 		governedPDBs[utils.PDBName(pod.Name)] = true
-		errs = append(errs, r.reconcilePodPDB(ctx, wc, pod))
+		remaining, err := r.reconcilePodPDB(ctx, wc, pod, leases)
+		errs = append(errs, err)
+		requeue = minPositiveDuration(requeue, remaining)
 	}
 
 	for i := range owned {
@@ -219,7 +245,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 		errs = append(errs, r.deletePDB(ctx, wc, pdb))
 	}
 
-	return errors.Join(errs...)
+	return requeue, errors.Join(errs...)
 }
 
 // governedPods returns the active Pods governed by the WorkloadClass that are not covered by a user-created PDB.
@@ -261,12 +287,52 @@ func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc, defaultW
 	return governed, nil
 }
 
-// reconcilePodPDB labels a governed Pod and syncs its PDB with the WorkloadClass' disruption policy.
-func (r *WorkloadClassReconciler) reconcilePodPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod) error {
+// reconcilePodPDB reconciles the PDB of a single governed Pod and returns the remaining time of its active lease,
+// or 0 if it has none.
+func (r *WorkloadClassReconciler) reconcilePodPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, leases map[string]utils.PendingLease) (time.Duration, error) {
+	log := logf.FromContext(ctx).WithValues("pod", pod.Name)
+
 	if err := r.ensurePodUIDLabel(ctx, pod); err != nil {
-		return err
+		return 0, err
 	}
-	return r.syncPodPDB(ctx, wc, pod, true)
+
+	existing := &policyv1.PodDisruptionBudget{}
+	if err := r.Get(ctx, client.ObjectKey{Name: utils.PDBName(pod.Name), Namespace: pod.Namespace}, existing); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return 0, fmt.Errorf("failed to get PDB for Pod %s: %w", pod.Name, err)
+		}
+		existing = nil
+	}
+
+	if lease, ok := leases[pod.Name]; ok && lease.PodUID == pod.UID {
+		switch {
+		case existing != nil && utils.SubjectAlreadyLeasing(existing, pod, lease.Subject):
+			return utils.LeaseTimeRemaining(existing), nil
+		case existing == nil || utils.AllowLease(existing, pod):
+			if err := r.leasePodPDB(ctx, wc, pod, lease.Subject); err != nil {
+				return 0, err
+			}
+			log.Info("Leased PDB", "subject", lease.Subject)
+			return utils.LeaseDurationForPod(pod), nil
+		default:
+			log.Info("Discarding lease request, another subject holds an active lease", "subject", lease.Subject, "owner", existing.Annotations[utils.BypassOwner])
+		}
+	}
+
+	if remaining := activeLeaseRemaining(existing, pod); remaining > 0 {
+		// Leave the leased PDB open until the lease expires.
+		return remaining, nil
+	}
+
+	return 0, r.syncPodPDB(ctx, wc, pod, true)
+}
+
+// activeLeaseRemaining returns the remaining time of an active lease on the PDB for this Pod instance, or 0.
+func activeLeaseRemaining(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod) time.Duration {
+	if pdb == nil || pdb.Labels[utils.PodUIDLabel] != string(pod.UID) || pdb.Annotations[utils.BypassOwner] == "" {
+		return 0
+	}
+	return utils.LeaseTimeRemaining(pdb)
 }
 
 // openOwnedPDBs opens the PDBs owned by an invalid WorkloadClass, and deletes those whose Pod no longer exists,
@@ -318,6 +384,20 @@ func (r *WorkloadClassReconciler) syncPodPDB(ctx context.Context, wc *workloadsv
 		return fmt.Errorf("failed to reconcile PDB %s: %w", pdb.Name, err)
 	}
 	logf.FromContext(ctx).V(1).Info("Reconciled PDB", "pdb", pdb.Name, "operation", op)
+	return nil
+}
+
+// leasePodPDB creates or updates the Pod's PDB with a lease for the subject.
+func (r *WorkloadClassReconciler) leasePodPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
+	pdb := utils.PDBBase(pod)
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		if err := r.claimPDB(wc, pdb); err != nil {
+			return err
+		}
+		return utils.PDBWithLease(pdb, pod, subject)
+	}); err != nil {
+		return fmt.Errorf("failed to lease PDB %s: %w", pdb.Name, err)
+	}
 	return nil
 }
 
@@ -855,7 +935,7 @@ func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
 		Watches(
 			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
@@ -888,9 +968,14 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForPod),
 			builder.WithPredicates(podPredicate()),
-		).
-		Named("workloadclass").
-		Complete(r)
+		)
+
+	if r.LeaseTracker != nil {
+		// Apply lease requests from the disruption webhook.
+		b = b.WatchesRawSource(source.Channel(r.LeaseTracker.Events(), &handler.EnqueueRequestForObject{}))
+	}
+
+	return b.Named("workloadclass").Complete(r)
 }
 
 // findWorkloadClassesInObjectNamespace enqueues every WorkloadClass in the object's namespace.

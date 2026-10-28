@@ -677,3 +677,39 @@ func TestIsPDBOpen(t *testing.T) {
 		})
 	}
 }
+
+func TestLeaseTimeRemaining(t *testing.T) {
+	withExpiration := func(value string) *policyv1.PodDisruptionBudget {
+		return &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{BypassExpiration: value}}}
+	}
+
+	tests := []struct {
+		name    string
+		pdb     *policyv1.PodDisruptionBudget
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{name: "nil_pdb", pdb: nil},
+		{name: "no_annotations", pdb: &policyv1.PodDisruptionBudget{}},
+		{name: "unparseable_expiration", pdb: withExpiration("not-a-time")},
+		{name: "expired", pdb: withExpiration(time.Now().Add(-time.Minute).Format(ExpirationFormat))},
+		{
+			name:    "active",
+			pdb:     withExpiration(time.Now().Add(time.Minute).Format(ExpirationFormat)),
+			wantMin: 50 * time.Second,
+			wantMax: time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := LeaseTimeRemaining(tt.pdb)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("LeaseTimeRemaining() = %v, want in [%v, %v]", got, tt.wantMin, tt.wantMax)
+			}
+			if wantExpired := tt.wantMax == 0; LeaseExpired(tt.pdb) != wantExpired {
+				t.Errorf("LeaseExpired() = %v, want %v", LeaseExpired(tt.pdb), wantExpired)
+			}
+		})
+	}
+}
