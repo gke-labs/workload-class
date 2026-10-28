@@ -276,6 +276,11 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			wantErr:    true,
 		},
 		{
+			name:       "namespace_not_found",
+			desc:       "Namespace not found, expect nil best match and no error",
+			getNSError: apierrors.NewNotFound(schema.GroupResource{Resource: "namespaces"}, namespace),
+		},
+		{
 			name:        "no_default_class_with_namespace",
 			desc:        "Namespace does not have a default WC, expect nil best match",
 			getNSResult: nsNoDefault,
@@ -308,7 +313,6 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 		},
 	}
 
-	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			wcResult := tc.getWCResult
@@ -316,7 +320,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 				wcResult = wc
 			}
 			c := createTestClient(tc.getNSError, tc.getWCError, nil, tc.getNSResult, wcResult, nil)
-			gotWC, err := NamespaceDefaultWorkloadClass(ctx, c, namespace)
+			gotWC, err := NamespaceDefaultWorkloadClass(t.Context(), c, namespace)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("NamespaceDefaultWorkloadClass() error = %v, wantErr: %v", err, tc.wantErr)
 			}
@@ -404,6 +408,16 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			listWCResult: &workloadsv1.WorkloadClassList{},
 			getNSResult:  nsNoDefault,
 			wantErr:      true,
+		},
+		{
+			name: "error_getting_namespace_default",
+			desc: "Error getting namespace default WorkloadClass, expect nil result and error without falling back to selector match",
+			listWCResult: &workloadsv1.WorkloadClassList{
+				Items: []workloadsv1.WorkloadClass{wc},
+			},
+			getNSResult: nsWithDefault,
+			getWCError:  fmt.Errorf("error getting WorkloadClass"),
+			wantErr:     true,
 		},
 		{
 			name: "success_getting_namespace_default",
@@ -660,6 +674,17 @@ func TestWorkloadClassPodSelector(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("error_getting_namespace_returns_error", func(t *testing.T) {
+		wc := &workloadsv1.WorkloadClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "team-a"},
+			Spec:       workloadsv1.WorkloadClassSpec{PodSelector: batchSelector},
+		}
+		c := createTestClient(fmt.Errorf("transient apiserver error"), nil, nil, nil, nil, nil)
+		if _, err := WorkloadClassPodSelector(t.Context(), c, wc); err == nil {
+			t.Fatal("WorkloadClassPodSelector() error = nil, want error when getting Namespace fails")
+		}
+	})
 }
 
 func TestBestMatchWorkloadClassForPod(t *testing.T) {

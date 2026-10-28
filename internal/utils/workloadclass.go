@@ -47,7 +47,11 @@ func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder e
 	}
 
 	// Use the namespace's default workload class if it exists
-	if bestMatch, err := NamespaceDefaultWorkloadClass(ctx, c, pod.Namespace); err == nil && bestMatch != nil {
+	bestMatch, err = NamespaceDefaultWorkloadClass(ctx, c, pod.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	if bestMatch != nil {
 		return bestMatch, nil
 	}
 
@@ -167,7 +171,11 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 // WorkloadClass should still filter the results through FindBestMatchWorkloadClass.
 func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workloadsv1.WorkloadClass) (labels.Selector, error) {
 	ns := &corev1.Namespace{}
-	if err := c.Get(ctx, client.ObjectKey{Name: wc.Namespace}, ns); err == nil && ns.Labels[workloadsv1.DefaultClassLabel] == wc.Name {
+	if err := c.Get(ctx, client.ObjectKey{Name: wc.Namespace}, ns); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
+		}
+	} else if ns.Labels[workloadsv1.DefaultClassLabel] == wc.Name {
 		return labels.Everything(), nil
 	}
 	if wc.Spec.PodSelector == nil {
@@ -183,11 +191,14 @@ func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workload
 // NamespaceDefaultWorkloadClass returns the active default WorkloadClass configured on the given Namespace
 // via the "workloads.gke.io/default-class" label.
 //
-// It returns (nil, nil) if the Namespace has no default-class label, if the referenced WorkloadClass
-// does not exist, or if the referenced WorkloadClass is currently being deleted.
+// It returns (nil, nil) if the Namespace does not exist, has no default-class label, if the referenced
+// WorkloadClass does not exist, or if the referenced WorkloadClass is currently being deleted.
 func NamespaceDefaultWorkloadClass(ctx context.Context, c client.Client, namespace string) (*workloadsv1.WorkloadClass, error) {
 	ns := &corev1.Namespace{}
 	if err := c.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("error getting Namespace %s: %w", namespace, err)
 	}
 
