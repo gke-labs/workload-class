@@ -450,6 +450,21 @@ var _ = Describe("Per-Pod PodDisruptionBudgets", Ordered, func() {
 		applyPPDeployment(ppApp, ppReplicas)
 		expectPerPodPDBs(ppApp, ppWC, ppClosed, ppReplicas)
 		expectNoStalePDBs()
+
+		By("completing a one-shot Pod and verifying its Per-Pod PDB is cleaned up")
+		jobPod := createExistingPod(newPlacementPod(ppApp, inNamespace(ppNS), asPendingOnDemandPod()))
+		DeferCleanup(func() { forceDeletePod(ppNS, jobPod.Name) })
+		Eventually(func(g Gomega) {
+			pdbs, err := ppPDBs()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(pdbs).To(HaveKey(ppPDBPrefix + jobPod.Name))
+		}).Should(Succeed())
+
+		_, err = kubectlJSON(nil, "patch", "pod", jobPod.Name, "-n", ppNS,
+			"--subresource=status", "--type=merge", "-p", `{"status":{"phase":"Succeeded"}}`)
+		Expect(err).NotTo(HaveOccurred())
+		expectNoStalePDBs()
+		forceDeletePod(ppNS, jobPod.Name)
 	})
 
 	It("defers to a user-created PDB that covers the Pods, and reclaims them when it is removed", func() {
