@@ -24,7 +24,9 @@ webhooks:
       values:
       - kube-system
       - cert-manager
-      - workload-class-system
+      {{- if not (has .Release.Namespace (list "kube-system" "cert-manager")) }}
+      - {{ .Release.Namespace }}
+      {{- end }}
   rules:
   - apiGroups:
     - ""
