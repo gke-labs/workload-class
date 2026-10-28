@@ -1510,6 +1510,44 @@ func TestReconcilePDBs(t *testing.T) {
 			objects:   []client.Object{ns(""), newTestPod("web-1", webLabels)},
 			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
 		},
+		{
+			name:      "skips_terminal_pods_and_deletes_their_existing_pdbs",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: func() []client.Object {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				succeeded := newTestPod("job-succeeded", webLabels)
+				succeeded.Status.Phase = corev1.PodSucceeded
+				failed := newTestPod("job-failed", webLabels)
+				failed.Status.Phase = corev1.PodFailed
+				return []client.Object{
+					ns(""),
+					succeeded,
+					failed,
+					newTestPod("web-active", webLabels),
+					newOwnedPDB(wc, succeeded, closed),
+					newOwnedPDB(wc, failed, closed),
+				}
+			}(),
+			wantPDBs: map[string]*wantPDB{
+				"workload-job-succeeded": nil,
+				"workload-job-failed":    nil,
+				"workload-web-active":    {owner: "web", maxUnavailable: "0"},
+			},
+		},
+		{
+			name:      "reconciles_and_retains_truncated_pdb_for_long_pod_name",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: func() []client.Object {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				longPod := newTestPod(strings.Repeat("a", 250), webLabels)
+				return []client.Object{ns(""), longPod, newOwnedPDB(wc, longPod, open)}
+			}(),
+			wantPDBs: map[string]*wantPDB{
+				utils.PDBName(strings.Repeat("a", 250)): {owner: "web", maxUnavailable: "0"},
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1553,10 +1591,9 @@ func TestReconcilePDBs(t *testing.T) {
 				}
 
 				// The PDB must select exactly its Pod, and the Pod must carry the matching label.
-				podName := utils.PodNameFromPDBName(name)
-				pod := &corev1.Pod{}
-				if err := c.Get(t.Context(), client.ObjectKey{Name: podName, Namespace: "default"}, pod); err != nil {
-					t.Fatalf("Pod %s: %v", podName, err)
+				pod, err := r.getPodForPDB(t.Context(), "default", pdb)
+				if err != nil || pod == nil {
+					t.Fatalf("getPodForPDB(%s): pod=%v, err=%v", name, pod, err)
 				}
 				wantSelector := &metav1.LabelSelector{MatchLabels: map[string]string{utils.PodUIDLabel: string(pod.UID)}}
 				if !reflect.DeepEqual(pdb.Spec.Selector, wantSelector) {
@@ -1565,7 +1602,7 @@ func TestReconcilePDBs(t *testing.T) {
 				// Only a valid WorkloadClass labels the Pods it governs.
 				governs := want.owner == tc.wc.Name && !want.leftForAdoption && tc.condition.Reason == workloadsv1.ReasonValidationPassed
 				if governs && pod.Labels[utils.PodUIDLabel] != string(pod.UID) {
-					t.Errorf("Pod %s: %s label = %q, want %q", podName, utils.PodUIDLabel, pod.Labels[utils.PodUIDLabel], pod.UID)
+					t.Errorf("Pod %s: %s label = %q, want %q", pod.Name, utils.PodUIDLabel, pod.Labels[utils.PodUIDLabel], pod.UID)
 				}
 			}
 		})
@@ -1582,6 +1619,10 @@ func TestPodPredicate(t *testing.T) {
 	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 	statusOnly := labeled.DeepCopy()
 	statusOnly.Status.Phase = corev1.PodRunning
+	succeeded := statusOnly.DeepCopy()
+	succeeded.Status.Phase = corev1.PodSucceeded
+	failed := statusOnly.DeepCopy()
+	failed.Status.Phase = corev1.PodFailed
 
 	testCases := []struct {
 		name     string
@@ -1592,6 +1633,8 @@ func TestPodPredicate(t *testing.T) {
 		{name: "status_only_change_is_ignored", old: labeled, new: statusOnly, want: false},
 		{name: "label_change_triggers", old: labeled, new: relabeled, want: true},
 		{name: "terminating_triggers", old: labeled, new: terminating, want: true},
+		{name: "succeeded_phase_triggers", old: statusOnly, new: succeeded, want: true},
+		{name: "failed_phase_triggers", old: statusOnly, new: failed, want: true},
 		{name: "pod_uid_label_removed_triggers", old: labeled, new: pod, want: true},
 	}
 
@@ -1605,6 +1648,70 @@ func TestPodPredicate(t *testing.T) {
 	}
 	if !p.Create(event.CreateEvent{Object: pod}) || !p.Delete(event.DeleteEvent{Object: pod}) {
 		t.Error("podPredicate() should pass Create and Delete events")
+	}
+}
+
+func TestCalculateReadinessBestMatchAndTerminalPods(t *testing.T) {
+	now := metav1.Now()
+	oldPodTime := metav1.NewTime(now.Add(-10 * 24 * time.Hour))
+	youngPodTime := metav1.NewTime(now.Add(-1 * time.Hour))
+	today := time.Now().UTC().Weekday().String()
+
+	generalWC := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-general",
+			Namespace:         "default",
+			CreationTimestamp: oldPodTime,
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				MaxNonDisruptionDurationDays: 30,
+				MinInitialRunDurationDays:    7,
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "Today", DaysOfWeek: []string{today}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+				},
+			},
+		},
+	}
+	canaryWC := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wc-canary",
+			Namespace:         "default",
+			CreationTimestamp: oldPodTime,
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web", "track": "canary"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				MaxNonDisruptionDurationDays: 30,
+				MinInitialRunDurationDays:    0,
+			},
+		},
+	}
+
+	stablePod := newTestPod("web-stable", map[string]string{"app": "web"})
+	stablePod.CreationTimestamp = oldPodTime
+
+	youngCanaryPod := newTestPod("web-canary", map[string]string{"app": "web", "track": "canary"})
+	youngCanaryPod.CreationTimestamp = youngPodTime
+
+	youngSucceededPod := newTestPod("web-job-done", map[string]string{"app": "web"})
+	youngSucceededPod.CreationTimestamp = youngPodTime
+	youngSucceededPod.Status.Phase = corev1.PodSucceeded
+
+	scheme := newTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+		generalWC, canaryWC, stablePod, youngCanaryPod, youngSucceededPod,
+	).Build()
+	r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
+
+	readiness, _, err := r.calculateReadiness(t.Context(), generalWC)
+	if err != nil {
+		t.Fatalf("calculateReadiness() unexpected error: %v", err)
+	}
+	if readiness != workloadsv1.ReadinessReady {
+		t.Errorf("calculateReadiness() = %v, want %v (young canary and succeeded Pods should not block generalWC)", readiness, workloadsv1.ReadinessReady)
 	}
 }
 

@@ -147,9 +147,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // most specific matching WorkloadClass) and the Pod is not already covered by a user-created PDB.
 //
 //   - If the WorkloadClass is invalid, its existing PDBs are opened (MaxUnavailable = 100%) rather than deleted.
-//   - Owned PDBs whose Pod no longer exists, is terminating, is covered by a user-created PDB, or is no longer
-//     governed by any valid WorkloadClass are deleted. PDBs of Pods governed by another WorkloadClass are left
-//     for that WorkloadClass to adopt.
+//   - Owned PDBs whose Pod no longer exists, is terminating or in a terminal phase, is covered by a user-created PDB,
+//     or is no longer governed by any valid WorkloadClass are deleted. PDBs of Pods governed by another WorkloadClass
+//     are left for that WorkloadClass to adopt.
 func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition) error {
 	log := logf.FromContext(ctx)
 
@@ -193,25 +193,24 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 	}
 
 	var errs []error
-	governedNames := make(map[string]bool, len(governed))
+	governedPDBs := make(map[string]bool, len(governed))
 	for _, pod := range governed {
-		governedNames[pod.Name] = true
+		governedPDBs[utils.PDBName(pod.Name)] = true
 		errs = append(errs, r.reconcilePodPDB(ctx, wc, pod))
 	}
 
 	for i := range owned {
 		pdb := &owned[i]
-		podName := utils.PodNameFromPDBName(pdb.Name)
-		if governedNames[podName] {
+		if governedPDBs[pdb.Name] {
 			continue
 		}
 
-		pod, err := r.getPod(ctx, wc.Namespace, podName)
+		pod, err := r.getPodForPDB(ctx, wc.Namespace, pdb)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if pod != nil && pod.DeletionTimestamp.IsZero() && !utils.IsPodCoveredByUserPDB(pod, userPDBs) {
+		if utils.IsPodActive(pod) && !utils.IsPodCoveredByUserPDB(pod, userPDBs) {
 			if bestMatch := utils.BestMatchWorkloadClassForPod(pod, defaultWC, wcs.Items); bestMatch != nil && bestMatch.Name != wc.Name && passedValidation(bestMatch) {
 				// Another WorkloadClass governs the Pod now and will adopt its PDB.
 				continue
@@ -251,7 +250,7 @@ func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc, defaultW
 	var governed []*corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !pod.DeletionTimestamp.IsZero() || utils.IsPodCoveredByUserPDB(pod, userPDBs) {
+		if !utils.IsPodActive(pod) || utils.IsPodCoveredByUserPDB(pod, userPDBs) {
 			continue
 		}
 		if bestMatch := utils.BestMatchWorkloadClassForPod(pod, defaultWC, wcs); bestMatch == nil || bestMatch.Name != wc.Name {
@@ -271,17 +270,17 @@ func (r *WorkloadClassReconciler) reconcilePodPDB(ctx context.Context, wc *workl
 }
 
 // openOwnedPDBs opens the PDBs owned by an invalid WorkloadClass, and deletes those whose Pod no longer exists,
-// is terminating, or is covered by a user-created PDB.
+// is terminating or in a terminal phase, or is covered by a user-created PDB.
 func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, owned, userPDBs []policyv1.PodDisruptionBudget) error {
 	var errs []error
 	for i := range owned {
 		pdb := &owned[i]
-		pod, err := r.getPod(ctx, wc.Namespace, utils.PodNameFromPDBName(pdb.Name))
+		pod, err := r.getPodForPDB(ctx, wc.Namespace, pdb)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if pod == nil || !pod.DeletionTimestamp.IsZero() || utils.IsPodCoveredByUserPDB(pod, userPDBs) {
+		if !utils.IsPodActive(pod) || utils.IsPodCoveredByUserPDB(pod, userPDBs) {
 			errs = append(errs, r.deletePDB(ctx, wc, pdb))
 			continue
 		}
@@ -373,6 +372,26 @@ func (r *WorkloadClassReconciler) getPod(ctx context.Context, namespace, name st
 	return pod, nil
 }
 
+// getPodForPDB returns the Pod targeted by a WorkloadClass-managed Per-Pod PDB, or nil if it does not exist.
+// For PDB names that were truncated to MaxPDBNameLength, it falls back to matching Pods in the namespace by
+// utils.PDBName(pod.Name) if the direct lookup by stripped prefix finds no Pod.
+func (r *WorkloadClassReconciler) getPodForPDB(ctx context.Context, namespace string, pdb *policyv1.PodDisruptionBudget) (*corev1.Pod, error) {
+	pod, err := r.getPod(ctx, namespace, utils.PodNameFromPDBName(pdb.Name))
+	if err != nil || pod != nil || len(pdb.Name) < utils.MaxPDBNameLength {
+		return pod, err
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list Pods in namespace %s: %w", namespace, err)
+	}
+	for i := range pods.Items {
+		if utils.PDBName(pods.Items[i].Name) == pdb.Name {
+			return &pods.Items[i], nil
+		}
+	}
+	return nil, nil
+}
+
 // passedValidation returns true if the WorkloadClass' status shows it passed guardrail validation.
 func passedValidation(wc *workloadsv1.WorkloadClass) bool {
 	cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
@@ -409,11 +428,33 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		return workloadsv1.ReadinessNotReady, 0, err
 	}
+	defaultWC, err := utils.NamespaceDefaultWorkloadClass(ctx, r.Client, wc.Namespace)
+	if err != nil {
+		return workloadsv1.ReadinessNotReady, 0, err
+	}
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+		return workloadsv1.ReadinessNotReady, 0, err
+	}
+
+	var matchedPods []corev1.Pod
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if bestMatch := utils.BestMatchWorkloadClassForPod(&pod, defaultWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
+			continue
+		}
+		matchedPods = append(matchedPods, pod)
+	}
 
 	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDuration)
 	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
 		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
-		for _, pod := range pods.Items {
+		for _, pod := range matchedPods {
+			if !utils.IsPodActive(&pod) {
+				continue
+			}
 			if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
 				// Pod hasn't run long enough
 				return workloadsv1.ReadinessNotReady, minRunDuration - now.Sub(pod.CreationTimestamp.Time), nil
@@ -425,7 +466,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	if wc.Spec.DisruptionPolicy.GraceTerminationDuration > 0 {
 		gracePeriodsPassed := true
 		maxTimeForGracePeriod := 0 * time.Second
-		for _, pod := range pods.Items {
+		for _, pod := range matchedPods {
 			// Check the grace period has passed for this pod. We want all grace periods to have passed.
 			gracePeriodsPassed, maxTimeForGracePeriod = evaluatePodGracePeriod(wc, &pod, now, gracePeriodsPassed, maxTimeForGracePeriod)
 		}
@@ -905,8 +946,8 @@ func (r *WorkloadClassReconciler) findWorkloadClassesForPod(ctx context.Context,
 	return requests
 }
 
-// podPredicate passes Pod creation and deletion, Pods starting to terminate, and Pod label changes. It ignores the
-// controller's own update that sets the workloads.gke.io/pod-uid label.
+// podPredicate passes Pod creation and deletion, Pods starting to terminate or reaching a terminal phase,
+// and Pod label changes. It ignores the controller's own update that sets the workloads.gke.io/pod-uid label.
 func podPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return true },
@@ -918,7 +959,7 @@ func podPredicate() predicate.Funcs {
 			if !okOld || !okNew {
 				return false
 			}
-			if oldPod.DeletionTimestamp.IsZero() != newPod.DeletionTimestamp.IsZero() {
+			if utils.IsPodActive(oldPod) != utils.IsPodActive(newPod) {
 				return true
 			}
 			if newPod.Labels[utils.PodUIDLabel] != string(newPod.UID) && oldPod.Labels[utils.PodUIDLabel] == string(oldPod.UID) {
