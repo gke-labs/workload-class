@@ -43,6 +43,7 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/controller"
+	"github.com/gke-labs/workload-class/internal/utils"
 	internalwebhook "github.com/gke-labs/workload-class/internal/webhook"
 	webhookv1 "github.com/gke-labs/workload-class/internal/webhook/v1"
 	// +kubebuilder:scaffold:imports
@@ -196,10 +197,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The disruption webhook queues Per-Pod PDB lease requests for subjects allowed to disrupt outside of a
+	// disruption window, and the WorkloadClass controller applies them. Both run in this process, so they share
+	// an in-memory tracker. This requires the webhook and the controller to run in the same replica: with
+	// multiple replicas, requests received by a non-leader replica would never be applied.
+	leaseTracker := utils.NewPendingLeaseTracker(utils.DefaultPendingLeaseBufferSize)
+
 	if err := (&controller.WorkloadClassReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("workloadclass-controller"),
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Recorder:     mgr.GetEventRecorder("workloadclass-controller"),
+		LeaseTracker: leaseTracker,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadClass")
 		os.Exit(1)
@@ -215,8 +223,9 @@ func main() {
 	setupLog.Info("Registering disruption webhook")
 	mgr.GetWebhookServer().Register("/validate-disruption", &admission.Webhook{
 		Handler: &internalwebhook.DisruptionWebhook{
-			Client:   mgr.GetClient(),
-			Recorder: mgr.GetEventRecorder("disruption-webhoook"),
+			Client:       mgr.GetClient(),
+			Recorder:     mgr.GetEventRecorder("disruption-webhoook"),
+			LeaseTracker: leaseTracker,
 		},
 	})
 

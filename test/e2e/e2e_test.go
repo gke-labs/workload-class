@@ -262,7 +262,8 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(string(out)).To(ContainSubstring("Eviction blocked"), "Expected webhook to deny the request")
 		})
 
-		It("should allow eviction of a pod outside of the window if requested by an allowed user (currently blocked due to PDB work)", func() {
+		It("should allow eviction of a pod outside of the window if requested by an allowed user", func() {
+			const autoscaler = "system:serviceaccount:kube-system:cluster-autoscaler"
 			notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
 
 			By("Patching the WorkloadClass to simulate being outside a disruption window AND allowing cluster-autoscaler")
@@ -280,30 +281,54 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			By("Setting up RBAC so the impersonated autoscaler has permission to call the eviction API")
 			rbacCmd := exec.Command("kubectl", "create", "clusterrolebinding", "test-autoscaler-admin",
 				"--clusterrole=cluster-admin",
-				"--user=system:serviceaccount:kube-system:cluster-autoscaler")
+				"--user="+autoscaler)
 			_ = rbacCmd.Run() // Ignore error in case the binding already exists from previous runs
 
-			By("Attempting to evict the Pod via the eviction subresource as the cluster autoscaler")
+			By("Fetching the dynamically generated pod name")
 			nameCmd := exec.Command("kubectl", "get", "pods", "-n", "sample", "-l", "role=batch-processor", "-o", "jsonpath={.items[0].metadata.name}")
 			podNameOutput, err := utils.Run(nameCmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to fetch dynamic pod name")
 			podName := strings.TrimSpace(podNameOutput)
+			pdbName := "workload-" + podName
+
+			pdbField := func(jsonPath string) func() (string, error) {
+				return func() (string, error) {
+					cmd := exec.Command("kubectl", "get", "pdb", pdbName, "-n", "sample", "-o", "jsonpath="+jsonPath)
+					out, err := utils.Run(cmd)
+					return strings.TrimSpace(out), err
+				}
+			}
+
+			By("Waiting for the Pod's PDB to close outside of the disruption window")
+			Eventually(pdbField("{.spec.maxUnavailable}")).Should(Equal("0"))
+			Eventually(pdbField("{.status.disruptionsAllowed}")).Should(Equal("0"))
 
 			evictionURL := fmt.Sprintf("/api/v1/namespaces/sample/pods/%s/eviction", podName)
 			evictionJSON := fmt.Sprintf(`{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"sample"}}`, podName)
 			evictionFile := filepath.Join("/tmp", "eviction.json")
 			err = os.WriteFile(evictionFile, []byte(evictionJSON), 0644)
 			Expect(err).NotTo(HaveOccurred())
+			evictAsAutoscaler := func() (string, error) {
+				// Append the --as flag to impersonate the autoscaler for the raw API request
+				cmd := exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as="+autoscaler)
+				return utils.Run(cmd)
+			}
 
-			// Append the --as flag to impersonate the autoscaler for the raw API request
-			cmd = exec.Command("kubectl", "create", "--raw", evictionURL, "-f", evictionFile, "--as=system:serviceaccount:kube-system:cluster-autoscaler")
-			out, err := utils.Run(cmd)
+			// The webhook admits the eviction and requests a lease, but the PDB is still closed.
+			By("Evicting the Pod as the cluster autoscaler, which the closed PDB rejects")
+			out, err := evictAsAutoscaler()
+			Expect(err).To(HaveOccurred(), "The first eviction should be rejected by the closed PDB")
+			Expect(out).To(ContainSubstring("Cannot evict pod as it would violate the pod's disruption budget"))
 
-			// Because the cluster-autoscaler is in the allowedDisruptionsOutsideOfWindow list,
-			// the webhook should NOT block the request, and err should be nil.
-			// Expect(err).NotTo(HaveOccurred(), "Eviction should be permitted for the autoscaler despite being outside the window")
-			Expect(err).To(HaveOccurred(), "Eviction should be blocked by the PDB")
-			Expect(string(out)).To(ContainSubstring("Cannot evict pod as it would violate the pod's disruption budget"), "Eviction should be blocked by PDB")
+			By("Waiting for the controller to lease the Pod's PDB to the cluster autoscaler")
+			Eventually(pdbField(`{.metadata.annotations.workloads\.gke\.io/bypass-owner}`)).Should(Equal(autoscaler))
+			Expect(pdbField("{.spec.maxUnavailable}")()).To(Equal("100%"))
+
+			By("Retrying the eviction, which succeeds once the leased PDB allows it")
+			Eventually(func() error {
+				_, err := evictAsAutoscaler()
+				return err
+			}, time.Minute, 2*time.Second).Should(Succeed(), "The autoscaler should be able to evict outside of the window")
 		})
 	})
 })
