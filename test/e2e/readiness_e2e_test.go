@@ -170,7 +170,7 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Patching the Guardrail to allow today")
-			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, currentDay)
+			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"daysOfWeek": ["%s"]}}}}`, currentDay)
 			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", patchGR)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
@@ -188,7 +188,7 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 		It("should evaluate MaintenanceReadiness to NotReady when outside disruption window", func() {
 			By("Updating the Guardrail and WorkloadClass to simulate being outside a disruption window")
 			notToday := time.Now().AddDate(0, 0, 1).Weekday().String()
-			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, notToday)
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"daysOfWeek": ["%s"]}}}}`, notToday)
 			workloadPatch := fmt.Sprintf(`{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "allowedDisruptionWindows": [{"name": "weekend-maintenance", "daysOfWeek": ["%s"], "startTime": "00:00", "endTime": "23:59", "timeZone": "Etc/UTC"}]}}}`, notToday)
 
 			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", workloadPatch)

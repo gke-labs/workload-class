@@ -40,7 +40,6 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
@@ -84,6 +83,17 @@ var _ = Describe("WorkloadClass Controller", func() {
 			fakeRecorder         *events.FakeRecorder
 		)
 
+		// restrictGuardrailDays limits the guardrail to Sunday-Tuesday. It is not part of the default guardrail,
+		// because a WorkloadClass that omits allowedDisruptionWindows allows disruption on every day and would
+		// then fail validation.
+		restrictGuardrailDays := func() {
+			GinkgoHelper()
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Disruption.DaysOfWeek = []string{"Sunday", "Monday", "Tuesday"}
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+		}
+
 		BeforeEach(func() {
 			fakeRecorder = events.NewFakeRecorder(100)
 			controllerReconciler = &WorkloadClassReconciler{
@@ -119,7 +129,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 					Constraints: workloadsv1.Constraints{
 						Disruption: workloadsv1.Disruption{
 							MaxAllowedWindows:            int32(2),
-							AllowedDisruptionDays:        []string{"Sunday", "Monday", "Tuesday"},
 							MaxNonDisruptionDurationDays: 3,
 						},
 					},
@@ -210,15 +219,17 @@ var _ = Describe("WorkloadClass Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "exceeds guardrail limit 2")
+							strings.Contains(cond.Message, "`allowedDisruptionWindows` must have at most 2 items (guardrail limit), got 3")
 					}
 				}
 				return false
 			}, "10s", "1s").Should(BeTrue())
 		})
 
-		It("should fail if DaysOfWeek is not a subset of AllowedDisruptionDays", func() {
-			By("updating WorkloadClass with DisruptionWindow outside of AllowedDisruptionDays")
+		It("should fail if the window DaysOfWeek is not a subset of the guardrail DaysOfWeek", func() {
+			restrictGuardrailDays()
+
+			By("updating WorkloadClass with DisruptionWindow outside of DaysOfWeek")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
@@ -243,7 +254,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "contains day(s) of week that are not allowed by guardrail.")
+							strings.Contains(cond.Message, "must contain only 'Sunday', 'Monday', 'Tuesday' (guardrail limit)")
 					}
 				}
 				return false
@@ -251,7 +262,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 
 		It("should fail if timeZone is invalid", func() {
-			By("updating WorkloadClass with DisruptionWindow outside of AllowedDisruptionDays")
+			By("updating WorkloadClass with DisruptionWindow outside of DaysOfWeek")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
@@ -276,7 +287,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "has invalid time zone")
+							strings.Contains(cond.Message, "must be a valid IANA time zone name")
 					}
 				}
 				return false
@@ -311,7 +322,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "maxNonDisruptionDurationDays 4 exceeds guardrail limit")
+							strings.Contains(cond.Message, "`maxNonDisruptionDurationDays` must be between 1 and 3, inclusive (guardrail limit), got 4")
 					}
 				}
 				return false
@@ -319,6 +330,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 		// Calculate readiness
 		It("should be ready if EmergencyOverride is set", func() {
+			restrictGuardrailDays()
+
 			By("updating WorkloadClass with EmergencyOverride")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
@@ -349,7 +362,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "contains day(s) of week that are not allowed by guardrail.")
+							strings.Contains(cond.Message, "must contain only 'Sunday', 'Monday', 'Tuesday' (guardrail limit)")
 					}
 				}
 				return false
@@ -400,7 +413,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			guardrail := &workloadsv1.WorkloadClassGuardrail{}
 			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
 
-			guardrail.Spec.Constraints.Disruption.AllowedDisruptionDays = []string{notToday}
+			guardrail.Spec.Constraints.Disruption.DaysOfWeek = []string{notToday}
 			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
 
 			By("updating WorkloadClass with disruption window that is not today")
@@ -469,7 +482,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 				{Name: "Today", DaysOfWeek: []string{today}, TimeZone: "America/Los_Angeles", StartTime: "00:00", EndTime: "23:59"},
 			}
 			wc.Spec.DisruptionPolicy.MinInitialRunDurationDays = 4
-			wc.Spec.DisruptionPolicy.GraceTerminationDuration = 3600
+			wc.Spec.DisruptionPolicy.GraceTerminationDurationSeconds = 3600
 			wc.Spec.PodSelector = &metav1.LabelSelector{
 				MatchLabels: podLabels,
 			}
@@ -523,29 +536,29 @@ var _ = Describe("WorkloadClass Controller", func() {
 			}, "30s", "1s").Should(BeTrue())
 		})
 
-		It("should emit warning when another WorkloadClass has the same selector", func() {
-			By("Creating another WorkloadClass with the same selector")
-			wcSameName := "wc-same-selector"
-			wcSame := &workloadsv1.WorkloadClass{
+		It("should report SelectorOverlap when another WorkloadClass has an overlapping selector, and keep protecting its Pods", func() {
+			By("Creating another WorkloadClass with a more specific, overlapping selector")
+			overlapKey := types.NamespacedName{Name: "wc-overlapping-selector", Namespace: defaultNamespace}
+			wcOverlap := &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      wcSameName,
+					Name:      overlapKey.Name,
 					Namespace: defaultNamespace,
 				},
 				Spec: workloadsv1.WorkloadClassSpec{
 					PodSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"duck-duck": "goose"},
+						MatchLabels: map[string]string{"duck-duck": "goose", "tier": "web"},
 					},
 					DisruptionPolicy: workloadsv1.DisruptionPolicy{
 						MaxNonDisruptionDurationDays: 1,
 					},
 				},
 			}
-			Expect(k8sClient.Create(ctx, wcSame)).To(Succeed())
+			Expect(k8sClient.Create(ctx, wcOverlap)).To(Succeed())
 			defer func() {
-				_ = k8sClient.Delete(ctx, wcSame)
+				_ = k8sClient.Delete(ctx, wcOverlap)
 			}()
 
-			By("Updating the first WorkloadClass to match the selector")
+			By("Updating the first WorkloadClass to select the Pod")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.PodSelector = &metav1.LabelSelector{
@@ -553,14 +566,33 @@ var _ = Describe("WorkloadClass Controller", func() {
 			}
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 
-			By("Reconciling the first WorkloadClass")
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
+			By("Reconciling both WorkloadClasses")
+			for _, key := range []types.NamespacedName{typeNamespacedName, overlapKey} {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+			}
 
-			By("Verifying a warning event was emitted")
-			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring("ValidationFailed")))
+			By("Verifying both WorkloadClasses report SelectorOverlap")
+			for key, other := range map[types.NamespacedName]string{
+				typeNamespacedName: overlapKey.Name,
+				overlapKey:         workloadClassName,
+			} {
+				updated := &workloadsv1.WorkloadClass{}
+				Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+				cond := meta.FindStatusCondition(updated.Status.Conditions, workloadsv1.ConditionTypeValidated)
+				Expect(cond).NotTo(BeNil())
+				Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				Expect(cond.Reason).To(Equal(workloadsv1.ReasonSelectorOverlap))
+				Expect(cond.Message).To(Equal("`podSelector` must not select the same Pods as another WorkloadClass in the namespace, " +
+					"but it overlaps with the `podSelector` of '" + other + "'"))
+			}
+
+			By("Verifying the Pod's best-match WorkloadClass still creates its PDB")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: utils.PDBName(podName), Namespace: defaultNamespace}, pdb)
+			}, "10s", "1s").Should(Succeed())
+			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(workloadClassName))
 		})
 
 		// PDB Reconciliation Tests
@@ -630,7 +662,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			}, "10s", "1s").Should(Equal("100%"))
 		})
 
-		It("should hand the Pod's PDB over to the namespace default WorkloadClass", func() {
+		It("should hand the Pod's PDB over to the namespace's enforced WorkloadClass", func() {
 			selectPod()
 
 			By("First reconciling to ensure the PDB is created initially")
@@ -639,32 +671,32 @@ var _ = Describe("WorkloadClass Controller", func() {
 				return k8sClient.Get(ctx, podPDBKey, &policyv1.PodDisruptionBudget{})
 			}, "10s", "1s").Should(Succeed())
 
-			By("Creating another WorkloadClass and setting it as the namespace default")
+			By("Creating another WorkloadClass and setting it as the namespace's enforced WorkloadClass")
 			defaultWCKey := types.NamespacedName{Name: "some-other-class", Namespace: defaultNamespace}
-			defaultWC := &workloadsv1.WorkloadClass{
+			enforcedWC := &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: defaultWCKey.Name, Namespace: defaultNamespace},
 				Spec: workloadsv1.WorkloadClassSpec{
 					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
 				},
 			}
-			Expect(k8sClient.Create(ctx, defaultWC)).To(Succeed())
+			Expect(k8sClient.Create(ctx, enforcedWC)).To(Succeed())
 
 			ns := &corev1.Namespace{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)).To(Succeed())
 			if ns.Labels == nil {
 				ns.Labels = make(map[string]string)
 			}
-			ns.Labels[workloadsv1.DefaultClassLabel] = defaultWCKey.Name
+			ns.Labels[workloadsv1.EnforcedClassLabel] = defaultWCKey.Name
 			Expect(k8sClient.Update(ctx, ns)).To(Succeed())
 
 			defer func() {
-				_ = k8sClient.Delete(ctx, defaultWC)
+				_ = k8sClient.Delete(ctx, enforcedWC)
 				_ = k8sClient.Get(ctx, types.NamespacedName{Name: defaultNamespace}, ns)
-				delete(ns.Labels, workloadsv1.DefaultClassLabel)
+				delete(ns.Labels, workloadsv1.EnforcedClassLabel)
 				_ = k8sClient.Update(ctx, ns)
 			}()
 
-			By("Reconciling the namespace default WorkloadClass, which adopts the PDB")
+			By("Reconciling the namespace's enforced WorkloadClass, which adopts the PDB")
 			reconcileWC(defaultWCKey)
 			Eventually(func() (string, error) {
 				pdb := &policyv1.PodDisruptionBudget{}
@@ -974,7 +1006,7 @@ func TestGracePeriodPassed(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			wc.Spec.DisruptionPolicy.GraceTerminationDuration = tc.grace
+			wc.Spec.DisruptionPolicy.GraceTerminationDurationSeconds = tc.grace
 			pod.DeletionTimestamp = tc.delTimestamp
 			gotPassed, gotDuration := gracePeriodPassed(wc, pod, now)
 
@@ -1057,7 +1089,7 @@ func TestEvaluatePodGracePeriod(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			pod.DeletionTimestamp.Time = tc.deletionTimestamp
-			wc.Spec.DisruptionPolicy.GraceTerminationDuration = tc.wcGraceDuration
+			wc.Spec.DisruptionPolicy.GraceTerminationDurationSeconds = tc.wcGraceDuration
 
 			gotGracePeriodPassed, gotDuration := evaluatePodGracePeriod(wc, pod, now, tc.initialGracePeriodPassed, tc.initialDuration)
 
@@ -1067,193 +1099,6 @@ func TestEvaluatePodGracePeriod(t *testing.T) {
 
 			if gotDuration != tc.wantDuration {
 				t.Errorf("evaluatePodGracePeriod() returned an unexpected duration, got: %v, want: %v", gotDuration, tc.wantDuration)
-			}
-		})
-	}
-}
-
-func TestSameLabelSelectorSemantic(t *testing.T) {
-	testCases := []struct {
-		name string
-		a    *metav1.LabelSelector
-		b    *metav1.LabelSelector
-		want bool
-	}{
-		{
-			name: "both_nil",
-			a:    nil,
-			b:    nil,
-			want: true,
-		},
-		{
-			name: "one_nil",
-			a:    &metav1.LabelSelector{},
-			b:    nil,
-			want: false,
-		},
-		{
-			name: "same_match_labels",
-			a:    &metav1.LabelSelector{MatchLabels: map[string]string{"foo": "bar", "baz": "qux"}},
-			b:    &metav1.LabelSelector{MatchLabels: map[string]string{"baz": "qux", "foo": "bar"}},
-			want: true,
-		},
-		{
-			name: "different_match_labels",
-			a:    &metav1.LabelSelector{MatchLabels: map[string]string{"foo": "bar"}},
-			b:    &metav1.LabelSelector{MatchLabels: map[string]string{"foo": "baz"}},
-			want: false,
-		},
-		{
-			name: "same_expressions_different_order",
-			a: &metav1.LabelSelector{
-				MatchExpressions: []metav1.LabelSelectorRequirement{
-					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"bar", "baz"}},
-					{Key: "qux", Operator: metav1.LabelSelectorOpExists},
-				},
-			},
-			b: &metav1.LabelSelector{
-				MatchExpressions: []metav1.LabelSelectorRequirement{
-					{Key: "qux", Operator: metav1.LabelSelectorOpExists},
-					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"bar", "baz"}},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "same_expressions_different_values_order",
-			a: &metav1.LabelSelector{
-				MatchExpressions: []metav1.LabelSelectorRequirement{
-					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"bar", "baz"}},
-				},
-			},
-			b: &metav1.LabelSelector{
-				MatchExpressions: []metav1.LabelSelectorRequirement{
-					{Key: "foo", Operator: metav1.LabelSelectorOpIn, Values: []string{"baz", "bar"}},
-				},
-			},
-			want: true,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sameLabelSelectorSemantic(tc.a, tc.b); got != tc.want {
-				t.Errorf("sameLabelSelectorSemantic() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestValidateSelectors(t *testing.T) {
-	scheme := runtime.NewScheme()
-	utilruntime.Must(workloadsv1.AddToScheme(scheme))
-	ns := "test-namespace"
-	wcCurrent := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "wc-current",
-			Namespace:         ns,
-			CreationTimestamp: metav1.Time{Time: time.Now()},
-		},
-		Spec: workloadsv1.WorkloadClassSpec{
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": "nginx"},
-			},
-		},
-	}
-	wcOverlapping := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "wc-same",
-			Namespace: ns,
-		},
-		Spec: workloadsv1.WorkloadClassSpec{
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": "nginx"},
-			},
-		},
-	}
-	testCases := []struct {
-		name            string
-		existing        []client.Object
-		wantOverlapping []workloadsv1.WorkloadClass
-		wantErrSuffix   string
-	}{
-		{
-			name:          "no_other_workload_classes",
-			existing:      []client.Object{wcCurrent},
-			wantErrSuffix: "",
-		},
-		{
-			name: "other_different_selector",
-			existing: []client.Object{
-				wcCurrent,
-				&workloadsv1.WorkloadClass{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "wc-different",
-						Namespace: ns,
-					},
-					Spec: workloadsv1.WorkloadClassSpec{
-						PodSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{"app": "redis"},
-						},
-					},
-				},
-			},
-			wantErrSuffix: "",
-		},
-		{
-			name:            "other_same_selector",
-			existing:        []client.Object{wcCurrent, wcOverlapping},
-			wantOverlapping: []workloadsv1.WorkloadClass{*wcOverlapping},
-			wantErrSuffix:   "the following WorkloadClasses have the same PodSelector as wc-current: wc-same",
-		},
-		{
-			name: "same_selector_different_namespace",
-			existing: []client.Object{
-				wcCurrent,
-				&workloadsv1.WorkloadClass{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "wc-same-other-ns",
-						Namespace: "another-namespace",
-					},
-					Spec: workloadsv1.WorkloadClassSpec{
-						PodSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{"app": "nginx"},
-						},
-					},
-				},
-			},
-			wantErrSuffix: "",
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.existing...).Build()
-			r := &WorkloadClassReconciler{
-				Client: fakeClient,
-				Scheme: scheme,
-			}
-			overlaps, err := r.validateSelectors(context.Background(), wcCurrent)
-			if tc.wantErrSuffix == "" {
-				if err != nil {
-					t.Fatalf("expected no error, got: %v", err)
-				}
-			} else {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				if !strings.Contains(err.Error(), tc.wantErrSuffix) {
-					t.Fatalf("expected error containing suffix %q, got: %v", tc.wantErrSuffix, err)
-				}
-			}
-			if (overlaps != nil) != (tc.wantOverlapping != nil) {
-				t.Fatalf("validateSelectors returned unexpected workloadClasses, want: %v, got: %v", tc.wantOverlapping, overlaps)
-			}
-
-			if overlaps == nil {
-				return
-			}
-
-			if overlaps[0].Name != tc.wantOverlapping[0].Name {
-				t.Fatalf("validateSelectors returned unexpected workloadClasses, want: %v, got: %v", tc.wantOverlapping, overlaps)
 			}
 		})
 	}
@@ -1341,10 +1186,10 @@ func TestReconcilePDBs(t *testing.T) {
 	webLabels := map[string]string{"app": "web"}
 	subject := workloadsv1.Subject{Kind: "ServiceAccount", Name: "cluster-autoscaler", Namespace: "kube-system"}
 
-	ns := func(defaultClass string) *corev1.Namespace {
+	ns := func(enforcedClass string) *corev1.Namespace {
 		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
-		if defaultClass != "" {
-			n.Labels = map[string]string{workloadsv1.DefaultClassLabel: defaultClass}
+		if enforcedClass != "" {
+			n.Labels = map[string]string{workloadsv1.EnforcedClassLabel: enforcedClass}
 		}
 		return n
 	}
@@ -1635,7 +1480,7 @@ func TestReconcilePDBs(t *testing.T) {
 			tracker := utils.NewPendingLeaseTracker(16)
 			r := &WorkloadClassReconciler{Client: c, Scheme: scheme, LeaseTracker: tracker}
 
-			requeue, err := r.reconcilePDBs(t.Context(), tc.wc, tc.condition, tc.leases)
+			requeue, err := r.reconcilePDBs(t.Context(), tc.wc, tc.condition, true, tc.leases)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("reconcilePDBs() error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -1807,16 +1652,16 @@ func TestCalculateReadinessBestMatchAndTerminalPods(t *testing.T) {
 	}
 }
 
-func TestNamespaceDefaultClassPredicate(t *testing.T) {
+func TestNamespaceEnforcedClassPredicate(t *testing.T) {
 	withDefault := func(value string) *corev1.Namespace {
 		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: map[string]string{"other": "label"}}}
 		if value != "" {
-			n.Labels[workloadsv1.DefaultClassLabel] = value
+			n.Labels[workloadsv1.EnforcedClassLabel] = value
 		}
 		return n
 	}
 
-	p := namespaceDefaultClassPredicate()
+	p := namespaceEnforcedClassPredicate()
 	testCases := []struct {
 		name     string
 		old, new *corev1.Namespace
@@ -1830,12 +1675,12 @@ func TestNamespaceDefaultClassPredicate(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := p.Update(event.UpdateEvent{ObjectOld: tc.old, ObjectNew: tc.new}); got != tc.want {
-				t.Errorf("namespaceDefaultClassPredicate().Update() = %v, want %v", got, tc.want)
+				t.Errorf("namespaceEnforcedClassPredicate().Update() = %v, want %v", got, tc.want)
 			}
 		})
 	}
 	if !p.Create(event.CreateEvent{Object: withDefault("wc")}) || p.Create(event.CreateEvent{Object: withDefault("")}) {
-		t.Error("namespaceDefaultClassPredicate().Create() should pass only Namespaces with a default class")
+		t.Error("namespaceEnforcedClassPredicate().Create() should pass only Namespaces with an enforced class")
 	}
 }
 

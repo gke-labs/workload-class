@@ -62,8 +62,8 @@ func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ct
 func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) metav1.Condition {
 	log := logf.FromContext(ctx)
 	var violations []string
-	if err := utils.WeekdaysValid(g.Spec.Constraints.Disruption.AllowedDisruptionDays); err != nil {
-		log.Error(err, "validation of AllowedDisruptionDays failed")
+	if err := utils.WeekdaysValid(g.Spec.Constraints.Disruption.DaysOfWeek); err != nil {
+		log.Error(err, "validation of DaysOfWeek failed")
 		violations = append(violations, err.Error())
 	}
 

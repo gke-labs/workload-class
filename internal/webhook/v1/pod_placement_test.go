@@ -232,12 +232,12 @@ var _ = Describe("Pod placement helpers", func() {
 			Expect(total).To(Equal(3))
 		})
 
-		It("counts every Pod in the namespace for the namespace-default WorkloadClass, regardless of its PodSelector", func() {
+		It("counts every Pod in the namespace for the namespace-enforced WorkloadClass, regardless of its PodSelector", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
 			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
-				Name: testNamespace, Labels: map[string]string{"workloads.gke.io/default-class": testWLCName},
+				Name: testNamespace, Labels: map[string]string{"workloads.gke.io/enforced-class": testWLCName},
 			}}
-			// Not matched by the WorkloadClass's app=batch selector, but it belongs to the namespace default.
+			// Not matched by the WorkloadClass's app=batch selector, but it belongs to the namespace's enforced WorkloadClass.
 			unlabeled := newExistingPod("other", "spot-node", true)
 			unlabeled.Labels = map[string]string{"app": "other"}
 

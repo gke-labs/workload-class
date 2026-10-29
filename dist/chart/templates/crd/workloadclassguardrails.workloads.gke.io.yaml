@@ -51,9 +51,9 @@ spec:
                     description: Disruption defines the constraints within which WorkloadClasses
                       can set disruption policies.
                     properties:
-                      allowedDisruptionDays:
-                        description: AllowedDisruptionDays specifies days on which
-                          disruption can happen (Monday-Sunday).
+                      daysOfWeek:
+                        description: DaysOfWeek specifies days on which disruption
+                          can happen (Monday-Sunday).
                         items:
                           type: string
                         type: array

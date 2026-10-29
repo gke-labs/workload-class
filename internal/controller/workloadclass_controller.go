@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -32,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -83,12 +86,21 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 1.1 Fetch Guardrails and validate
-	validationCond, err := r.validateAgainstGuardrails(ctx, wc)
-	if err != nil {
-		log.Error(err, "Failed to validate against guardrails")
+	// 1.1 Fetch Guardrails and the other WorkloadClasses whose PodSelector overlaps, and validate
+	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
+	if err := r.List(ctx, guardrails); err != nil {
+		log.Error(err, "Failed to list WorkloadClassGuardrails")
 		return ctrl.Result{}, err
 	}
+	hasGuardrails := len(guardrails.Items) > 0
+
+	overlapping, err := r.overlappingWorkloadClasses(ctx, wc)
+	if err != nil {
+		log.Error(err, "Failed to validate PodSelector against other WorkloadClasses")
+		return ctrl.Result{}, err
+	}
+
+	validationCond := validatedCondition(ctx, wc, guardrails, overlapping)
 
 	// 1.2 Check for plugin placement attachment conditions
 	changed, removed := false, false
@@ -103,20 +115,6 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 1.3 If the plugin has not attached, mark the WorkloadClass as not yet validated
 	reconcileConditions(&validationCond, pluginPlacementCondition)
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
-
-	// 2. Check if other existing WorkloadClasses have the same PodSelector
-	if _, err := r.validateSelectors(ctx, wc); err != nil {
-		// Emit a warning event
-		r.Recorder.Eventf(
-			wc,
-			nil,
-			corev1.EventTypeWarning,
-			"ValidationFailed",
-			"SelectorValidation",
-			"%s",
-			err.Error(),
-		)
-	}
 
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
@@ -137,7 +135,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
 	// Leases are drained only now, so earlier failures (e.g., status update conflicts) do not discard them.
 	pendingLeases := r.LeaseTracker.Drain(req.NamespacedName)
-	leaseRequeue, err := r.reconcilePDBs(ctx, wc, validationCond, pendingLeases)
+	leaseRequeue, err := r.reconcilePDBs(ctx, wc, validationCond, hasGuardrails, pendingLeases)
 	if err != nil {
 		r.Recorder.Eventf(
 			wc,
@@ -157,10 +155,11 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // reconcilePDBs reconciles the Per-Pod PDBs (workload-<pod.Name>) of the Pods governed by the WorkloadClass.
 //
-// A Pod is governed by the WorkloadClass if the WorkloadClass is its best match (the namespace default, or the
+// A Pod is governed by the WorkloadClass if the WorkloadClass is its best match (the namespace's enforced WorkloadClass, or the
 // most specific matching WorkloadClass) and the Pod is not already covered by a user-created PDB.
 //
-//   - If the WorkloadClass is invalid, its existing PDBs are opened (MaxUnavailable = 100%) rather than deleted.
+//   - If the WorkloadClass does not protect Pods (see protectsPods), its existing PDBs are opened
+//     (MaxUnavailable = 100%) rather than deleted.
 //   - Pending leases from the disruption webhook are applied to the PDBs of the requested Pods.
 //   - PDBs with an active lease are left untouched until the lease expires.
 //   - Owned PDBs whose Pod no longer exists, is terminating or in a terminal phase, is covered by a user-created PDB,
@@ -168,7 +167,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 //     are left for that WorkloadClass to adopt.
 //
 // It returns the time until the earliest active lease expires, or 0 if there are none.
-func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, pendingLeases []utils.PendingLease) (time.Duration, error) {
+func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, hasGuardrails bool, pendingLeases []utils.PendingLease) (time.Duration, error) {
 	log := logf.FromContext(ctx)
 
 	if !wc.DeletionTimestamp.IsZero() {
@@ -192,12 +191,12 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 		}
 	}
 
-	if condition.Reason != workloadsv1.ReasonValidationPassed {
+	if !protectsPods(condition.Reason, hasGuardrails) {
 		log.Info("WorkloadClass is invalid, opening its PDBs")
 		return 0, r.openOwnedPDBs(ctx, wc, owned, userPDBs)
 	}
 
-	defaultWC, err := utils.NamespaceDefaultWorkloadClass(ctx, r.Client, wc.Namespace)
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
 		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, err
@@ -208,7 +207,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 		return 0, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
 
-	governed, err := r.governedPods(ctx, wc, defaultWC, wcs.Items, userPDBs)
+	governed, err := r.governedPods(ctx, wc, enforcedWC, wcs.Items, userPDBs)
 	if err != nil {
 		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, err
@@ -246,7 +245,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 			continue
 		}
 		if utils.IsPodActive(pod) && !utils.IsPodCoveredByUserPDB(pod, userPDBs) {
-			if bestMatch := utils.BestMatchWorkloadClassForPod(pod, defaultWC, wcs.Items); bestMatch != nil && bestMatch.Name != wc.Name && passedValidation(bestMatch) {
+			if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs.Items); bestMatch != nil && bestMatch.Name != wc.Name && passedValidation(bestMatch, hasGuardrails) {
 				// Another WorkloadClass governs the Pod now and will adopt its PDB.
 				continue
 			}
@@ -258,14 +257,14 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 }
 
 // governedPods returns the active Pods governed by the WorkloadClass that are not covered by a user-created PDB.
-func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc, defaultWC *workloadsv1.WorkloadClass, wcs []workloadsv1.WorkloadClass, userPDBs []policyv1.PodDisruptionBudget) ([]*corev1.Pod, error) {
-	if defaultWC != nil && defaultWC.Name != wc.Name {
-		// The namespace default WorkloadClass governs every Pod in the namespace.
+func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc, enforcedWC *workloadsv1.WorkloadClass, wcs []workloadsv1.WorkloadClass, userPDBs []policyv1.PodDisruptionBudget) ([]*corev1.Pod, error) {
+	if enforcedWC != nil && enforcedWC.Name != wc.Name {
+		// The namespace's enforced WorkloadClass governs every Pod in the namespace.
 		return nil, nil
 	}
 
 	selector := labels.Everything()
-	if defaultWC == nil {
+	if enforcedWC == nil {
 		if wc.Spec.PodSelector == nil {
 			// A WorkloadClass without a PodSelector is never the best match for a Pod.
 			return nil, nil
@@ -288,7 +287,7 @@ func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc, defaultW
 		if !utils.IsPodActive(pod) || utils.IsPodCoveredByUserPDB(pod, userPDBs) {
 			continue
 		}
-		if bestMatch := utils.BestMatchWorkloadClassForPod(pod, defaultWC, wcs); bestMatch == nil || bestMatch.Name != wc.Name {
+		if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs); bestMatch == nil || bestMatch.Name != wc.Name {
 			continue
 		}
 		governed = append(governed, pod)
@@ -488,10 +487,22 @@ func (r *WorkloadClassReconciler) getPodForPDB(ctx context.Context, namespace st
 	return nil, nil
 }
 
-// passedValidation returns true if the WorkloadClass' status shows it passed guardrail validation.
-func passedValidation(wc *workloadsv1.WorkloadClass) bool {
+// passedValidation returns true if the WorkloadClass' status shows that it protects the Pods it governs (see
+// protectsPods).
+func passedValidation(wc *workloadsv1.WorkloadClass, hasGuardrails bool) bool {
 	cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
-	return cond != nil && cond.Reason == workloadsv1.ReasonValidationPassed
+	return cond != nil && protectsPods(cond.Reason, hasGuardrails)
+}
+
+// protectsPods reports whether a WorkloadClass whose Validated condition has the given reason creates and keeps
+// Per-Pod PDBs for the Pods it governs.
+//
+// Only WorkloadClasses validated against at least one guardrail protect Pods. A WorkloadClass whose only
+// validation issue is a PodSelector overlap with another WorkloadClass (SelectorOverlap) still complies with the
+// guardrails and keeps protecting its Pods: each Pod is governed by a single best-match WorkloadClass, so the
+// overlap is resolved per Pod rather than by dropping protection for every overlapping WorkloadClass.
+func protectsPods(reason string, hasGuardrails bool) bool {
+	return reason == workloadsv1.ReasonValidationPassed || (reason == workloadsv1.ReasonSelectorOverlap && hasGuardrails)
 }
 
 func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
@@ -524,7 +535,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		return workloadsv1.ReadinessNotReady, 0, err
 	}
-	defaultWC, err := utils.NamespaceDefaultWorkloadClass(ctx, r.Client, wc.Namespace)
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
 		return workloadsv1.ReadinessNotReady, 0, err
 	}
@@ -538,13 +549,13 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		if bestMatch := utils.BestMatchWorkloadClassForPod(&pod, defaultWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
+		if bestMatch := utils.BestMatchWorkloadClassForPod(&pod, enforcedWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
 			continue
 		}
 		matchedPods = append(matchedPods, pod)
 	}
 
-	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDuration)
+	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDurationSeconds)
 	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
 		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
 		for _, pod := range matchedPods {
@@ -558,8 +569,8 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		}
 	}
 
-	// 5. Check if grace period has passed for all pods (GraceTerminationDuration)
-	if wc.Spec.DisruptionPolicy.GraceTerminationDuration > 0 {
+	// 5. Check if grace period has passed for all pods (GraceTerminationDurationSeconds)
+	if wc.Spec.DisruptionPolicy.GraceTerminationDurationSeconds > 0 {
 		gracePeriodsPassed := true
 		maxTimeForGracePeriod := 0 * time.Second
 		for _, pod := range matchedPods {
@@ -606,6 +617,10 @@ func placementPluginCondition(ctx context.Context, wc *workloadsv1.WorkloadClass
 const (
 	placementUnattachedMsg = "WorkloadClass references an infrastructure profile, but the plugin has not attached"
 	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
+	noGuardrailsMsg        = "No Guardrails found to validate against"
+	disjointDaysOfWeekMsg  = "cluster guardrails restrict `daysOfWeek` to disjoint sets, so no disruption window can comply; contact your cluster administrator"
+	maxConditionMessageLen = 32768
+	maxReportedOverlaps    = 5
 )
 
 func reconcileConditions(validation, placement *metav1.Condition) {
@@ -623,9 +638,9 @@ func addPlacementViolation(validation, placement *metav1.Condition) {
 	}
 
 	if validation.Status == metav1.ConditionFalse {
-		validation.Message = validation.Message + "; " + violationMsg
+		validation.Message = truncateMessage(validation.Message+"; "+violationMsg, maxConditionMessageLen)
 	} else {
-		validation.Message = violationMsg
+		validation.Message = truncateMessage(violationMsg, maxConditionMessageLen)
 	}
 
 	validation.Status = metav1.ConditionFalse
@@ -653,15 +668,15 @@ func evaluatePodGracePeriod(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now 
 	return gracePeriodsPassed, maxDurationForGracePeriod
 }
 
-// gracePeriodPassed returns true if the GraceTerminationDuration has passed for the Pod, indicating that maintenance should not be blocked.
+// gracePeriodPassed returns true if the GraceTerminationDurationSeconds has passed for the Pod, indicating that maintenance should not be blocked.
 //
 // It checks if the pod has a DeletionTimestamp, which indicates when the pod began deletion.
-// The function then compares the WorkloadClass' GraceTerminationDuration against the time passed since the DeletionTimestamp.
+// The function then compares the WorkloadClass' GraceTerminationDurationSeconds against the time passed since the DeletionTimestamp.
 //
-// If the time passed is not greater than or equal to the GraceTerminationDuration, the function returns false and the time remaining until the grace period expires.
-// If the time passed is greater than or equal to the GraceTerminationDuration, the function returns, and the WorkloadClass is marked Ready for maintenance.
+// If the time passed is not greater than or equal to the GraceTerminationDurationSeconds, the function returns false and the time remaining until the grace period expires.
+// If the time passed is greater than or equal to the GraceTerminationDurationSeconds, the function returns, and the WorkloadClass is marked Ready for maintenance.
 func gracePeriodPassed(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time) (bool, time.Duration) {
-	gracePeriod := wc.Spec.DisruptionPolicy.GraceTerminationDuration
+	gracePeriod := wc.Spec.DisruptionPolicy.GraceTerminationDurationSeconds
 
 	// Check if Pod's deletion timestamp is set
 	if pod.DeletionTimestamp == nil {
@@ -669,52 +684,156 @@ func gracePeriodPassed(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.
 	}
 
 	// Check if the grace period has passed
-	// GraceTerminationDuration - time passed since deletion timestamp
+	// GraceTerminationDurationSeconds - time passed since deletion timestamp
 	diff := (time.Duration(gracePeriod) * time.Second) - now.Sub(pod.DeletionTimestamp.Time)
 	return diff <= 0, diff
 }
 
-func (r *WorkloadClassReconciler) validateAgainstGuardrails(ctx context.Context, wc *workloadsv1.WorkloadClass) (metav1.Condition, error) {
-	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
-	if err := r.List(ctx, guardrails); err != nil {
-		return metav1.Condition{}, err
+// validatedCondition builds the Validated condition for the WorkloadClass.
+//
+// Spec, guardrail, and capacity strategy violations take precedence and are reported with ReasonValidationFailed.
+// If the only problem is that the PodSelector overlaps with other WorkloadClasses in the namespace,
+// ReasonSelectorOverlap is used instead. Overlap is intentionally reported symmetrically on every
+// WorkloadClass involved so that any affected workload owner sees the conflict, while keeping a
+// distinct Reason from ReasonValidationFailed so that consumers can tell guardrail compliance apart from
+// selector ambiguity.
+func validatedCondition(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	guardrails *workloadsv1.WorkloadClassGuardrailList,
+	overlapping []workloadsv1.WorkloadClass,
+) metav1.Condition {
+	cond := metav1.Condition{
+		Type:               workloadsv1.ConditionTypeValidated,
+		Status:             metav1.ConditionTrue,
+		Reason:             workloadsv1.ReasonValidationPassed,
+		Message:            validationPassedMsg,
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: wc.Generation,
 	}
 
-	if len(guardrails.Items) == 0 {
-		return metav1.Condition{
-			Type:               workloadsv1.ConditionTypeValidated,
-			Status:             metav1.ConditionTrue,
-			Reason:             workloadsv1.ReasonNoGuardrails,
-			Message:            "No Guardrails found to validate against",
-			ObservedGeneration: wc.Generation,
-			LastTransitionTime: metav1.Now(),
-		}, nil
+	violations := validateSpec(wc)
+	violations = append(violations, validateAgainstGuardrails(wc, guardrails.Items)...)
+	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+	overlapMsg := selectorOverlapMessage(overlapping)
+
+	switch {
+	case len(violations) > 0:
+		if overlapMsg != "" {
+			violations = append(violations, overlapMsg)
+		}
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = workloadsv1.ReasonValidationFailed
+		cond.Message = truncateMessage(strings.Join(violations, "; "), maxConditionMessageLen)
+	case overlapMsg != "":
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = workloadsv1.ReasonSelectorOverlap
+		cond.Message = truncateMessage(overlapMsg, maxConditionMessageLen)
+	case len(guardrails.Items) == 0:
+		cond.Reason = workloadsv1.ReasonNoGuardrails
+		cond.Message = noGuardrailsMsg
 	}
 
-	// Determine effective constraints (pick the most restrictive)
-	allowedDisruptionDays, maxAllowedWindows, maxNonDisruptionDurationDays := guardrailDisruptionConstraints(guardrails.Items)
+	return cond
+}
+
+// truncateMessage caps msg at maxLen bytes on a UTF-8 rune boundary so that it fits within the CRD
+// schema limit for metav1.Condition.Message.
+func truncateMessage(msg string, maxLen int) string {
+	const ellipsis = "..."
+	if len(msg) <= maxLen {
+		return msg
+	}
+	if maxLen <= len(ellipsis) {
+		return ellipsis[:maxLen]
+	}
+	cut := maxLen - len(ellipsis)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + ellipsis
+}
+
+// validateSpec validates the fields of the WorkloadClass spec that are not fully enforced by the
+// CRD OpenAPI/CEL schema (semantic LabelSelector validation, valid weekday names, and IANA time zone
+// database lookup), and acts as defense-in-depth for rules also checked at admission time (such as
+// rejecting the 'Local' time zone).
+func validateSpec(wc *workloadsv1.WorkloadClass) []string {
+	var violations []string
+	if wc.Spec.PodSelector != nil {
+		if _, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
+			violations = append(violations, fmt.Sprintf("`podSelector` must be a valid label selector: %v", err))
+		}
+	}
+	for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
+		if err := utils.WeekdaysValid(dw.DaysOfWeek); err != nil {
+			violations = append(violations, fmt.Sprintf("disruption window '%s': %v", dw.Name, err))
+		}
+		if dw.TimeZone != "" && !utils.TimeZoneValid(dw.TimeZone) {
+			violations = append(violations, fmt.Sprintf(
+				"`timeZone` of disruption window '%s' must be a valid IANA time zone name other than 'Local', got '%s'",
+				dw.Name, dw.TimeZone))
+		}
+	}
+	return violations
+}
+
+// validateAgainstGuardrails returns the disruption constraints of the guardrails that the WorkloadClass violates.
+//
+// Guardrail names are deliberately omitted: guardrails are cluster-scoped, and users who can read the
+// WorkloadClass status may not have access to them. Constraint limits across all guardrails are combined
+// into the effective (strictest) limit—minimum MaxAllowedWindows, minimum MaxNonDisruptionDurationDays,
+// and the intersection of restricting DaysOfWeek—so workload owners see a single actionable limit per field.
+// Unset (zero-valued) guardrail constraints are not enforced.
+func validateAgainstGuardrails(wc *workloadsv1.WorkloadClass, guardrails []workloadsv1.WorkloadClassGuardrail) []string {
+	if len(guardrails) == 0 {
+		return nil
+	}
+
+	var (
+		effectiveDays  = utils.AllWeekdays()
+		daysRestricted bool
+		minWindows     int32
+		minDuration    int32
+	)
+	for i := range guardrails {
+		d := guardrails[i].Spec.Constraints.Disruption
+		if len(d.DaysOfWeek) > 0 {
+			daysRestricted = true
+			allowed := sets.New(d.DaysOfWeek...)
+			effectiveDays = slices.DeleteFunc(effectiveDays, func(day string) bool {
+				return !allowed.Has(day)
+			})
+		}
+		if d.MaxAllowedWindows > 0 && (minWindows == 0 || d.MaxAllowedWindows < minWindows) {
+			minWindows = d.MaxAllowedWindows
+		}
+		if d.MaxNonDisruptionDurationDays > 0 && (minDuration == 0 || d.MaxNonDisruptionDurationDays < minDuration) {
+			minDuration = d.MaxNonDisruptionDurationDays
+		}
+	}
+	if !daysRestricted {
+		effectiveDays = nil
+	}
 
 	var violations []string
-	for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
-		if !allowedDisruptionDaysValid(dw.DaysOfWeek, allowedDisruptionDays) {
-			violations = append(violations, fmt.Sprintf("disruption window %s contains day(s) of week that are not allowed by guardrail. Found DaysOfWeek: %v, guardrail AllowedDisruptionDays: %v", dw.Name, dw.DaysOfWeek, allowedDisruptionDays))
-		}
-		if !utils.TimeZoneValid(dw.TimeZone) {
-			violations = append(violations, fmt.Sprintf("disruption window %s has invalid time zone %s", dw.Name, dw.TimeZone))
-		}
+	if daysRestricted && len(effectiveDays) == 0 {
+		violations = append(violations, disjointDaysOfWeekMsg)
 	}
 
-	if len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows) > int(*maxAllowedWindows) {
-		violations = append(violations, fmt.Sprintf("number of windows %v exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.AllowedDisruptionWindows, int(*maxAllowedWindows)))
+	effective := workloadsv1.WorkloadClassGuardrail{
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1.Constraints{
+				Disruption: workloadsv1.Disruption{
+					DaysOfWeek:                   effectiveDays,
+					MaxAllowedWindows:            minWindows,
+					MaxNonDisruptionDurationDays: minDuration,
+				},
+			},
+		},
 	}
-
-	if maxNonDisruptionDurationDays != nil && wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > *maxNonDisruptionDurationDays {
-		violations = append(violations, fmt.Sprintf("maxNonDisruptionDurationDays %d exceeds guardrail limit %d", wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, *maxNonDisruptionDurationDays))
-	}
-
-	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
-
-	return condition(wc.Generation, violations), nil
+	violations = append(violations, utils.GuardrailViolations(wc, &effective)...)
+	return violations
 }
 
 // validateCapacityStrategy validates WorkloadClass.Spec.CapacityStrategy against the aggregated
@@ -888,74 +1007,84 @@ func applyPlacementCapacityConstraints(ctx context.Context, guardrailName string
 	return errors.Join(errs...)
 }
 
-// validateSelectors validates the workloadclass' PodSelector against existing workloadclasses in the same namespace.
-// If another workloadclass has the exact same PodSelector, an error is returned to be emitted as a warning.
-// If two workloadclasses match a Pod with the same specificity, the oldest workloadclass takes precedence.
-func (r *WorkloadClassReconciler) validateSelectors(ctx context.Context, wc *workloadsv1.WorkloadClass) ([]workloadsv1.WorkloadClass, error) {
-	workloadClasses := &workloadsv1.WorkloadClassList{}
-	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
-		return nil, fmt.Errorf("failed to fetch workloadclasses: %w", err)
+// overlappingWorkloadClasses returns the other active WorkloadClasses in the same namespace whose
+// PodSelector could select the same Pod as the WorkloadClass PodSelector, sorted by name.
+//
+// Overlap is symmetric: every WorkloadClass whose selector overlaps with another active WorkloadClass in
+// the namespace is reported with ReasonSelectorOverlap. WorkloadClasses that are being deleted or have an
+// invalid PodSelector are skipped; an invalid PodSelector is reported on the WorkloadClass that owns it.
+//
+// When the Namespace enforces a WorkloadClass (EnforcedClassLabel), that WorkloadClass governs every Pod in the
+// namespace and PodSelectors are not used to match Pods, so no overlap is reported.
+func (r *WorkloadClassReconciler) overlappingWorkloadClasses(
+	ctx context.Context, wc *workloadsv1.WorkloadClass,
+) ([]workloadsv1.WorkloadClass, error) {
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(workloadClasses.Items) == 0 {
+	if enforcedWC != nil {
 		return nil, nil
 	}
 
+	workloadClasses := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
+	}
+
 	var matches []workloadsv1.WorkloadClass
-	for _, ewc := range workloadClasses.Items {
-		if ewc.Name == wc.Name {
+	for _, other := range workloadClasses.Items {
+		if other.Name == wc.Name || !other.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if sameLabelSelectorSemantic(wc.Spec.PodSelector, ewc.Spec.PodSelector) {
-			matches = append(matches, ewc)
+		overlap, err := utils.SelectorsOverlap(wc.Spec.PodSelector, other.Spec.PodSelector)
+		if err != nil {
+			continue
+		}
+		if overlap {
+			matches = append(matches, other)
 		}
 	}
-
-	return matches, formatError(wc, matches)
+	slices.SortFunc(matches, func(a, b workloadsv1.WorkloadClass) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return matches, nil
 }
 
-func formatError(wc *workloadsv1.WorkloadClass, matches []workloadsv1.WorkloadClass) error {
-	if len(matches) == 0 {
-		return nil
+// selectorOverlapMessage returns a message listing the WorkloadClasses whose PodSelector overlaps
+// with the PodSelector of the reconciled WorkloadClass, or an empty string if there are none.
+// Names are sorted so the message does not depend on informer cache iteration order, and at most
+// maxReportedOverlaps names are listed explicitly, followed by "and K more" if additional classes overlap.
+func selectorOverlapMessage(overlapping []workloadsv1.WorkloadClass) string {
+	if len(overlapping) == 0 {
+		return ""
 	}
 
-	oldest := wc
-	var matchNames []string
-	for _, m := range matches {
-		matchNames = append(matchNames, m.Name)
-		if m.CreationTimestamp.Before(&oldest.CreationTimestamp) {
-			oldest = &m
-		}
+	names := make([]string, 0, len(overlapping))
+	for _, o := range overlapping {
+		names = append(names, o.Name)
 	}
+	slices.Sort(names)
 
-	return fmt.Errorf("the following WorkloadClasses have the same PodSelector as %s: %s", wc.Name, strings.Join(matchNames, ", "))
-}
-
-// sameLabelSelectorSemantic returns true if the two label selectors select the
-// same resources, regardless of the order of rules/expressions.
-func sameLabelSelectorSemantic(a, b *metav1.LabelSelector) bool {
-	if a == nil && b == nil {
-		return true
+	limit := min(len(names), maxReportedOverlaps)
+	listed := utils.QuotedList(names[:limit])
+	if extra := len(names) - limit; extra > 0 {
+		listed = fmt.Sprintf("%s, and %d more", listed, extra)
 	}
-	if a == nil || b == nil {
-		return false
-	}
-	selA, errA := metav1.LabelSelectorAsSelector(a)
-	selB, errB := metav1.LabelSelectorAsSelector(b)
-	if errA != nil || errB != nil {
-		return false
-	}
-	// .String() returns a sorted, deterministic representation of the selector rules.
-	return selA.String() == selB.String()
+	return fmt.Sprintf("`podSelector` must not select the same Pods as another WorkloadClass in the namespace, "+
+		"but it overlaps with the `podSelector` of %s", listed)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1.WorkloadClass{}).
+		// Re-validate all WorkloadClasses when a guardrail spec changes, is created, or is deleted. Guardrail
+		// status updates do not re-queue every WorkloadClass in the cluster.
 		Watches(
-			&workloadsv1.WorkloadClassGuardrail{}, // Re-trigger validation if guardrails change
+			&workloadsv1.WorkloadClassGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesToReconcile),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		// A WorkloadClass being created, deleted, or changing its spec can change the best-match WorkloadClass of
 		// Pods in its namespace, so every WorkloadClass in the namespace re-evaluates which Pods it governs.
@@ -973,11 +1102,11 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesInObjectNamespace),
 			builder.WithPredicates(userPDBPredicate()),
 		).
-		// Changing the namespace default WorkloadClass changes which WorkloadClass governs every Pod in it.
+		// Changing the namespace's enforced WorkloadClass changes which WorkloadClass governs every Pod in it.
 		Watches(
 			&corev1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(r.findWorkloadClassesForNamespace),
-			builder.WithPredicates(namespaceDefaultClassPredicate()),
+			builder.WithPredicates(namespaceEnforcedClassPredicate()),
 		).
 		// Create, update, or delete a Pod's PDB as the Pod is created, relabeled, or deleted.
 		Watches(
@@ -1089,16 +1218,16 @@ func userPDBPredicate() predicate.Funcs {
 	})
 }
 
-// namespaceDefaultClassPredicate passes Namespace events that set, change, or remove the
-// workloads.gke.io/default-class label.
-func namespaceDefaultClassPredicate() predicate.Funcs {
+// namespaceEnforcedClassPredicate passes Namespace events that set, change, or remove the
+// workloads.gke.io/enforced-class label.
+func namespaceEnforcedClassPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			_, ok := e.Object.GetLabels()[workloadsv1.DefaultClassLabel]
+			_, ok := e.Object.GetLabels()[workloadsv1.EnforcedClassLabel]
 			return ok
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return e.ObjectOld.GetLabels()[workloadsv1.DefaultClassLabel] != e.ObjectNew.GetLabels()[workloadsv1.DefaultClassLabel]
+			return e.ObjectOld.GetLabels()[workloadsv1.EnforcedClassLabel] != e.ObjectNew.GetLabels()[workloadsv1.EnforcedClassLabel]
 		},
 		// Deleting a Namespace deletes its WorkloadClasses and PDBs.
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },
@@ -1137,46 +1266,8 @@ func condition(generation int64, violations []string) metav1.Condition {
 	if len(violations) > 0 {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = workloadsv1.ReasonValidationFailed
-		condition.Message = strings.Join(violations, "; ")
+		condition.Message = truncateMessage(strings.Join(violations, "; "), maxConditionMessageLen)
 	}
 
 	return condition
-}
-
-func guardrailDisruptionConstraints(guardrails []workloadsv1.WorkloadClassGuardrail) ([][]string, *int32, *int32) {
-	if guardrails == nil {
-		return nil, nil, nil
-	}
-
-	// Determine effective constraints (pick the most restrictive)
-	var allowedDisruptionDays [][]string
-	var maxAllowedWindows *int32
-	var maxNonDisruptionDurationDays *int32
-
-	for _, g := range guardrails {
-		if maxNonDisruptionDurationDays == nil || g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays < *maxNonDisruptionDurationDays {
-			maxNonDisruptionDurationDays = &g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
-		}
-
-		allowedDisruptionDays = append(allowedDisruptionDays, g.Spec.Constraints.Disruption.AllowedDisruptionDays)
-
-		if maxAllowedWindows == nil || g.Spec.Constraints.Disruption.MaxAllowedWindows < *maxAllowedWindows {
-			maxAllowedWindows = &g.Spec.Constraints.Disruption.MaxAllowedWindows
-		}
-	}
-
-	return allowedDisruptionDays, maxAllowedWindows, maxNonDisruptionDurationDays
-}
-
-func allowedDisruptionDaysValid(wcAllowedDisruptionDays []string, guardrail [][]string) bool {
-	if len(guardrail) == 0 || len(wcAllowedDisruptionDays) == 0 {
-		return true
-	}
-
-	valid := true
-	for _, days := range guardrail {
-		valid = valid && utils.IsSubset(wcAllowedDisruptionDays, days)
-	}
-
-	return valid
 }

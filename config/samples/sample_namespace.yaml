@@ -3,4 +3,4 @@ kind: Namespace
 metadata:
   name: sample
   labels:
-    workloads.gke.io/default-class: critical-batch
+    workloads.gke.io/enforced-class: critical-batch

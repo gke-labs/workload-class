@@ -113,6 +113,17 @@ func TestHandle(t *testing.T) {
 		},
 	}
 
+	// wcSelectorOverlap is out of window and only flagged for an overlapping PodSelector, so its constraints are
+	// still enforced.
+	wcSelectorOverlap := wcOutOfWindow.DeepCopy()
+	wcSelectorOverlap.Status.Conditions = []metav1.Condition{
+		{
+			Type:   workloadsv1.ConditionTypeValidated,
+			Status: metav1.ConditionFalse,
+			Reason: workloadsv1.ReasonSelectorOverlap,
+		},
+	}
+
 	nsNoAnnotation := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-no-wc",
@@ -255,6 +266,15 @@ func TestHandle(t *testing.T) {
 			getWCResp:       wcOutOfWindow,
 			readiness:       workloadsv1.ReadinessNotReady,
 			want:            admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcOutOfWindow.Name)),
+		},
+		{
+			name:            "selectorOverlapStillEnforced",
+			desc:            "Validated=False only because of SelectorOverlap, not in window, admission Denied",
+			req:             evictionRequestNonMatchingUser,
+			podCreationTime: podNowCreationTime,
+			getWCResp:       wcSelectorOverlap,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcSelectorOverlap.Name)),
 		},
 		{
 			name:            "podIsTooNew",

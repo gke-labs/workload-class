@@ -48,15 +48,22 @@ const (
 // DisruptionPolicy specifies the policy governing pod disruptions.
 type DisruptionPolicy struct {
 	// AllowedDisruptionWindows defines when disruptions are allowed.
+	// When unset or empty, disruptions are allowed at all times on all days of the week.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
 
 	// AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
+	// +listType=map
+	// +listMapKey=kind
+	// +listMapKey=name
 	// +optional
 	AllowedDisruptionsOutsideOfWindow []Subject `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
 
 	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
 	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
+	// When unset (0), no upper bound is placed on how long the workload can remain undisrupted.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays,omitempty"`
@@ -66,10 +73,12 @@ type DisruptionPolicy struct {
 	// +kubebuilder:validation:Minimum=0
 	MinInitialRunDurationDays int32 `json:"minInitialRunDurationDays,omitempty"`
 
-	// GraceTerminationDuration is the maximum time in seconds for a pod to terminate gracefully.
+	// GraceTerminationDurationSeconds is the duration in seconds after a pod's deletionTimestamp is set during which
+	// the controller keeps the WorkloadClass MaintenanceReadiness as NotReady to allow in-flight pod terminations to drain
+	// before further disruptions occur. It does not override Pod.spec.terminationGracePeriodSeconds or set eviction DeleteOptions.gracePeriodSeconds.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
-	GraceTerminationDuration int32 `json:"graceTerminationDuration,omitempty"`
+	GraceTerminationDurationSeconds int32 `json:"graceTerminationDurationSeconds,omitempty"`
 
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
@@ -79,20 +88,29 @@ type DisruptionPolicy struct {
 // DisruptionWindow defines a temporal window when disruptions are allowed.
 type DisruptionWindow struct {
 	// Name is the name of the DisruptionWindow.
-	Name string `json:"name,omitempty"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 
-	// DaysOfWeek specifies the days of the week (Monday-Sunday).
+	// DaysOfWeek specifies the days of the week (Monday-Sunday) on which the window starts.
+	// When unset or empty, the window applies to every day of the week.
+	// +optional
 	DaysOfWeek []string `json:"daysOfWeek,omitempty"`
 
-	// TimeZone is the IANA Time Zone Database name (e.g., "America/Los_Angeles", "Etc/UTC"). See https://www.iana.org/time-zones.
-	// +kubebuilder:validation:Pattern=`^[A-Za-z_]+/[A-Za-z_]+$`
+	// TimeZone is the IANA Time Zone Database name (e.g., "America/Los_Angeles", "America/Argentina/Buenos_Aires", "Etc/UTC", "UTC"). See https://www.iana.org/time-zones.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}|UTC|GMT)$`
+	// +kubebuilder:validation:XValidation:rule="self != 'Local' && self != 'local'",message="must not be 'Local' or 'local'"
 	TimeZone string `json:"timeZone,omitempty"`
 
-	// StartTime is the start time of the window in HH:MM format (e.g. 22:00) in UTC.
+	// StartTime is the start time of the window in HH:MM format (e.g. 22:00) in the specified timeZone (or UTC if timeZone is omitted).
+	// +optional
 	// +kubebuilder:validation:Pattern=`^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$`
 	StartTime string `json:"startTime,omitempty"`
 
-	// EndTime is the end time of the window in HH:MM format (e.g. 04:00) in UTC.
+	// EndTime is the end time of the window in HH:MM format (e.g. 04:00) in the specified timeZone (or UTC if timeZone is omitted).
+	// +optional
 	// +kubebuilder:validation:Pattern=`^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$`
 	EndTime string `json:"endTime,omitempty"`
 }
@@ -121,7 +139,11 @@ type Subject struct {
 
 // WorkloadClassSpec defines the desired state of WorkloadClass
 type WorkloadClassSpec struct {
-	// PodSelector matches the pods that this class applies to.
+	// PodSelector matches the pods in the same namespace that this class applies to.
+	// If a Namespace has the "workloads.gke.io/enforced-class" label (EnforcedClassLabel) set,
+	// the referenced WorkloadClass is enforced for all pods in that namespace and overrides PodSelector
+	// matching. Otherwise, PodSelector selects the target pods in the namespace; overlapping PodSelectors
+	// across WorkloadClasses in the same namespace are surfaced as a status Condition.
 	// +optional
 	PodSelector *metav1.LabelSelector `json:"podSelector,omitempty"`
 
@@ -196,8 +218,10 @@ const (
 )
 
 const (
-	// DefaultClassLabel is the Namespace label naming the namespace's default WorkloadClass.
-	DefaultClassLabel = "workloads.gke.io/default-class"
+	// EnforcedClassLabel is the label key applied to a Namespace to enforce a single WorkloadClass across all
+	// pods in that namespace. When set on a Namespace, the referenced WorkloadClass applies to all pods in the
+	// namespace and overrides PodSelector matching. It is not a fallback default.
+	EnforcedClassLabel = "workloads.gke.io/enforced-class"
 
 	// PodUIDLabel is the label set on governed Pods and their Per-Pod PodDisruptionBudgets
 	// to associate each PDB with a single Pod instance by UID.
@@ -212,6 +236,10 @@ const (
 	ReasonValidationFailed = "ValidationFailed"
 	// ReasonNoGuardrails indicates that no Guardrails were found to validate against.
 	ReasonNoGuardrails = "NoGuardrails"
+	// ReasonSelectorOverlap indicates that the WorkloadClass PodSelector overlaps with another WorkloadClass in the
+	// same namespace. It is only used when the WorkloadClass has no other validation failures. Each Pod is still
+	// governed by its single best-match WorkloadClass, so overlapping WorkloadClasses keep protecting their Pods.
+	ReasonSelectorOverlap = "SelectorOverlap"
 
 	// ConditionTypePlacementPluginAttached indicates whether the referenced infrastructureProfileRef
 	// has been resolved and attached by its corresponding placement plugin controller.

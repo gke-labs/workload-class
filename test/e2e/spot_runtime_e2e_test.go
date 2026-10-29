@@ -64,7 +64,7 @@ metadata:
 spec:
   constraints:
     disruption:
-      allowedDisruptionDays:
+      daysOfWeek:
         - Saturday
         - Sunday
       maxAllowedWindows: 2

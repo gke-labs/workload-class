@@ -316,14 +316,14 @@ func TestReconcile_InFallback(t *testing.T) {
 			want: metav1.ConditionFalse,
 		},
 		{
-			name: "namespace-default WorkloadClass counts Pods outside its PodSelector",
+			name: "namespace-enforced WorkloadClass counts Pods outside its PodSelector",
 			cs:   fallbackCS("100%"), reversion: &lazy,
 			pods: []client.Object{
 				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
-					Name: "default", Labels: map[string]string{"workloads.gke.io/default-class": "spot-wc"},
+					Name: "default", Labels: map[string]string{"workloads.gke.io/enforced-class": "spot-wc"},
 				}},
 				func() *corev1.Pod {
-					// Not matched by spot-wc's {"app": "test"} selector, but it belongs to the namespace default.
+					// Not matched by spot-wc's {"app": "test"} selector, but it belongs to the namespace's enforced WorkloadClass.
 					pod := spotTargetedPod("fallback-1", "ondemand-node-1")
 					pod.Labels = map[string]string{"app": "other"}
 					return pod

@@ -158,7 +158,7 @@ func (r *GKESpotPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // GKESpotPlacementPolicy, whether the policy controller has attached it. This is the same gate the Pod
 // placement webhook applies before mutating Pods.
 func isReady(wc *workloadsv1.WorkloadClass) bool {
-	if !meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeValidated) {
+	if !utils.IsValidated(meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)) {
 		return false
 	}
 	return !utils.ReferencesGKESpotPlacementPolicy(wc.Spec.InfrastructureProfileRef) ||
