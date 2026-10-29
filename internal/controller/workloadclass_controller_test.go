@@ -1339,6 +1339,7 @@ func TestReconcilePDBs(t *testing.T) {
 	closed := intstr.FromInt32(0)
 	open := intstr.FromString("100%")
 	webLabels := map[string]string{"app": "web"}
+	subject := workloadsv1.Subject{Kind: "ServiceAccount", Name: "cluster-autoscaler", Namespace: "kube-system"}
 
 	ns := func(defaultClass string) *corev1.Namespace {
 		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
@@ -1351,18 +1352,21 @@ func TestReconcilePDBs(t *testing.T) {
 	type wantPDB struct {
 		owner          string // WorkloadClass name of the controller owner reference
 		maxUnavailable string
+		leaseOwner     string // expected workloads.gke.io/bypass-owner, if any
 		// leftForAdoption means the reconciled WorkloadClass still owns the PDB but no longer governs the Pod,
 		// and leaves the PDB for the governing WorkloadClass to adopt.
 		leftForAdoption bool
 	}
 
 	testCases := []struct {
-		name      string
-		wc        *workloadsv1.WorkloadClass
-		condition metav1.Condition
-		objects   []client.Object
-		wantErr   bool
-		wantPDBs  map[string]*wantPDB // PDB name -> expected PDB, or nil if it must not exist
+		name        string
+		wc          *workloadsv1.WorkloadClass
+		condition   metav1.Condition
+		objects     []client.Object
+		leases      []utils.PendingLease
+		wantErr     bool
+		wantPDBs    map[string]*wantPDB // PDB name -> expected PDB, or nil if it must not exist
+		wantRequeue time.Duration       // approximate expected requeue; 0 means none
 	}{
 		{
 			name:      "creates_per_pod_pdbs_for_governed_pods_only",
@@ -1485,6 +1489,77 @@ func TestReconcilePDBs(t *testing.T) {
 			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "web-frontend", maxUnavailable: "100%"}},
 		},
 		{
+			name:      "applies_pending_lease_to_requested_pod_only",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects:   []client.Object{ns(""), newTestPod("web-1", webLabels), newTestPod("web-2", webLabels)},
+			leases:    []utils.PendingLease{{PodName: "web-1", PodUID: "uid-web-1", Subject: subject}},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "web", maxUnavailable: "100%", leaseOwner: utils.BypassOwnerValue(subject)},
+				"workload-web-2": {owner: "web", maxUnavailable: "0"},
+			},
+			wantRequeue: utils.DefaultLeaseDuration,
+		},
+		{
+			name:      "discards_lease_for_previous_pod_instance",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects:   []client.Object{ns(""), newTestPod("web-1", webLabels)},
+			leases:    []utils.PendingLease{{PodName: "web-1", PodUID: "old-uid", Subject: subject}},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": {owner: "web", maxUnavailable: "0"}},
+		},
+		{
+			name:      "preserves_active_lease",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: func() []client.Object {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				pod := newTestPod("web-1", webLabels)
+				leased := newOwnedPDB(wc, pod, open)
+				leased.Annotations = map[string]string{
+					utils.BypassOwner:      "user-a",
+					utils.BypassExpiration: time.Now().Add(time.Minute).Format(utils.ExpirationFormat),
+				}
+				return []client.Object{ns(""), pod, leased}
+			}(),
+			wantPDBs:    map[string]*wantPDB{"workload-web-1": {owner: "web", maxUnavailable: "100%", leaseOwner: "user-a"}},
+			wantRequeue: time.Minute,
+		},
+		{
+			name:      "discards_lease_request_when_another_subject_holds_lease",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: func() []client.Object {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				pod := newTestPod("web-1", webLabels)
+				leased := newOwnedPDB(wc, pod, open)
+				leased.Annotations = map[string]string{
+					utils.BypassOwner:      "user-a",
+					utils.BypassExpiration: time.Now().Add(time.Minute).Format(utils.ExpirationFormat),
+				}
+				return []client.Object{ns(""), pod, leased}
+			}(),
+			leases:      []utils.PendingLease{{PodName: "web-1", PodUID: "uid-web-1", Subject: subject}},
+			wantPDBs:    map[string]*wantPDB{"workload-web-1": {owner: "web", maxUnavailable: "100%", leaseOwner: "user-a"}},
+			wantRequeue: time.Minute,
+		},
+		{
+			name:      "expired_lease_is_cleared",
+			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
+			condition: validCondition(),
+			objects: func() []client.Object {
+				wc := newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true)
+				pod := newTestPod("web-1", webLabels)
+				leased := newOwnedPDB(wc, pod, open)
+				leased.Annotations = map[string]string{
+					utils.BypassOwner:      "user-a",
+					utils.BypassExpiration: time.Now().Add(-time.Minute).Format(utils.ExpirationFormat),
+				}
+				return []client.Object{ns(""), pod, leased}
+			}(),
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "web", maxUnavailable: "0"}},
+		},
+		{
 			name:      "refuses_to_modify_user_pdb_with_the_same_name",
 			wc:        newTestWC("web", webLabels, now, workloadsv1.ReadinessNotReady, true),
 			condition: validCondition(),
@@ -1496,6 +1571,7 @@ func TestReconcilePDBs(t *testing.T) {
 					Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unrelated"}}},
 				},
 			},
+			leases:   []utils.PendingLease{{PodName: "web-1", PodUID: "uid-web-1", Subject: subject}},
 			wantErr:  true,
 			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: ""}},
 		},
@@ -1556,11 +1632,24 @@ func TestReconcilePDBs(t *testing.T) {
 			wcForClient := tc.wc.DeepCopy()
 			wcForClient.DeletionTimestamp = nil // The fake client rejects objects with a DeletionTimestamp and no finalizers.
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(tc.objects, wcForClient)...).Build()
-			r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
+			tracker := utils.NewPendingLeaseTracker(16)
+			r := &WorkloadClassReconciler{Client: c, Scheme: scheme, LeaseTracker: tracker}
 
-			err := r.reconcilePDBs(t.Context(), tc.wc, tc.condition)
+			requeue, err := r.reconcilePDBs(t.Context(), tc.wc, tc.condition, tc.leases)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("reconcilePDBs() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && len(tc.leases) > 0 {
+				if drained := tracker.Drain(client.ObjectKeyFromObject(tc.wc)); !reflect.DeepEqual(drained, tc.leases) {
+					t.Errorf("failed reconcilePDBs() should re-enqueue unapplied leases: got %v, want %v", drained, tc.leases)
+				}
+			}
+
+			if tc.wantRequeue == 0 && requeue != 0 {
+				t.Errorf("reconcilePDBs() requeue = %v, want 0", requeue)
+			}
+			if tc.wantRequeue != 0 && (requeue <= 0 || requeue > tc.wantRequeue) {
+				t.Errorf("reconcilePDBs() requeue = %v, want in (0, %v]", requeue, tc.wantRequeue)
 			}
 
 			for name, want := range tc.wantPDBs {
@@ -1588,6 +1677,9 @@ func TestReconcilePDBs(t *testing.T) {
 				}
 				if got := pdb.Spec.MaxUnavailable.String(); got != want.maxUnavailable {
 					t.Errorf("PDB %s: maxUnavailable = %s, want %s", name, got, want.maxUnavailable)
+				}
+				if got := pdb.Annotations[utils.BypassOwner]; got != want.leaseOwner {
+					t.Errorf("PDB %s: %s = %q, want %q", name, utils.BypassOwner, got, want.leaseOwner)
 				}
 
 				// The PDB must select exactly its Pod, and the Pod must carry the matching label.
