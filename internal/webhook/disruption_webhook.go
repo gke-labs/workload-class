@@ -43,7 +43,7 @@ type DisruptionWebhook struct {
 	Recorder events.EventRecorder
 }
 
-// +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods;pods/eviction,verbs=create;delete,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods/eviction,verbs=create,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
 
 // Handle handles admission requests for Pod evictions.
 func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
