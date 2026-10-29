@@ -13,22 +13,53 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
+  - configmaps
   - namespaces
-  - pods
+  - nodes
   verbs:
   - get
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/eviction
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies
   - workloadclasses
   - workloadclassguardrails
   verbs:
@@ -42,6 +73,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies/finalizers
   - workloadclasses/finalizers
   - workloadclassguardrails/finalizers
   verbs:
@@ -49,6 +81,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies/status
   - workloadclasses/status
   - workloadclassguardrails/status
   verbs:

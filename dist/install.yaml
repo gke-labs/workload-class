@@ -12,6 +12,185 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
+  name: gkespotplacementpolicies.workloads.gke.io
+spec:
+  group: workloads.gke.io
+  names:
+    kind: GKESpotPlacementPolicy
+    listKind: GKESpotPlacementPolicyList
+    plural: gkespotplacementpolicies
+    shortNames:
+    - gkespotpolicy
+    singular: gkespotplacementpolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.customComputeClass
+      name: ComputeClass
+      type: string
+    - jsonPath: .spec.reversion.action
+      name: Reversion
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Validated')].status
+      name: Validated
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='SpotCapacityAvailable')].status
+      name: SpotAvailable
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: GKESpotPlacementPolicy defines GKE-specific Spot placement, machine
+          family, and reversion settings.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of GKESpotPlacementPolicy.
+            properties:
+              customComputeClass:
+                description: |-
+                  CustomComputeClass is the optional name of a GKE Custom Compute Class
+                  (cloud.google.com/compute-class) used for the workload's primary placement.
+                maxLength: 63
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+              fallbackAllowedMachineFamilies:
+                description: |-
+                  FallbackAllowedMachineFamilies restricts which GKE machine families Pods may schedule onto
+                  when falling back to On-Demand capacity during a Spot stockout (e.g., ["e2", "n2d"]).
+                  If empty, all machine families are allowed.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
+              reversion:
+                default: {}
+                description: |-
+                  Reversion configures how fallback Pods running on On-Demand nodes return to GKE Spot VMs
+                  once Spot capacity recovers (Active, Lazy, or None).
+                properties:
+                  action:
+                    default: None
+                    description: 'Action specifies the reversion strategy once Spot
+                      capacity returns: Active, Lazy, or None (default).'
+                    enum:
+                    - Active
+                    - Lazy
+                    - None
+                    type: string
+                  minDurationOnFallback:
+                    description: |-
+                      MinDurationOnFallback sets the minimum duration a Pod must run on On-Demand fallback VMs
+                      before becoming eligible for Active reversion (e.g., "4h"), dampening churn when Spot capacity is unstable.
+                      When omitted, the controller applies a 5m floor; set it explicitly (including "0s") to override.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: minDurationOnFallback must be non-negative
+                      rule: duration(self) >= duration('0s')
+                type: object
+                x-kubernetes-validations:
+                - message: minDurationOnFallback can only be greater than 0s when
+                    reversion action is Active
+                  rule: '!has(self.minDurationOnFallback) || duration(self.minDurationOnFallback)
+                    == duration(''0s'') || self.action == ''Active'''
+            type: object
+          status:
+            description: status defines the observed state of GKESpotPlacementPolicy.
+            properties:
+              conditions:
+                description: Conditions represent the current state of the GKESpotPlacementPolicy
+                  resource (e.g., Validated, SpotCapacityAvailable).
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: workloadclasses.workloads.gke.io
 spec:
   group: workloads.gke.io
@@ -19,10 +198,31 @@ spec:
     kind: WorkloadClass
     listKind: WorkloadClassList
     plural: workloadclasses
+    shortNames:
+    - wc
     singular: workloadclass
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.maintenanceReadiness
+      name: Maintenance
+      type: string
+    - jsonPath: .spec.capacityStrategy.type
+      name: Capacity
+      type: string
+    - jsonPath: .spec.capacityStrategy.spotRatio
+      name: SpotRatio
+      type: string
+    - jsonPath: .spec.infrastructureProfileRef.name
+      name: Profile
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Validated')].status
+      name: Validated
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
     schema:
       openAPIV3Schema:
         description: WorkloadClass is the Schema for the workloadclasses API
@@ -47,6 +247,36 @@ spec:
           spec:
             description: spec defines the desired state of WorkloadClass
             properties:
+              capacityStrategy:
+                description: |-
+                  CapacityStrategy defines portable, cloud-agnostic compute capacity and fallback intent
+                  (e.g., targeting Spot vs. On-Demand capacity, target Spot percentage, and stockout fallback behavior).
+                properties:
+                  action:
+                    default: Fail
+                    description: |-
+                      FallbackAction determines whether Pods remain Pending ("Fail") or schedule onto On-Demand ("FallbackToOnDemand")
+                      when Spot capacity is unavailable. Default: "Fail".
+                    enum:
+                    - Fail
+                    - FallbackToOnDemand
+                    type: string
+                  spotRatio:
+                    default: 100%
+                    description: |-
+                      SpotRatio is the target percentage of Pods to place on Spot capacity (e.g., "80%"). Default: "100%".
+                      Must be an integer percentage between "0%" and "100%".
+                    pattern: ^(100|[1-9]?[0-9])%$
+                    type: string
+                  type:
+                    default: Spot
+                    description: 'Type specifies whether the workload targets Spot
+                      or OnDemand capacity. Default: "Spot".'
+                    enum:
+                    - Spot
+                    - OnDemand
+                    type: string
+                type: object
               disruptionPolicy:
                 description: DisruptionPolicy specifies the policy governing pod disruptions.
                 properties:
@@ -137,6 +367,33 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                type: object
+              infrastructureProfileRef:
+                description: |-
+                  InfrastructureProfileRef references a cluster-scoped, provider-specific infrastructure profile CR
+                  (such as GKESpotPlacementPolicy) managed by Platform/SRE.
+                properties:
+                  group:
+                    description: Group is the API group of the infrastructure profile
+                      (e.g., "workloads.gke.io").
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  kind:
+                    description: Kind is the resource kind of the infrastructure profile
+                      (e.g., "GKESpotPlacementPolicy").
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  name:
+                    description: Name is the metadata.name of the cluster-scoped infrastructure
+                      profile resource.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - kind
+                - name
                 type: object
               podSelector:
                 description: PodSelector matches the pods that this class applies
@@ -258,6 +515,10 @@ spec:
               maintenanceReadiness:
                 description: MaintenanceReadiness indicates if the workload is currently
                   ready for maintenance.
+                enum:
+                - Ready
+                - NotReady
+                - Overdue
                 type: string
             type: object
         required:
@@ -310,7 +571,8 @@ spec:
             description: spec defines the desired state of WorkloadClassGuardrail
             properties:
               constraints:
-                description: Constraints defines the guardrails for WorkloadClasses.
+                description: Constraints defines the core cloud-agnostic guardrails
+                  for WorkloadClasses.
                 properties:
                   disruption:
                     description: Disruption defines the constraints within which WorkloadClasses
@@ -352,6 +614,40 @@ spec:
                 required:
                 - disruption
                 type: object
+              pluginConstraints:
+                description: PluginConstraints defines guardrail constraints grouped
+                  by plugin optimization intent.
+                properties:
+                  placement:
+                    description: Placement holds the list of plugin constraints for
+                      workload placement.
+                    items:
+                      description: PluginConstraint defines constraints for a specific
+                        plugin controller.
+                      properties:
+                        allowedConfigTemplate:
+                          description: AllowedConfigTemplate optionally specifies
+                            a policy template name (e.g., "K8sAllowedSpotRatio").
+                          type: string
+                        name:
+                          description: Name identifies the target plugin controller
+                            (e.g., "gke-spot-placement").
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        parameters:
+                          description: Parameters holds plugin-specific guardrail
+                            parameters as an arbitrary JSON/YAML object.
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                type: object
             required:
             - constraints
             type: object
@@ -359,16 +655,8 @@ spec:
             description: status defines the observed state of WorkloadClassGuardrail
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the WorkloadClassGuardrail resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                description: Conditions represent the latest observed state of the
+                  WorkloadClassGuardrail resource.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -494,19 +782,37 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
+  - configmaps
   - namespaces
-  - pods
+  - nodes
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/eviction
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - policy
   resources:
@@ -522,6 +828,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies
   - workloadclasses
   - workloadclassguardrails
   verbs:
@@ -535,6 +842,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies/finalizers
   - workloadclasses/finalizers
   - workloadclassguardrails/finalizers
   verbs:
@@ -542,6 +850,7 @@ rules:
 - apiGroups:
   - workloads.gke.io
   resources:
+  - gkespotplacementpolicies/status
   - workloadclasses/status
   - workloadclassguardrails/status
   verbs:
@@ -906,6 +1215,41 @@ spec:
   selfSigned: {}
 ---
 apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: workload-class-system/workload-class-serving-cert
+  name: workload-class-mutating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /mutate-pod-placement
+  failurePolicy: Fail
+  name: mpod-v1.kb.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      - workload-class-system
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   annotations:
@@ -928,9 +1272,7 @@ webhooks:
     - v1
     operations:
     - CREATE
-    - DELETE
     resources:
-    - pods
     - pods/eviction
   sideEffects: None
 - admissionReviewVersions:
