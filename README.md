@@ -16,6 +16,8 @@ A Validating Admission Webhook intercepts eviction requests for pods and enforce
 1. **Namespace-level default**: If a default `WorkloadClass` is labeled on the pod's namespace (`workloads.gke.io/default-class`), it is chosen immediately, overriding any other potential matches.
 2. **Pod label selectors**: If no namespace default is defined, the webhook selects the `WorkloadClass` in the pod's namespace that has the highest specificity (matching label selectors) against the pod. If multiple `WorkloadClasses` have the same specificity, the oldest `WorkloadClass` takes precedence.
 
+The controller also expresses each workload's disruption policy as a PodDisruptionBudget for every pod a `WorkloadClass` governs (see [Per-Pod PodDisruptionBudgets](#per-pod-poddisruptionbudgets)).
+
 ## Example Usage
 
 **1. Platform Engineer defines a Guardrail**
@@ -164,6 +166,101 @@ Events:
   ----     ------            ----  ----                       -------
   Warning  ValidationFailed  10s   workloadclass-controller   the following WorkloadClasses have the same PodSelector as critical-batch-duplicate: critical-batch
 ```
+
+**D. Evicting as an Allowed Subject Outside the Window**
+
+The sample `WorkloadClass` allows `kube-system/cluster-autoscaler` to disrupt pods outside of its windows. Evicting as that service account outside the window takes two attempts: the first is rejected by the pod's closed PDB while the controller leases it, and a retry succeeds (see [Leasing for Allowed Subjects](#leasing-for-allowed-subjects)):
+
+```sh
+POD_NAME=$(kubectl get pods -n sample -l role=batch-processor -o jsonpath='{.items[0].metadata.name}')
+cat > /tmp/eviction.json <<EOF
+{"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "$POD_NAME", "namespace": "sample"}}
+EOF
+
+# 1. The first attempt is admitted by the webhook but rejected by the pod's PDB
+kubectl create --raw "/api/v1/namespaces/sample/pods/$POD_NAME/eviction" -f /tmp/eviction.json \
+  --as=system:serviceaccount:kube-system:cluster-autoscaler
+# Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's disruption budget.
+
+# 2. After a few seconds, the controller has leased the pod's PDB to the cluster autoscaler
+kubectl get pdb "workload-$POD_NAME" -n sample \
+  -o jsonpath='{.spec.maxUnavailable} {.metadata.annotations.workloads\.gke\.io/bypass-owner}'
+# 100% system:serviceaccount:kube-system:cluster-autoscaler
+
+# 3. The retry succeeds
+kubectl create --raw "/api/v1/namespaces/sample/pods/$POD_NAME/eviction" -f /tmp/eviction.json \
+  --as=system:serviceaccount:kube-system:cluster-autoscaler
+```
+
+> **NOTE:** Impersonating the service account with `--as` requires impersonation permissions, and the service account needs permission to create `pods/eviction`.
+
+## Per-Pod PodDisruptionBudgets
+
+In addition to the webhook, the controller expresses each workload's disruption policy as standard PodDisruptionBudgets (PDBs), which Kubernetes components such as the cluster autoscaler, `kubectl drain`, and node upgrades already respect when planning and performing disruptions. It creates a PDB for each pod a `WorkloadClass` governs.
+
+### Which Pods Get a PDB
+
+A pod is governed by its best-match `WorkloadClass`, using the same precedence as the webhook: the namespace default if one is set, otherwise the most specific matching `podSelector` (the oldest wins ties). The controller creates a PDB for every governed pod, except:
+
+- **Pods already covered by a user-created PDB.** If any PDB not managed by a `WorkloadClass` selects a pod, the user's PDB takes precedence and the controller doesn't create one. If a user creates such a PDB later, the controller deletes its PDB for the pod, and recreates it if the user's PDB is removed.
+- **Terminating or completed pods.**
+
+> **NOTE:** A `WorkloadClass` without a `podSelector` only governs pods when it is the namespace default.
+
+### PDB Spec
+
+Each PDB is named `workload-<pod name>`. The controller labels the pod with `workloads.gke.io/pod-uid: <pod UID>`, and the PDB selects only that label, so it covers exactly one pod and never a later pod that reuses the same name. The PDB uses `unhealthyPodEvictionPolicy: IfHealthyBudget`, and its `maxUnavailable` follows the `WorkloadClass`:
+
+| `WorkloadClass` state | `maxUnavailable` |
+| --- | --- |
+| `Validated=True` and `MaintenanceReadiness: NotReady` (outside a window, or a pod hasn't met `minInitialRunDurationDays`) | `0`: evictions are blocked. |
+| `MaintenanceReadiness: Ready` or `Overdue` | `100%`: evictions are allowed. |
+| `Validated=False` (fails guardrail validation) | `100%`: the controller opens existing PDBs instead of deleting them, and doesn't create new ones. |
+
+```sh
+kubectl get pdb -n sample
+```
+```
+NAME                                        MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+workload-test-deployment-5f8c7d9b6c-x2k4p   N/A             0                 0                     2m
+```
+
+> **NOTE:** The controller only creates PDBs for a `WorkloadClass` that passed validation against at least one `WorkloadClassGuardrail`.
+
+### Ownership and Cleanup
+
+Each PDB is owned by its pod's `WorkloadClass` through a controller owner reference, so deleting the `WorkloadClass` deletes its PDBs. The controller also deletes a pod's PDB when the pod is deleted, starts terminating, or reaches a terminal phase, when a user-created PDB starts covering it, or when no `WorkloadClass` governs it anymore.
+
+When a pod's best-match `WorkloadClass` changes, for example because a namespace default is set or a more specific `WorkloadClass` is created, the new `WorkloadClass` takes ownership of the existing PDB rather than deleting and recreating it. The controller never modifies a user-created PDB, even one that happens to be named `workload-<pod name>`.
+
+### Leasing for Allowed Subjects
+
+Subjects listed in `allowedDisruptionsOutsideOfWindow` (such as the cluster autoscaler or VPA) are admitted by the webhook regardless of disruption windows and `minInitialRunDurationDays`. When their eviction targets a pod whose PDB is closed, the pod's PDB is temporarily opened for them with a **lease**:
+
+```mermaid
+sequenceDiagram
+  participant S as Allowed subject
+  participant API as API server
+  participant W as Disruption webhook
+  participant C as WorkloadClass controller
+  S->>API: Evict pod
+  API->>W: Admission review
+  W-->>C: Request a lease on the pod's PDB
+  W->>API: Allowed
+  API-->>S: 429: the PDB does not allow the disruption
+  C->>API: Lease the pod's PDB (maxUnavailable 100%)
+  S->>API: Retry eviction
+  API-->>S: Evicted
+```
+
+1. The webhook admits the eviction and asks the controller to lease the pod's PDB. The webhook itself never modifies PDBs, which keeps admission fast.
+2. The closed PDB rejects this first attempt with `429 TooManyRequests`. Eviction clients such as the cluster autoscaler and `kubectl drain` retry automatically.
+3. The controller sets the PDB's `maxUnavailable` to `100%` and records the lease in two annotations: `workloads.gke.io/bypass-owner` (the subject's identity, e.g. `system:serviceaccount:kube-system:cluster-autoscaler`) and `workloads.gke.io/bypass-expiration`.
+4. The subject's retry succeeds.
+
+Leases are per pod, so several pods of the same workload can be evicted at the same time, for example when the cluster autoscaler drains a node. While a lease is active, eviction requests for that pod from other allowed subjects are denied. A lease lasts for the pod's termination grace period (30 seconds by default). Once it expires, the controller re-syncs the PDB with the `WorkloadClass`, closing it again if the workload is still outside its disruption window.
+
+> **NOTE:** Lease requests are passed from the webhook to the controller in memory, so the controller manager must run as a single replica (the default).
 
 ## Spot Placement
 
