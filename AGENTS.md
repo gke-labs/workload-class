@@ -1,6 +1,35 @@
-# workload-class - AI Agent Guide
+# workload-class — Repository Agent Guidelines (`AGENTS.md`)
 
-## Project Structure
+Welcome to `gke-labs/workload-class`! This document guides autonomous agents, AI assistants, and human contributors working within this repository.
+
+## 1. Project Overview & Layout
+- `cmd/`, `api/`, `internal/` (or `controller/`, `pkg/`): Core reconcilers, webhooks, and API definitions.
+- `docs/invariants.md`: Authoritative specification of runtime safety invariants (`I1`–`In`).
+- `verification-suite/`:
+  - `verify_invariant_governance.sh`: Tier-0 (T0) Two-Lane CODEOWNERS governance gate.
+  - `T1`/`T2`/`T3` verification scripts.
+- `.agents/skills/`: Pre-PR self-review skills (`review-adversarial`, `review-docs-drift`).
+
+## 2. Build, Test & Governance Commands
+- Run `go vet ./...` and `go test -race ./...`
+- Run `./verification-suite/verify_invariant_governance.sh`
+- Generated code: Never regenerate `zz_generated.deepcopy.go` unless `api/v1/` (or `api/v1alpha1/`) types changed.
+- License headers: All new `.go` and `.sh` files must include the standard Apache-2.0 header.
+
+## 3. Two-Lane CODEOWNERS Invariant Governance
+Changes to runtime safety invariants (`internal/invariants/`) are governed by `.github/CODEOWNERS` and `./verification-suite/verify_invariant_governance.sh`:
+- Lane 1 (`feature/*`, `fix/*`, `docs/*`): Must NOT modify `internal/invariants/**`, `.github/CODEOWNERS`, or `verify_invariant_governance.sh`. Never weaken an invariant to make a test pass. (Rare atomic co-changes require an `Invariant-Cochange: <rationale>` commit trailer.)
+- Lane 2 (`invariant/*`): Must touch ONLY `internal/invariants/**` and `docs/invariants.md`, and must include both positive tests and negative fault-injection tests.
+
+## 4. Pull Request Hygiene & Fresh-Context Self-Review
+1. Worktree Isolation: Always work in an isolated worktree branched from `upstream/main`:
+   `git fetch upstream --prune && git worktree add -B <branch-name> ~/workload-class-wt/<worktree-name> upstream/main`
+2. Mandatory Pre-PR Self-Review (Fresh Context): Before opening a PR, spawn a fresh subagent context (that did not author the edits) to run `.agents/skills/review-adversarial/SKILL.md` and `.agents/skills/review-docs-drift/SKILL.md`. Record findings and fixes under `## Self-Review` in the PR description.
+3. Open-Source Hygiene: Never commit internal corporate URLs, LDAPs, or internal GCP project IDs.
+
+---
+
+## Project Structure (Kubebuilder)
 
 **Single-group layout (default):**
 ```
