@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
@@ -41,8 +42,16 @@ import (
 //
 // If no specific or default WorkloadClass is found, it returns nil.
 func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder events.EventRecorder, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
+	if pod == nil {
+		return nil, nil
+	}
+
 	// Use the namespace's default workload class if it exists
-	if bestMatch = namespaceDefaultWorkloadClass(ctx, c, pod); bestMatch != nil {
+	bestMatch, err = NamespaceDefaultWorkloadClass(ctx, c, pod.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	if bestMatch != nil {
 		return bestMatch, nil
 	}
 
@@ -53,12 +62,39 @@ func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder e
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %v", err)
 	}
 
-	// Keep track of all other matches to emit a warning message
+	bestMatch, otherMatches, maxSpecificity := selectBestMatchFromList(pod, wcs.Items)
+
+	// Emit warning message for WorkloadClasses that matched, but are ignored
+	emitAmbiguousMatchWarning(ctx, recorder, pod, bestMatch, otherMatches, maxSpecificity)
+
+	return bestMatch, nil
+}
+
+// BestMatchWorkloadClassForPod evaluates the best-matching WorkloadClass for a Pod in memory
+// using a pre-fetched namespace default WorkloadClass (if any) and list of WorkloadClasses.
+//
+// If defaultWC is non-nil, in the Pod's namespace, and not being deleted, it takes immediate precedence.
+// Otherwise, the active WorkloadClass in the Pod's namespace with the highest selector specificity
+// (breaking ties by oldest CreationTimestamp) is returned, or nil if none match.
+func BestMatchWorkloadClassForPod(pod *corev1.Pod, defaultWC *workloadsv1.WorkloadClass, allWCs []workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
+	if pod == nil {
+		return nil
+	}
+	if defaultWC != nil && defaultWC.Namespace == pod.Namespace && defaultWC.DeletionTimestamp.IsZero() {
+		return defaultWC
+	}
+	bestMatch, _, _ := selectBestMatchFromList(pod, allWCs)
+	return bestMatch
+}
+
+func selectBestMatchFromList(pod *corev1.Pod, allWCs []workloadsv1.WorkloadClass) (*workloadsv1.WorkloadClass, map[string]int, int) {
+	var bestMatch *workloadsv1.WorkloadClass
 	otherMatches := map[string]int{}
 	maxSpecificity := -1
 
-	for _, wc := range wcs.Items {
-		if wc.Namespace != pod.Namespace {
+	for i := range allWCs {
+		wc := &allWCs[i]
+		if wc.Namespace != pod.Namespace || !wc.DeletionTimestamp.IsZero() {
 			continue
 		}
 		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
@@ -66,14 +102,11 @@ func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder e
 			continue
 		}
 		if selector.Matches(labels.Set(pod.Labels)) {
-			bestMatch, otherMatches = updateBestMatch(&wc, bestMatch, &maxSpecificity, otherMatches)
+			bestMatch, otherMatches = updateBestMatch(wc, bestMatch, &maxSpecificity, otherMatches)
 		}
 	}
 
-	// Emit warning message for WorkloadClasses that matched, but are ignored
-	emitAmbiguousMatchWarning(ctx, recorder, pod, bestMatch, otherMatches, maxSpecificity)
-
-	return bestMatch, nil
+	return bestMatch, otherMatches, maxSpecificity
 }
 
 func emitAmbiguousMatchWarning(ctx context.Context, recorder events.EventRecorder, pod *corev1.Pod, bestMatch *workloadsv1.WorkloadClass, matches map[string]int, maxSpecificity int) {
@@ -129,9 +162,6 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 	return len(sel.MatchLabels) + len(sel.MatchExpressions)
 }
 
-// namespaceDefaultClassLabel is the Namespace label naming the namespace's default WorkloadClass.
-const namespaceDefaultClassLabel = "workloads.gke.io/default-class"
-
 // WorkloadClassPodSelector returns a selector for the Pods that a WorkloadClass applies to, for use when listing
 // or counting a WorkloadClass's Pods.
 //
@@ -141,7 +171,11 @@ const namespaceDefaultClassLabel = "workloads.gke.io/default-class"
 // WorkloadClass should still filter the results through FindBestMatchWorkloadClass.
 func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workloadsv1.WorkloadClass) (labels.Selector, error) {
 	ns := &corev1.Namespace{}
-	if err := c.Get(ctx, client.ObjectKey{Name: wc.Namespace}, ns); err == nil && ns.Labels[namespaceDefaultClassLabel] == wc.Name {
+	if err := c.Get(ctx, client.ObjectKey{Name: wc.Namespace}, ns); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
+		}
+	} else if ns.Labels[workloadsv1.DefaultClassLabel] == wc.Name {
 		return labels.Everything(), nil
 	}
 	if wc.Spec.PodSelector == nil {
@@ -154,15 +188,37 @@ func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workload
 	return selector, nil
 }
 
-func namespaceDefaultWorkloadClass(ctx context.Context, c client.Client, pod *corev1.Pod) *workloadsv1.WorkloadClass {
+// NamespaceDefaultWorkloadClass returns the active default WorkloadClass configured on the given Namespace
+// via the "workloads.gke.io/default-class" label.
+//
+// It returns (nil, nil) if the Namespace does not exist, has no default-class label, if the referenced
+// WorkloadClass does not exist, or if the referenced WorkloadClass is currently being deleted.
+func NamespaceDefaultWorkloadClass(ctx context.Context, c client.Client, namespace string) (*workloadsv1.WorkloadClass, error) {
 	ns := &corev1.Namespace{}
-	if err := c.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil && len(ns.GetLabels()) > 0 {
-		if defaultClass, ok := ns.Labels[namespaceDefaultClassLabel]; ok {
-			wc := &workloadsv1.WorkloadClass{}
-			if err := c.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err == nil {
-				return wc
-			}
+	if err := c.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
 		}
+		return nil, fmt.Errorf("error getting Namespace %s: %w", namespace, err)
 	}
-	return nil
+
+	defaultClass, ok := ns.Labels[workloadsv1.DefaultClassLabel]
+	if !ok || defaultClass == "" {
+		return nil, nil
+	}
+
+	wc := &workloadsv1.WorkloadClass{}
+	if err := c.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: namespace}, wc); err != nil {
+		if apierrors.IsNotFound(err) {
+			logf.FromContext(ctx).Info("Referenced default WorkloadClass not found", "workloadClass", defaultClass, "namespace", namespace)
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if !wc.DeletionTimestamp.IsZero() {
+		return nil, nil
+	}
+
+	return wc, nil
 }
