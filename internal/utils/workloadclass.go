@@ -34,20 +34,20 @@ import (
 
 // FindBestMatchWorkloadClass finds the most suitable WorkloadClass for a given Pod.
 //
-// Selection preference is given to the namespace's default WorkloadClass.
-// If no default is defined, the WorkloadClass in the Pod's namespace that has the
+// Selection preference is given to the namespace's enforced WorkloadClass.
+// If no enforced WorkloadClass is defined, the WorkloadClass in the Pod's namespace that has the
 // highest number of matching labels and expressions against the Pod is selected.
 // If two or more WorkloadClasses match in specificity to the Pod, the oldest
 // WorkloadClass takes precedence.
 //
-// If no specific or default WorkloadClass is found, it returns nil.
+// If no specific or enforced WorkloadClass is found, it returns nil.
 func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder events.EventRecorder, pod *corev1.Pod) (bestMatch *workloadsv1.WorkloadClass, err error) {
 	if pod == nil {
 		return nil, nil
 	}
 
-	// Use the namespace's default workload class if it exists
-	bestMatch, err = NamespaceDefaultWorkloadClass(ctx, c, pod.Namespace)
+	// Use the namespace's enforced WorkloadClass if it exists
+	bestMatch, err = NamespaceEnforcedWorkloadClass(ctx, c, pod.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -71,17 +71,17 @@ func FindBestMatchWorkloadClass(ctx context.Context, c client.Client, recorder e
 }
 
 // BestMatchWorkloadClassForPod evaluates the best-matching WorkloadClass for a Pod in memory
-// using a pre-fetched namespace default WorkloadClass (if any) and list of WorkloadClasses.
+// using a pre-fetched namespace's enforced WorkloadClass (if any) and list of WorkloadClasses.
 //
-// If defaultWC is non-nil, in the Pod's namespace, and not being deleted, it takes immediate precedence.
+// If enforcedWC is non-nil, in the Pod's namespace, and not being deleted, it takes immediate precedence.
 // Otherwise, the active WorkloadClass in the Pod's namespace with the highest selector specificity
 // (breaking ties by oldest CreationTimestamp) is returned, or nil if none match.
-func BestMatchWorkloadClassForPod(pod *corev1.Pod, defaultWC *workloadsv1.WorkloadClass, allWCs []workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
+func BestMatchWorkloadClassForPod(pod *corev1.Pod, enforcedWC *workloadsv1.WorkloadClass, allWCs []workloadsv1.WorkloadClass) *workloadsv1.WorkloadClass {
 	if pod == nil {
 		return nil
 	}
-	if defaultWC != nil && defaultWC.Namespace == pod.Namespace && defaultWC.DeletionTimestamp.IsZero() {
-		return defaultWC
+	if enforcedWC != nil && enforcedWC.Namespace == pod.Namespace && enforcedWC.DeletionTimestamp.IsZero() {
+		return enforcedWC
 	}
 	bestMatch, _, _ := selectBestMatchFromList(pod, allWCs)
 	return bestMatch
@@ -165,7 +165,7 @@ func getSpecificity(sel *metav1.LabelSelector) int {
 // WorkloadClassPodSelector returns a selector for the Pods that a WorkloadClass applies to, for use when listing
 // or counting a WorkloadClass's Pods.
 //
-// The namespace's default WorkloadClass applies to every Pod in its namespace, regardless of its PodSelector,
+// The namespace's enforced WorkloadClass applies to every Pod in its namespace, regardless of its PodSelector,
 // because FindBestMatchWorkloadClass selects it for all of them. For any other WorkloadClass, the PodSelector is
 // used, and a nil PodSelector selects all Pods. Callers that must exclude Pods owned by a more specific
 // WorkloadClass should still filter the results through FindBestMatchWorkloadClass.
@@ -175,7 +175,7 @@ func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workload
 		if !apierrors.IsNotFound(err) {
 			return nil, fmt.Errorf("error getting Namespace %s: %w", wc.Namespace, err)
 		}
-	} else if ns.Labels[workloadsv1.DefaultClassLabel] == wc.Name {
+	} else if ns.Labels[workloadsv1.EnforcedClassLabel] == wc.Name {
 		return labels.Everything(), nil
 	}
 	if wc.Spec.PodSelector == nil {
@@ -188,12 +188,12 @@ func WorkloadClassPodSelector(ctx context.Context, c client.Client, wc *workload
 	return selector, nil
 }
 
-// NamespaceDefaultWorkloadClass returns the active default WorkloadClass configured on the given Namespace
-// via the "workloads.gke.io/default-class" label.
+// NamespaceEnforcedWorkloadClass returns the active enforced WorkloadClass configured on the given Namespace
+// via the "workloads.gke.io/enforced-class" label.
 //
-// It returns (nil, nil) if the Namespace does not exist, has no default-class label, if the referenced
+// It returns (nil, nil) if the Namespace does not exist, has no enforced-class label, if the referenced
 // WorkloadClass does not exist, or if the referenced WorkloadClass is currently being deleted.
-func NamespaceDefaultWorkloadClass(ctx context.Context, c client.Client, namespace string) (*workloadsv1.WorkloadClass, error) {
+func NamespaceEnforcedWorkloadClass(ctx context.Context, c client.Client, namespace string) (*workloadsv1.WorkloadClass, error) {
 	ns := &corev1.Namespace{}
 	if err := c.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -202,15 +202,15 @@ func NamespaceDefaultWorkloadClass(ctx context.Context, c client.Client, namespa
 		return nil, fmt.Errorf("error getting Namespace %s: %w", namespace, err)
 	}
 
-	defaultClass, ok := ns.Labels[workloadsv1.DefaultClassLabel]
-	if !ok || defaultClass == "" {
+	enforcedClass, ok := ns.Labels[workloadsv1.EnforcedClassLabel]
+	if !ok || enforcedClass == "" {
 		return nil, nil
 	}
 
 	wc := &workloadsv1.WorkloadClass{}
-	if err := c.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: namespace}, wc); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Name: enforcedClass, Namespace: namespace}, wc); err != nil {
 		if apierrors.IsNotFound(err) {
-			logf.FromContext(ctx).Info("Referenced default WorkloadClass not found", "workloadClass", defaultClass, "namespace", namespace)
+			logf.FromContext(ctx).Info("Referenced enforced WorkloadClass not found", "workloadClass", enforcedClass, "namespace", namespace)
 			return nil, nil
 		}
 		return nil, err
@@ -221,4 +221,18 @@ func NamespaceDefaultWorkloadClass(ctx context.Context, c client.Client, namespa
 	}
 
 	return wc, nil
+}
+
+// IsValidated reports whether a WorkloadClass Validated condition allows the WorkloadClass to govern its Pods:
+// the condition is True, or it is False only because the WorkloadClass PodSelector overlaps the PodSelector of
+// another WorkloadClass in the namespace (ReasonSelectorOverlap).
+//
+// An overlapping WorkloadClass still complies with the guardrails. Each Pod is governed by its single best-match
+// WorkloadClass (see BestMatchWorkloadClassForPod), so the overlap is resolved per Pod rather than by dropping the
+// policy of every WorkloadClass involved.
+func IsValidated(cond *metav1.Condition) bool {
+	if cond == nil {
+		return false
+	}
+	return cond.Status == metav1.ConditionTrue || cond.Reason == workloadsv1.ReasonSelectorOverlap
 }

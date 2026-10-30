@@ -220,7 +220,7 @@ func TestUpdateBestMatch(t *testing.T) {
 	}
 }
 
-func TestNamespaceDefaultWorkloadClass(t *testing.T) {
+func TestNamespaceEnforcedWorkloadClass(t *testing.T) {
 	const namespace = "namespace"
 	now := metav1.Now()
 	wc := &workloadsv1.WorkloadClass{
@@ -245,7 +245,7 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 			Name:      "namespace-default",
 			Namespace: namespace,
 			Labels: map[string]string{
-				workloadsv1.DefaultClassLabel: "wc",
+				workloadsv1.EnforcedClassLabel: "wc",
 			},
 		},
 	}
@@ -320,18 +320,18 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 				wcResult = wc
 			}
 			c := createTestClient(tc.getNSError, tc.getWCError, nil, tc.getNSResult, wcResult, nil)
-			gotWC, err := NamespaceDefaultWorkloadClass(t.Context(), c, namespace)
+			gotWC, err := NamespaceEnforcedWorkloadClass(t.Context(), c, namespace)
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("NamespaceDefaultWorkloadClass() error = %v, wantErr: %v", err, tc.wantErr)
+				t.Fatalf("NamespaceEnforcedWorkloadClass() error = %v, wantErr: %v", err, tc.wantErr)
 			}
 			if (gotWC != nil) != (tc.wantBestMatch != nil) {
-				t.Errorf("NamespaceDefaultWorkloadClass() returned an unexpected result, got: %v, want: %v", gotWC, tc.wantBestMatch)
+				t.Errorf("NamespaceEnforcedWorkloadClass() returned an unexpected result, got: %v, want: %v", gotWC, tc.wantBestMatch)
 			}
 			if gotWC == nil {
 				return
 			}
 			if gotWC.Name != tc.wantBestMatch.Name {
-				t.Errorf("NamespaceDefaultWorkloadClass() returned a different WorkloadClass than expected, got: %v, want: %v", gotWC, tc.wantBestMatch)
+				t.Errorf("NamespaceEnforcedWorkloadClass() returned a different WorkloadClass than expected, got: %v, want: %v", gotWC, tc.wantBestMatch)
 			}
 		})
 	}
@@ -381,7 +381,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			Name:      "namespace-with-wc",
 			Namespace: namespace,
 			Labels: map[string]string{
-				"workloads.gke.io/default-class": "wc-default",
+				"workloads.gke.io/enforced-class": "wc-default",
 			},
 		},
 	}
@@ -411,7 +411,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 		},
 		{
 			name: "error_getting_namespace_default",
-			desc: "Error getting namespace default WorkloadClass, expect nil result and error without falling back to selector match",
+			desc: "Error getting namespace's enforced WorkloadClass, expect nil result and error without falling back to selector match",
 			listWCResult: &workloadsv1.WorkloadClassList{
 				Items: []workloadsv1.WorkloadClass{wc},
 			},
@@ -421,7 +421,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 		},
 		{
 			name: "success_getting_namespace_default",
-			desc: "Success getting namespace default as best match",
+			desc: "Success getting namespace-enforced WorkloadClass as best match",
 			listWCResult: &workloadsv1.WorkloadClassList{
 				Items: []workloadsv1.WorkloadClass{wc, wcDefault},
 			},
@@ -432,7 +432,7 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 		},
 		{
 			name: "success_no_namespace_default",
-			desc: "Success getting best match with selectors (no namespace default)",
+			desc: "Success getting best match with selectors (no namespace-enforced WorkloadClass)",
 			listWCResult: &workloadsv1.WorkloadClassList{
 				Items: []workloadsv1.WorkloadClass{wc},
 			},
@@ -582,10 +582,10 @@ func TestWorkloadClassPodSelector(t *testing.T) {
 	}
 
 	batchSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "batch"}}
-	newNS := func(defaultClass string) *corev1.Namespace {
+	newNS := func(enforcedClass string) *corev1.Namespace {
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
-		if defaultClass != "" {
-			ns.Labels = map[string]string{workloadsv1.DefaultClassLabel: defaultClass}
+		if enforcedClass != "" {
+			ns.Labels = map[string]string{workloadsv1.EnforcedClassLabel: enforcedClass}
 		}
 		return ns
 	}
@@ -751,11 +751,11 @@ func TestBestMatchWorkloadClassForPod(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name      string
-		pod       *corev1.Pod
-		defaultWC *workloadsv1.WorkloadClass
-		allWCs    []workloadsv1.WorkloadClass
-		wantName  string
+		name       string
+		pod        *corev1.Pod
+		enforcedWC *workloadsv1.WorkloadClass
+		allWCs     []workloadsv1.WorkloadClass
+		wantName   string
 	}{
 		{
 			name:     "nil_pod_returns_nil",
@@ -764,18 +764,18 @@ func TestBestMatchWorkloadClassForPod(t *testing.T) {
 			wantName: "",
 		},
 		{
-			name:      "active_default_wc_takes_precedence",
-			pod:       pod,
-			defaultWC: &wcDefault,
-			allWCs:    []workloadsv1.WorkloadClass{wcSpecific, wcOlder},
-			wantName:  "wc-default",
+			name:       "active_default_wc_takes_precedence",
+			pod:        pod,
+			enforcedWC: &wcDefault,
+			allWCs:     []workloadsv1.WorkloadClass{wcSpecific, wcOlder},
+			wantName:   "wc-default",
 		},
 		{
-			name:      "deleting_default_wc_falls_back_to_selectors",
-			pod:       pod,
-			defaultWC: &wcDefaultDeleting,
-			allWCs:    []workloadsv1.WorkloadClass{wcSpecific, wcOlder},
-			wantName:  "wc-specific",
+			name:       "deleting_default_wc_falls_back_to_selectors",
+			pod:        pod,
+			enforcedWC: &wcDefaultDeleting,
+			allWCs:     []workloadsv1.WorkloadClass{wcSpecific, wcOlder},
+			wantName:   "wc-specific",
 		},
 		{
 			name:     "highest_specificity_wins",
@@ -799,7 +799,7 @@ func TestBestMatchWorkloadClassForPod(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := BestMatchWorkloadClassForPod(tc.pod, tc.defaultWC, tc.allWCs)
+			got := BestMatchWorkloadClassForPod(tc.pod, tc.enforcedWC, tc.allWCs)
 			if tc.wantName == "" {
 				if got != nil {
 					t.Errorf("BestMatchWorkloadClassForPod() = %v, want nil", got.Name)
@@ -870,4 +870,26 @@ func (fc fakeWCClient) Get(ctx context.Context, key client.ObjectKey, obj client
 	}
 
 	return nil
+}
+
+func TestIsValidated(t *testing.T) {
+	testCases := []struct {
+		name string
+		cond *metav1.Condition
+		want bool
+	}{
+		{name: "missing", cond: nil, want: false},
+		{name: "true", cond: &metav1.Condition{Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonValidationPassed}, want: true},
+		{name: "no_guardrails", cond: &metav1.Condition{Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonNoGuardrails}, want: true},
+		{name: "selector_overlap", cond: &metav1.Condition{Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonSelectorOverlap}, want: true},
+		{name: "validation_failed", cond: &metav1.Condition{Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed}, want: false},
+		{name: "unknown", cond: &metav1.Condition{Status: metav1.ConditionUnknown}, want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsValidated(tc.cond); got != tc.want {
+				t.Errorf("IsValidated(%+v) = %t, want %t", tc.cond, got, tc.want)
+			}
+		})
+	}
 }

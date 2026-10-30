@@ -79,7 +79,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, g)).To(Succeed())
 
 			validDays := []string{"Sunday", "Monday"}
-			g.Spec.Constraints.Disruption.AllowedDisruptionDays = validDays
+			g.Spec.Constraints.Disruption.DaysOfWeek = validDays
 			Expect(k8sClient.Update(ctx, g)).To(Succeed())
 
 			By("Reconciling the created resource")
@@ -107,13 +107,13 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 			}, "10s", "1s").Should(BeTrue())
 		})
 
-		It("should fail validation if it contains an invalid day in AllowedDisruptionDays", func() {
+		It("should fail validation if it contains an invalid day in DaysOfWeek", func() {
 			By("updating the resource with an invalid day")
 			g := &workloadsv1.WorkloadClassGuardrail{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, g)).To(Succeed())
 
 			invalidDays := []string{"Christmas", "Eid", "Birthday"}
-			g.Spec.Constraints.Disruption.AllowedDisruptionDays = invalidDays
+			g.Spec.Constraints.Disruption.DaysOfWeek = invalidDays
 			Expect(k8sClient.Update(ctx, g)).To(Succeed())
 
 			By("reconiling")
@@ -135,7 +135,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 					if cond.Type == workloadsv1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "allowedDisruptionDays contains invalid days, valid days are")
+							strings.Contains(cond.Message, "`daysOfWeek` must only contain")
 					}
 				}
 				return false

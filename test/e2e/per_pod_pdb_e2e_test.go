@@ -63,7 +63,7 @@ const (
 	ppPDBPrefix        = "workload-"
 	ppPodUIDLabel      = "workloads.gke.io/pod-uid"
 	ppBypassOwner      = "workloads.gke.io/bypass-owner"
-	ppDefaultClassLbl  = "workloads.gke.io/default-class"
+	ppDefaultClassLbl  = "workloads.gke.io/enforced-class"
 	ppAutoscalerUser   = "system:serviceaccount:kube-system:cluster-autoscaler"
 	ppVPAUser          = "system:serviceaccount:kube-system:vpa-updater"
 	ppClosed           = "0"
@@ -78,7 +78,7 @@ metadata:
 spec:
   constraints:
     disruption:
-      allowedDisruptionDays: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]
+      daysOfWeek: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]
       maxAllowedWindows: 2
       maxNonDisruptionDurationDays: %d
 `
@@ -524,10 +524,10 @@ var _ = Describe("Per-Pod PodDisruptionBudgets", Ordered, func() {
 		expectPerPodPDBs(ppApp, ppWC, ppClosed, ppReplicas)
 	})
 
-	It("hands the PDBs over to the namespace default WorkloadClass and back", func() {
+	It("hands the PDBs over to the namespace's enforced WorkloadClass and back", func() {
 		expectPerPodPDBs(ppApp, ppWC, ppClosed, ppReplicas)
 
-		By("creating a WorkloadClass without a podSelector and making it the namespace default")
+		By("creating a WorkloadClass without a podSelector and making it the namespace's enforced WorkloadClass")
 		Expect(applyObject(newPPWorkloadClass(ppDefaultWC, nil, false))).To(Succeed())
 		expectWorkloadClassReady(ppDefaultWC, ppNS, false)
 		DeferCleanup(func() {
@@ -537,11 +537,11 @@ var _ = Describe("Per-Pod PodDisruptionBudgets", Ordered, func() {
 		_, err := utils.Run(exec.Command("kubectl", "label", "ns", ppNS, ppDefaultClassLbl+"="+ppDefaultWC, "--overwrite"))
 		Expect(err).NotTo(HaveOccurred())
 
-		By("verifying the namespace default governs every Pod in the namespace")
+		By("verifying the namespace's enforced WorkloadClass governs every Pod in the namespace")
 		expectPerPodPDBs(ppApp, ppDefaultWC, ppClosed, ppReplicas)
 		expectPerPodPDBs(ppOtherApp, ppDefaultWC, ppClosed, 1)
 
-		By("removing the namespace default")
+		By("removing the namespace's enforced WorkloadClass")
 		_, err = utils.Run(exec.Command("kubectl", "label", "ns", ppNS, ppDefaultClassLbl+"-"))
 		Expect(err).NotTo(HaveOccurred())
 
@@ -549,7 +549,7 @@ var _ = Describe("Per-Pod PodDisruptionBudgets", Ordered, func() {
 		expectPerPodPDBs(ppApp, ppWC, ppClosed, ppReplicas)
 		expectNoPerPodPDBs(ppOtherApp)
 
-		By("deleting the former namespace default, which no longer owns any PDB")
+		By("deleting the former namespace-enforced WorkloadClass, which no longer owns any PDB")
 		_, err = utils.Run(exec.Command("kubectl", "delete", "workloadclass", ppDefaultWC, "-n", ppNS))
 		Expect(err).NotTo(HaveOccurred())
 		Consistently(func(g Gomega) {

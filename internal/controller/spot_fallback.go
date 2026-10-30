@@ -218,7 +218,7 @@ func (r *GKESpotPlacementReconciler) listSpotNodeNames(ctx context.Context) (map
 }
 
 // classifyWorkloadPods splits the active Pods the WorkloadClass applies to by placement. A nil PodSelector, or
-// the WorkloadClass being the namespace default, selects all Pods in the namespace (see
+// the WorkloadClass being the namespace's enforced WorkloadClass, selects all Pods in the namespace (see
 // utils.WorkloadClassPodSelector). When multiple WorkloadClasses exist in the namespace, each Pod is only
 // counted for its best-matching WorkloadClass (matching the Pod placement webhook and Pod watch mapper).
 func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass, spotNodes map[string]bool) (workloadPods, error) {

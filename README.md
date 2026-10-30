@@ -13,8 +13,15 @@ This project is not eligible for the Google Open Source Software Vulnerability R
 The Workload Class Controller manages the lifecycle of disruption policies, ensuring they adhere to organizational guardrails.
 
 A Validating Admission Webhook intercepts eviction requests for pods and enforces temporal constraints (allowed windows) and pod lifecycle protection (minimum run duration). The webhook resolves the applicable `WorkloadClass` for a pod using the following order of precedence:
-1. **Namespace-level default**: If a default `WorkloadClass` is labeled on the pod's namespace (`workloads.gke.io/default-class`), it is chosen immediately, overriding any other potential matches.
-2. **Pod label selectors**: If no namespace default is defined, the webhook selects the `WorkloadClass` in the pod's namespace that has the highest specificity (matching label selectors) against the pod. If multiple `WorkloadClasses` have the same specificity, the oldest `WorkloadClass` takes precedence.
+1. **Namespace-enforced class**: If the pod's namespace has the `workloads.gke.io/enforced-class` label, the named `WorkloadClass` is enforced for every pod in the namespace, overriding `podSelector` matching. It is not a fallback default.
+2. **Pod label selectors**: If the namespace doesn't enforce a class, the webhook selects the `WorkloadClass` in the pod's namespace that has the highest specificity (matching label selectors) against the pod. If multiple `WorkloadClasses` have the same specificity, the oldest `WorkloadClass` takes precedence. Overlapping `podSelector`s are also reported on the `WorkloadClass` status (see [Testing Selector Overlap Validation](#example-usage)).
+
+### Disruption Policy Semantics
+
+- **Unset fields:** Omitting `allowedDisruptionWindows` allows disruption at any time on every day. A window with an empty `daysOfWeek` applies to every day of the week. A `maxNonDisruptionDurationDays` of `0` (or unset) means no upper bound.
+- **Windows and time zones:** `startTime` and `endTime` are interpreted in the window's `timeZone` (UTC if omitted), and `daysOfWeek` is evaluated in that time zone. A window that crosses midnight belongs to the day it starts: `daysOfWeek: [Monday]` with `22:00`-`04:00` covers Monday 22:00 to Tuesday 04:00. `timeZone` must be an IANA name such as `UTC`, `EST`, or `America/Argentina/Buenos_Aires`; `Local` is rejected because it depends on where the controller runs.
+- **`graceTerminationDurationSeconds`:** While a governed pod is terminating and less than this many seconds have passed since its `deletionTimestamp`, `maintenanceReadiness` stays `NotReady` so in-flight terminations finish before further disruptions. It doesn't override `terminationGracePeriodSeconds`, and the controller doesn't set the eviction's `gracePeriodSeconds`.
+- **Guardrails:** Unset guardrail constraints aren't enforced. With several guardrails, the strictest limit for each field applies (the intersection of `daysOfWeek`, and the minimum `maxAllowedWindows` and `maxNonDisruptionDurationDays`). A `WorkloadClass` that leaves a field unset doesn't comply with a guardrail that limits it, for example `maxNonDisruptionDurationDays: 0` with a guardrail limit of `30`. Creating or updating a guardrail is never blocked by existing `WorkloadClasses`; the webhook returns a warning for each non-compliant `WorkloadClass`, and the controller marks it `Validated=False`.
 
 The controller also expresses each workload's disruption policy as a PodDisruptionBudget for every pod a `WorkloadClass` governs (see [Per-Pod PodDisruptionBudgets](#per-pod-poddisruptionbudgets)).
 
@@ -32,7 +39,7 @@ metadata:
 spec:
   constraints:
     disruption:
-      allowedDisruptionDays:
+      daysOfWeek:
         - Saturday
         - Sunday
       maxAllowedWindows: 2
@@ -83,7 +90,7 @@ kind: Namespace
 metadata:
   name: sample
   labels:
-    workloads.gke.io/default-class: critical-batch
+    workloads.gke.io/enforced-class: critical-batch
 ```
 
 **4. Testing the Capabilities**
@@ -123,7 +130,7 @@ kill $PROXY_PID
 
 **B. Testing Guardrail Validation**
 
-You can attempt to update the `WorkloadClass` with an invalid policy that violates the `WorkloadClassGuardrail` (e.g., setting 32 maxNonDisruptionDurationDays when the guardrail only allows 30). The validation will fail and the WorkloadClass Status will be updated:
+You can attempt to update the `WorkloadClass` with an invalid policy that violates the `WorkloadClassGuardrail` (e.g., setting 32 maxNonDisruptionDurationDays when the guardrail only allows 30). The validation will fail and the WorkloadClass Status will be updated. The message reports the effective guardrail limit, but not the names of the cluster-scoped guardrails:
 
 ```sh
 # Attempt to apply a WorkloadClass with too many windows or invalid duration
@@ -138,7 +145,7 @@ kubectl describe workloadclass critical-workload -n demo
 Status:
   Conditions:
     Last Transition Time:  2026-06-05T14:59:29Z
-    Message:               maxNonDisruptionDurationDays 32 exceeds guardrail limit 30
+    Message:               `maxNonDisruptionDurationDays` must be between 1 and 30, inclusive (guardrail limit), got 32 (0 means no limit)
     Reason:                ValidationFailed
     Status:                False
     Type:                  Validated
@@ -146,26 +153,27 @@ Status:
 Events:                    <none>
 ```
 
-**C. Testing Selector Conflict Validation**
+**C. Testing Selector Overlap Validation**
 
-If you create multiple `WorkloadClass` resources with the same `podSelector` in the same namespace, the controller will detect the conflict and emit a warning Event:
+If the `podSelector`s of two `WorkloadClass` resources in the same namespace could select the same pod (for example `{role: batch-processor}` and `{role: batch-processor, tier: web}`), the controller sets `Validated=False` with reason `SelectorOverlap` on **both** `WorkloadClasses`, so whichever team inspects their `WorkloadClass` sees the conflict:
 
 ```sh
 # Apply a duplicate WorkloadClass in the same namespace with the same selector
 kubectl apply -f config/samples/workloads_v1_workloadclass_duplicate.yaml
-```
 
-*Expected Events:*
-```sh
 # Describe the duplicate WorkloadClass
 kubectl describe workloadclass critical-batch-duplicate -n sample
 ```
 ```
-Events:
-  Type     Reason            Age   From                       Message
-  ----     ------            ----  ----                       -------
-  Warning  ValidationFailed  10s   workloadclass-controller   the following WorkloadClasses have the same PodSelector as critical-batch-duplicate: critical-batch
+Status:
+  Conditions:
+    Message:               `podSelector` must not select the same Pods as another WorkloadClass in the namespace, but it overlaps with the `podSelector` of 'critical-batch'
+    Reason:                SelectorOverlap
+    Status:                False
+    Type:                  Validated
 ```
+
+Guardrail and spec violations take precedence: if the `WorkloadClass` also violates a guardrail, the reason is `ValidationFailed` and the message includes the overlap. A `WorkloadClass` that is only flagged with `SelectorOverlap` still complies with the guardrails, so it keeps governing the pods it is the best match for: the webhook enforces its policy, and the controller keeps its PDBs. Overlap isn't reported in a namespace that enforces a class with `workloads.gke.io/enforced-class`, because `podSelector`s aren't used there.
 
 **D. Evicting as an Allowed Subject Outside the Window**
 
@@ -200,12 +208,12 @@ In addition to the webhook, the controller expresses each workload's disruption 
 
 ### Which Pods Get a PDB
 
-A pod is governed by its best-match `WorkloadClass`, using the same precedence as the webhook: the namespace default if one is set, otherwise the most specific matching `podSelector` (the oldest wins ties). The controller creates a PDB for every governed pod, except:
+A pod is governed by its best-match `WorkloadClass`, using the same precedence as the webhook: the namespace's enforced class if one is set, otherwise the most specific matching `podSelector` (the oldest wins ties). The controller creates a PDB for every governed pod, except:
 
 - **Pods already covered by a user-created PDB.** If any PDB not managed by a `WorkloadClass` selects a pod, the user's PDB takes precedence and the controller doesn't create one. If a user creates such a PDB later, the controller deletes its PDB for the pod, and recreates it if the user's PDB is removed.
 - **Terminating or completed pods.**
 
-> **NOTE:** A `WorkloadClass` without a `podSelector` only governs pods when it is the namespace default.
+> **NOTE:** A `WorkloadClass` without a `podSelector` only governs pods when the namespace enforces it.
 
 ### PDB Spec
 
@@ -215,6 +223,7 @@ Each PDB is named `workload-<pod name>`. The controller labels the pod with `wor
 | --- | --- |
 | `Validated=True` and `MaintenanceReadiness: NotReady` (outside a window, or a pod hasn't met `minInitialRunDurationDays`) | `0`: evictions are blocked. |
 | `MaintenanceReadiness: Ready` or `Overdue` | `100%`: evictions are allowed. |
+| `Validated=False` with reason `SelectorOverlap` only | Same as `Validated=True`: each pod is governed by its best match, so overlap doesn't open PDBs. |
 | `Validated=False` (fails guardrail validation) | `100%`: the controller opens existing PDBs instead of deleting them, and doesn't create new ones. |
 
 ```sh
@@ -231,7 +240,7 @@ workload-test-deployment-5f8c7d9b6c-x2k4p   N/A             0                 0 
 
 Each PDB is owned by its pod's `WorkloadClass` through a controller owner reference, so deleting the `WorkloadClass` deletes its PDBs. The controller also deletes a pod's PDB when the pod is deleted, starts terminating, or reaches a terminal phase, when a user-created PDB starts covering it, or when no `WorkloadClass` governs it anymore.
 
-When a pod's best-match `WorkloadClass` changes, for example because a namespace default is set or a more specific `WorkloadClass` is created, the new `WorkloadClass` takes ownership of the existing PDB rather than deleting and recreating it. The controller never modifies a user-created PDB, even one that happens to be named `workload-<pod name>`.
+When a pod's best-match `WorkloadClass` changes, for example because the namespace starts enforcing a class or a more specific `WorkloadClass` is created, the new `WorkloadClass` takes ownership of the existing PDB rather than deleting and recreating it. The controller never modifies a user-created PDB, even one that happens to be named `workload-<pod name>`.
 
 ### Leasing for Allowed Subjects
 
@@ -322,7 +331,7 @@ metadata:
 spec:
   constraints:
     disruption:
-      allowedDisruptionDays:
+      daysOfWeek:
         - Saturday
         - Sunday
       maxAllowedWindows: 2
@@ -486,6 +495,15 @@ kubectl get pod -n sample -l app=checkout-service -o jsonpath='{.items[0].spec.a
 
 > **NOTE:** `kubectl create deployment` labels the Pods `app=checkout-service`, which matches the WorkloadClass selector. Pods in `kube-system`, `cert-manager`, and `workload-class-system` are never mutated. The cluster needs a Spot node pool (or a compute class that provisions Spot nodes) for Spot-targeted Pods to schedule.
 
+
+## Relationship to Upstream `scheduling.k8s.io` `Workload`
+
+`WorkloadClass` and upstream `scheduling.k8s.io` `Workload` (KEP-4671) address orthogonal layers of workload management:
+
+- **`scheduling.k8s.io` `Workload`** models a **runtime scheduling unit and pod-group topology**, such as gang scheduling constraints for batch and AI jobs, and gang disruption policies that define *what unit* must be disrupted together.
+- **`WorkloadClass`** defines **operational maintenance and disruption policies**: *when* and *under what organizational guardrails* disruptions are allowed, such as time-zone-aware maintenance windows, minimum initial run durations, and `maxNonDisruptionDurationDays`.
+
+The two APIs are complementary: `Workload` governs pod-group scheduling and gang disruption scope, while `WorkloadClass` governs temporal readiness and guardrail enforcement for maintenance disruptions.
 
 ## Getting Started
 

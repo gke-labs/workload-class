@@ -193,7 +193,7 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Patching the Guardrail to allow today")
-			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"]}}}}`, currentDay)
+			patchGR := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"daysOfWeek": ["%s"]}}}}`, currentDay)
 			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", patchGR)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
@@ -239,7 +239,7 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Patching the Guardrail to allow tomorrow")
-			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"daysOfWeek": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
 			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
@@ -273,7 +273,7 @@ var _ = Describe("WorkloadClass Eviction Webhook", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Patching the Guardrail to allow tomorrow")
-			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"allowedDisruptionDays": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
+			guardrailPatch := fmt.Sprintf(`{"spec": {"constraints": {"disruption": {"daysOfWeek": ["%s"], "maxNonDisruptionDurationDays": 30}}}}`, notToday)
 			cmd = exec.Command("kubectl", "patch", "workloadclassguardrail", "default", "--type", "merge", "-p", guardrailPatch)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())

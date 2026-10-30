@@ -101,7 +101,9 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 	// Only mutate once the controllers have confirmed the WorkloadClass is valid against guardrails and,
 	// when a GKESpotPlacementPolicy is referenced, that it has attached. The WorkloadClass controller
 	// removes PlacementPluginAttached when there is no InfrastructureProfileRef, so it is only required
-	// when a profile is referenced. Missing or Unknown conditions are treated as not ready, as are conditions
+	// when a profile is referenced. A WorkloadClass that is only flagged for an overlapping PodSelector
+	// (SelectorOverlap) is still valid against guardrails, because each Pod resolves to a single best match.
+	// Missing or Unknown conditions are treated as not ready, as are conditions
 	// observed for an older generation: after a spec edit they describe the previous spec until the controllers
 	// reconcile, so mutating on them could apply an unvalidated CapacityStrategy.
 	requiredConds := []string{workloadsv1.ConditionTypeValidated}
@@ -114,7 +116,8 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 		case c == nil:
 			log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", cType)
 			return nil
-		case c.Status != metav1.ConditionTrue:
+		case cType == workloadsv1.ConditionTypeValidated && !utils.IsValidated(c),
+			cType != workloadsv1.ConditionTypeValidated && c.Status != metav1.ConditionTrue:
 			log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", cType, "reason", c.Reason, "message", c.Message)
 			return nil
 		case bestWLC.Generation > 0 && c.ObservedGeneration != bestWLC.Generation:

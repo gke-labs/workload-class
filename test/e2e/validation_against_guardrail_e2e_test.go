@@ -190,7 +190,7 @@ var _ = Describe("WorkloadClass Validation Against Guardrail", Ordered, func() {
 			}
 			Eventually(verifyWorkloadClassValidated, 2*time.Minute, 2*time.Second).Should(Succeed())
 		})
-		It("should fail validation of a WorkloadClass with a day that is not in the allowedDisruptionDays", func() {
+		It("should fail validation of a WorkloadClass with a day that is not in the guardrail daysOfWeek", func() {
 			By("Updating the WorkloadClass with a Monday DisruptionWindow")
 			patch := `[{"op": "add", "path": "/spec/disruptionPolicy/allowedDisruptionWindows/-", "value": {"name": "bad-day", "daysOfWeek": ["Monday"], "startTime": "00:00", "endTime": "01:00", "timeZone": "America/Toronto"}}]`
 			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "json", "-p", patch)

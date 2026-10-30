@@ -94,37 +94,53 @@ spec:
                 description: DisruptionPolicy specifies the policy governing pod disruptions.
                 properties:
                   allowedDisruptionWindows:
-                    description: AllowedDisruptionWindows defines when disruptions
-                      are allowed.
+                    description: |-
+                      AllowedDisruptionWindows defines when disruptions are allowed.
+                      When unset or empty, disruptions are allowed at all times on all days of the week.
                     items:
                       description: DisruptionWindow defines a temporal window when
                         disruptions are allowed.
                       properties:
                         daysOfWeek:
-                          description: DaysOfWeek specifies the days of the week (Monday-Sunday).
+                          description: |-
+                            DaysOfWeek specifies the days of the week (Monday-Sunday) on which the window starts.
+                            When unset or empty, the window applies to every day of the week.
                           items:
                             type: string
                           type: array
                         endTime:
                           description: EndTime is the end time of the window in HH:MM
-                            format (e.g. 04:00) in UTC.
+                            format (e.g. 04:00) in the specified timeZone (or UTC
+                            if timeZone is omitted).
                           pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
                           type: string
                         name:
                           description: Name is the name of the DisruptionWindow.
+                          minLength: 1
                           type: string
                         startTime:
                           description: StartTime is the start time of the window in
-                            HH:MM format (e.g. 22:00) in UTC.
+                            HH:MM format (e.g. 22:00) in the specified timeZone (or
+                            UTC if timeZone is omitted).
                           pattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
                           type: string
                         timeZone:
                           description: TimeZone is the IANA Time Zone Database name
-                            (e.g., "America/Los_Angeles", "Etc/UTC"). See https://www.iana.org/time-zones.
-                          pattern: ^[A-Za-z_]+/[A-Za-z_]+$
+                            (e.g., "America/Los_Angeles", "America/Argentina/Buenos_Aires",
+                            "Etc/UTC", "UTC"). See https://www.iana.org/time-zones.
+                          maxLength: 63
+                          pattern: ^([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}|UTC|GMT)$
                           type: string
+                          x-kubernetes-validations:
+                          - message: must not be 'Local' or 'local'
+                            rule: self != 'Local' && self != 'local'
+                      required:
+                      - name
                       type: object
                     type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   allowedDisruptionsOutsideOfWindow:
                     description: AllowedDisruptionsOutsideOfWindow specifies subjects
                       that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
@@ -157,13 +173,19 @@ spec:
                       - name
                       type: object
                     type: array
+                    x-kubernetes-list-map-keys:
+                    - kind
+                    - name
+                    x-kubernetes-list-type: map
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
                       immediately.
                     type: boolean
-                  graceTerminationDuration:
-                    description: GraceTerminationDuration is the maximum time in seconds
-                      for a pod to terminate gracefully.
+                  graceTerminationDurationSeconds:
+                    description: |-
+                      GraceTerminationDurationSeconds is the duration in seconds after a pod's deletionTimestamp is set during which
+                      the controller keeps the WorkloadClass MaintenanceReadiness as NotReady to allow in-flight pod terminations to drain
+                      before further disruptions occur. It does not override Pod.spec.terminationGracePeriodSeconds or set eviction DeleteOptions.gracePeriodSeconds.
                     format: int32
                     minimum: 0
                     type: integer
@@ -171,6 +193,7 @@ spec:
                     description: |-
                       MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
                       If exceeded, maintenance takes precedence over per-pod run-duration hints.
+                      When unset (0), no upper bound is placed on how long the workload can remain undisrupted.
                     format: int32
                     minimum: 0
                     type: integer
@@ -209,8 +232,12 @@ spec:
                 - name
                 type: object
               podSelector:
-                description: PodSelector matches the pods that this class applies
-                  to.
+                description: |-
+                  PodSelector matches the pods in the same namespace that this class applies to.
+                  If a Namespace has the "workloads.gke.io/enforced-class" label (EnforcedClassLabel) set,
+                  the referenced WorkloadClass is enforced for all pods in that namespace and overrides PodSelector
+                  matching. Otherwise, PodSelector selects the target pods in the namespace; overlapping PodSelectors
+                  across WorkloadClasses in the same namespace are surfaced as a status Condition.
                 properties:
                   matchExpressions:
                     description: matchExpressions is a list of label selector requirements.

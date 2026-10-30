@@ -45,7 +45,7 @@ const (
 
 	// placementNS holds WorkloadClasses selected by podSelector.
 	placementNS = "spot-placement-e2e"
-	// placementDefaultNS is labeled with a namespace-default WorkloadClass.
+	// placementDefaultNS is labeled with a namespace-enforced WorkloadClass.
 	placementDefaultNS    = "spot-placement-default-e2e"
 	placementDefaultClass = "ns-default"
 
@@ -66,7 +66,7 @@ metadata:
 spec:
   constraints:
     disruption:
-      allowedDisruptionDays:
+      daysOfWeek:
         - Saturday
         - Sunday
       maxAllowedWindows: 2
@@ -388,7 +388,7 @@ var _ = Describe("Pod Placement Webhook", Ordered, func() {
 		_, err = utils.Run(exec.Command("kubectl", "create", "ns", placementDefaultNS))
 		Expect(err).NotTo(HaveOccurred())
 		_, err = utils.Run(exec.Command("kubectl", "label", "--overwrite", "ns", placementDefaultNS,
-			"workloads.gke.io/default-class="+placementDefaultClass))
+			"workloads.gke.io/enforced-class="+placementDefaultClass))
 		Expect(err).NotTo(HaveOccurred())
 
 		By("looking up a node to bind existing Pods to")
@@ -848,8 +848,8 @@ var _ = Describe("Pod Placement Webhook", Ordered, func() {
 		})
 	})
 
-	Context("When the namespace has a default WorkloadClass", func() {
-		It("applies the namespace default to Pods regardless of their labels and counts all Pods in the namespace", func() {
+	Context("When the namespace has an enforced WorkloadClass", func() {
+		It("applies the namespace's enforced WorkloadClass to Pods regardless of their labels and counts all Pods in the namespace", func() {
 			wc := &workloadsv1.WorkloadClass{
 				TypeMeta:   metav1.TypeMeta{APIVersion: workloadsv1.GroupVersion.String(), Kind: "WorkloadClass"},
 				ObjectMeta: metav1.ObjectMeta{Name: placementDefaultClass, Namespace: placementDefaultNS},

@@ -44,8 +44,9 @@ import (
 //     On-Demand node throughout, so Pods that prefer Spot land on it and become fallback Pods.
 //   - Workloads are Deployments (pause image), so evicted Pods are recreated by a controller and go back
 //     through the webhook, like in production.
-//   - WorkloadClasses carry no disruptionPolicy. With none, maintenance readiness is Overdue, so the PDB the
-//     core controller creates allows 100% unavailable and the disruption webhook admits evictions.
+//   - WorkloadClasses only set maxNonDisruptionDurationDays (see newRuntimeWorkloadClass). Without
+//     allowedDisruptionWindows they are always in an allowed window, so maintenance readiness is Ready, the PDB
+//     the core controller creates allows 100% unavailable, and the disruption webhook admits evictions.
 //
 // Not covered here: reversion stopping once the Spot share meets spotRatio. With a single node that is
 // either Spot or On-Demand, a workload cannot have Pods on both at once, so that path is unit-tested only.
@@ -56,6 +57,11 @@ const (
 	autoscalerStatusName = "cluster-autoscaler-status"
 
 	// runtimeGuardrailTmpl is a baseline guardrail whose placement block is filled in per spec.
+//
+// Its disruption constraints must not invalidate the runtime WorkloadClasses: unset WorkloadClass fields don't
+// comply with a guardrail that limits them, so it doesn't restrict daysOfWeek (the WorkloadClasses have no
+// disruption windows, which allows every day), and runtimeMaxNonDisruptionDays is shared with
+// newRuntimeWorkloadClass.
 	runtimeGuardrailTmpl = `
 apiVersion: workloads.gke.io/v1
 kind: WorkloadClassGuardrail
@@ -64,11 +70,8 @@ metadata:
 spec:
   constraints:
     disruption:
-      allowedDisruptionDays:
-        - Saturday
-        - Sunday
       maxAllowedWindows: 2
-      maxNonDisruptionDurationDays: 30
+      maxNonDisruptionDurationDays: %d
   pluginConstraints:
     placement:
       - name: gke-spot-placement
@@ -78,7 +81,7 @@ spec:
 )
 
 func runtimeGuardrail(params string) string {
-	return fmt.Sprintf(runtimeGuardrailTmpl, params)
+	return fmt.Sprintf(runtimeGuardrailTmpl, runtimeMaxNonDisruptionDays, params)
 }
 
 // setSpotCapacity writes the cluster autoscaler status ConfigMap with a Spot node group that is either Healthy
@@ -117,10 +120,17 @@ func clearSpotCapacity() {
 	_, _ = utils.Run(exec.Command("kubectl", "delete", "configmap", autoscalerStatusName, "-n", autoscalerStatusNS, "--ignore-not-found"))
 }
 
+// runtimeMaxNonDisruptionDays is the guardrail limit and WorkloadClass value for maxNonDisruptionDurationDays.
+// A WorkloadClass that leaves it unset (no limit) would fail validation against runtimeGuardrailTmpl.
+const runtimeMaxNonDisruptionDays = 30
+
 // newRuntimeWorkloadClass returns a WorkloadClass in runtimeNS selecting app=<app> that references the e2e policy.
+// It sets maxNonDisruptionDurationDays so that it complies with runtimeGuardrailTmpl, and leaves out disruption
+// windows so that evictions are always allowed.
 func newRuntimeWorkloadClass(app string, cs *workloadsv1.CapacityStrategy) *workloadsv1.WorkloadClass {
 	wc := newPlacementWorkloadClass(app, cs, withSpotPolicyRef())
 	wc.Namespace = runtimeNS
+	wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = runtimeMaxNonDisruptionDays
 	return wc
 }
 

@@ -29,9 +29,9 @@ type Constraints struct {
 
 // Disruption defines the constraints within which WorkloadClasses can set disruption policies.
 type Disruption struct {
-	// AllowedDisruptionDays specifies days on which disruption can happen (Monday-Sunday).
+	// DaysOfWeek specifies days on which disruption can happen (Monday-Sunday).
 	// +optional
-	AllowedDisruptionDays []string `json:"allowedDisruptionDays,omitempty"`
+	DaysOfWeek []string `json:"daysOfWeek,omitempty"`
 
 	// MaxAllowedWindows sets the limit of how many windows workload owners can set.
 	// This avoid complications where windows are too short or cases where there could be too many disruptions to workloads.

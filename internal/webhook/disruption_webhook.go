@@ -28,6 +28,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,12 +81,13 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	log = log.WithValues("workloadClass", bestWC.Name)
 
-	// Check Guardrail validation (if it fails, we don't enforce constraints)
-	for _, cond := range bestWC.Status.Conditions {
-		if cond.Type == workloadsv1.ConditionTypeValidated && cond.Status == metav1.ConditionFalse {
-			log.Info("WorkloadClass failed Guardrail validation, ignoring constraints")
-			return admission.Allowed("WorkloadClass failed Guardrail validation")
-		}
+	// Check Guardrail validation (if it fails, we don't enforce constraints). A WorkloadClass that is only
+	// flagged for an overlapping PodSelector (SelectorOverlap) still complies with the guardrails, and this Pod
+	// resolved to it as its best match, so its constraints are still enforced.
+	if cond := meta.FindStatusCondition(bestWC.Status.Conditions, workloadsv1.ConditionTypeValidated); cond != nil &&
+		cond.Status == metav1.ConditionFalse && !utils.IsValidated(cond) {
+		log.Info("WorkloadClass failed Guardrail validation, ignoring constraints")
+		return admission.Allowed("WorkloadClass failed Guardrail validation")
 	}
 
 	// Emergency Override

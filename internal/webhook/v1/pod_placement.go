@@ -131,7 +131,7 @@ func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, inco
 
 // listWorkloadClassPods lists active (non-terminating, non-terminal) Pods in the incoming Pod's namespace
 // that the WorkloadClass applies to, excluding the incoming Pod itself (see utils.WorkloadClassPodSelector: a
-// nil PodSelector, or the WorkloadClass being the namespace default, selects all Pods in the namespace). When
+// nil PodSelector, or the WorkloadClass being the namespace's enforced WorkloadClass, selects all Pods in the namespace). When
 // multiple WorkloadClasses exist in the namespace, each Pod is only counted for its best-matching WorkloadClass.
 func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) ([]*corev1.Pod, error) {
 	selector, err := utils.WorkloadClassPodSelector(ctx, d.Client, wc)
