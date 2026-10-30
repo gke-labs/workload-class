@@ -8,24 +8,33 @@ Welcome to `gke-labs/workload-class`! This document guides autonomous agents, AI
 - `internal/controller/`: Reconcilers for `WorkloadClass`, `WorkloadClassGuardrail`, `GKESpotPlacementPolicy`, and GKE Spot placement, capacity detection, fallback, and reversion.
 - `internal/webhook/` and `internal/webhook/v1/`: Pod disruption eviction validating webhook (`/validate-disruption`), Pod placement mutating/validating webhooks, and `WorkloadClassGuardrail` admission webhook.
 - `internal/utils/`: Shared helpers for Per-Pod `PodDisruptionBudget` (`PDB`) management, PDB lease tracking, guardrail validation, temporal window evaluation, and Spot ratio/fallback calculations.
+- `internal/invariants/`: Stateless runtime safety invariant evaluators (`I1`–`I5`) and unit tests.
+- `docs/invariants.md`: Authoritative specification of runtime safety invariants (`I1`–`I5`).
+- `verification-suite/verify_invariant_governance.sh`: Tier-0 (`T0`) Two-Lane CODEOWNERS governance gate.
+- `.agents/skills/`: Pre-PR self-review skills (`review-adversarial`, `review-docs-drift`).
 - `config/`, `dist/install.yaml`, and `dist/chart/`: Kustomize manifests, consolidated YAML installer bundle, and Helm chart.
 - `test/e2e/`: End-to-end Ginkgo/Gomega test suites (run against an isolated Kind cluster).
-- `docs/`: Repository documentation (`docs/contributing.md`).
 - `hack/boilerplate.go.txt`: Canonical Apache-2.0 license header template.
 
-## 2. Build, Test & Verification Commands
+## 2. Build, Test & Governance Commands
 - **Unit & envtest suites:** Run `make test` (matching `.github/workflows/test.yml`).
   - Note: `internal/controller` and `internal/webhook/v1` use `envtest` (`etcd` + `kube-apiserver`). Running bare `go test -race ./...` on a fresh checkout or worktree will fail unless `envtest` binaries are configured first via `make setup-envtest` and `KUBEBUILDER_ASSETS="$(./bin/setup-envtest use -p path --bin-dir ./bin)" go test -race $(go list ./... | grep -v /e2e)`.
 - **Linter & static analysis:** Run `make lint` (matching `.github/workflows/lint.yml`) and `go vet ./...`.
+- **Two-Lane Invariant Governance (`T0`):** Run `./verification-suite/verify_invariant_governance.sh` (and `./verification-suite/verify_invariant_governance.sh --self-test`).
 - **Generated code & distribution artifacts:**
   - Never manually edit or regenerate `api/v1/zz_generated.deepcopy.go` unless `api/v1/` types changed.
   - When `api/v1/` types or Kubebuilder RBAC/webhook markers change, run `make manifests generate` and keep `dist/install.yaml` (`make build-installer`) and `dist/chart/` in sync so `.github/workflows/test-chart.yml` passes.
 - **License headers:** All new `.go` and `.sh` files must include the standard Apache-2.0 header from `hack/boilerplate.go.txt`.
 
-## 3. Pull Request Hygiene & Self-Review
+## 3. Two-Lane CODEOWNERS Invariant Governance
+Changes to runtime safety invariants (`internal/invariants/` and `docs/invariants.md`) are governed by `.github/CODEOWNERS` and `./verification-suite/verify_invariant_governance.sh`:
+- **Lane 1 (`feature/*`, `fix/*`, `docs/*`, `chore/*`):** Must NOT modify `internal/invariants/**`, `docs/invariants.md`, `.github/CODEOWNERS`, or `verification-suite/verify_invariant_governance.sh`. Never weaken an invariant to make a test pass. (Rare atomic co-changes require an `Invariant-Cochange: <rationale>` commit trailer or the `allow-invariant-cochange` PR label.)
+- **Lane 2 (`invariant/*`):** Must touch ONLY `internal/invariants/**` and `docs/invariants.md`, and must include both positive (`GREEN`) tests and negative fault-injection (`RED`) tests.
+
+## 4. Pull Request Hygiene & Fresh-Context Self-Review
 1. **Worktree Guidance for Parallel Agent Sessions:** When running multiple local agent tasks in parallel, prefer using isolated git worktrees (for example under `~/workload-class-wt/<worktree-name>`) branched from `origin/main` (or `upstream/main` when working from a fork), or from the parent PR branch when creating stacked PRs (`base -> child`):
    `git fetch origin --prune && git worktree add -B <branch-name> ~/workload-class-wt/<worktree-name> origin/main`
-2. **Pre-PR Self-Review:** Before opening or updating a PR, review the full branch diff against the target base branch (`origin/main`, `upstream/main`, or the parent branch in a PR stack) for state/reconciler edge cases, webhook safety, test coverage, and documentation/manifest drift (`README.md`, `dist/install.yaml`, `dist/chart/`). Record findings under `## Self-Review` in the PR description.
+2. **Mandatory Pre-PR Self-Review (Fresh Context):** Before opening or updating a PR, spawn a fresh subagent context (that did not author the edits) to run `.agents/skills/review-adversarial/SKILL.md` and `.agents/skills/review-docs-drift/SKILL.md`. Record findings and fixes under `## Self-Review` in the PR description (following `.github/PULL_REQUEST_TEMPLATE.md`).
 3. **Open-Source Hygiene:** Never commit internal corporate URLs, internal issue links, LDAPs, or internal GCP project IDs.
 
 ---
