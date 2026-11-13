@@ -51,3 +51,12 @@ func IsGKESpotManaged(wc *workloadsv1.WorkloadClass) bool {
 	ref := wc.Spec.InfrastructureProfileRef
 	return ref == nil || ReferencesGKESpotPlacementPolicy(ref)
 }
+
+// OnTargetComputeClass returns the policy's customComputeClass when the policy opts in with
+// CountComputeClassAsTargetAnnotation, otherwise "".
+func OnTargetComputeClass(policy *workloadsv1.GKESpotPlacementPolicy) string {
+	if policy == nil || policy.Spec.CustomComputeClass == "" || policy.Annotations[CountComputeClassAsTargetAnnotation] != "true" {
+		return ""
+	}
+	return policy.Spec.CustomComputeClass
+}

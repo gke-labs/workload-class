@@ -34,6 +34,25 @@ func IsSpotNode(node *corev1.Node) bool {
 	return node != nil && node.Labels[SpotLabelKey] == SpotLabelValue
 }
 
+const (
+	// CountComputeClassAsTargetAnnotation, set to "true" on a GKESpotPlacementPolicy with a non-Spot
+	// customComputeClass, makes nodes of that compute class count as "on target" (like Spot nodes) for
+	// spotRatio accounting and fallback detection. This lets the Spot plugin split a workload between a
+	// preferred compute class and default capacity. Experimental (workload-class demo).
+	CountComputeClassAsTargetAnnotation = "workloads.gke.io/count-compute-class-as-target"
+	// ComputeClassNodeLabelKey is the GKE node label carrying the node's compute class.
+	ComputeClassNodeLabelKey = "cloud.google.com/compute-class"
+)
+
+// IsOnTargetNode reports whether a Spot-targeted Pod on node is on target: the node is a Spot node, or
+// targetCCC is set and the node belongs to that compute class.
+func IsOnTargetNode(node *corev1.Node, targetCCC string) bool {
+	if IsSpotNode(node) {
+		return true
+	}
+	return node != nil && targetCCC != "" && node.Labels[ComputeClassNodeLabelKey] == targetCCC
+}
+
 // IsPodTargetedForSpot reports whether the Pod has been directed at Spot capacity (by the Pod placement
 // webhook), either via the Spot nodeSelector or the Spot toleration. Pods placed on On-Demand on purpose
 // carry neither.

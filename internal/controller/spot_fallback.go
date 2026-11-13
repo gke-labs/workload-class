@@ -108,7 +108,7 @@ func desiredFallbackCondition(wc *workloadsv1.WorkloadClass, pods workloadPods, 
 func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context, wc *workloadsv1.WorkloadClass, policy *workloadsv1.GKESpotPlacementPolicy) (workloadPods, error) {
 	var pods workloadPods
 	if tracksFallback(wc) {
-		spotNodes, err := r.listSpotNodeNames(ctx)
+		spotNodes, err := r.listOnTargetNodeNames(ctx, utils.OnTargetComputeClass(policy))
 		if err != nil {
 			return pods, err
 		}
@@ -215,6 +215,23 @@ func (r *GKESpotPlacementReconciler) listSpotNodeNames(ctx context.Context) (map
 		spotNodes[nodes.Items[i].Name] = true
 	}
 	return spotNodes, nil
+}
+
+// listOnTargetNodeNames returns the Spot nodes plus, when targetCCC is set (the policy opted in with
+// utils.CountComputeClassAsTargetAnnotation), the nodes of that compute class.
+func (r *GKESpotPlacementReconciler) listOnTargetNodeNames(ctx context.Context, targetCCC string) (map[string]bool, error) {
+	onTarget, err := r.listSpotNodeNames(ctx)
+	if err != nil || targetCCC == "" {
+		return onTarget, err
+	}
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes, client.MatchingLabels{utils.ComputeClassNodeLabelKey: targetCCC}); err != nil {
+		return nil, fmt.Errorf("failed to list compute class %s nodes: %w", targetCCC, err)
+	}
+	for i := range nodes.Items {
+		onTarget[nodes.Items[i].Name] = true
+	}
+	return onTarget, nil
 }
 
 // classifyWorkloadPods splits the active Pods the WorkloadClass applies to by placement. A nil PodSelector, or
