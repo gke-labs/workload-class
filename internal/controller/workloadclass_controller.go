@@ -649,6 +649,9 @@ func addPlacementViolation(validation, placement *metav1.Condition) {
 }
 
 func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
+	if wc == nil {
+		return false
+	}
 	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 {
 		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
 		if wc.Status.LastDisruptionTime != nil {
@@ -656,7 +659,9 @@ func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 		}
 		return now.Sub(wc.CreationTimestamp.Time) > maxDuration
 	}
-	return true
+	// An unset (0) MaxNonDisruptionDurationDays places no upper bound on how long the workload may remain
+	// undisrupted, so it is never overdue and defers to AllowedDisruptionWindows and lifecycle checks.
+	return false
 }
 
 func evaluatePodGracePeriod(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {

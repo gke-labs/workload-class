@@ -380,10 +380,13 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 
 		It("should be overdue if time since last disruption exceeds max", func() {
-			By("updating WorkloadClass with old last disruption")
+			By("updating WorkloadClass with MaxNonDisruptionDurationDays and old last disruption")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 2
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Status.LastDisruptionTime = &metav1.Time{
 				Time: time.Now().AddDate(0, 0, -4),
 			}
@@ -870,93 +873,119 @@ var _ = Describe("WorkloadClass Controller", func() {
 })
 
 func TestOverdue(t *testing.T) {
-	wc := &workloadsv1.WorkloadClass{
-		Spec: workloadsv1.WorkloadClassSpec{
-			DisruptionPolicy: workloadsv1.DisruptionPolicy{},
-		},
-		Status: workloadsv1.WorkloadClassStatus{},
-	}
+	now := time.Now().UTC()
+
 	testCases := []struct {
-		name                     string
-		desc                     string
-		wc                       *workloadsv1.WorkloadClass
-		setLastDisruption        bool
-		setMNDDD                 bool
-		maxNonDisruptionDuration int
-		lastDisruption           time.Time
-		want                     bool
+		name string
+		wc   *workloadsv1.WorkloadClass
+		want bool
 	}{
 		{
 			name: "wc_nil",
-			desc: "WorkloadClass is nil, want true",
+			wc:   nil,
+			want: false,
+		},
+		{
+			name: "max_non_disruption_days_unset_and_last_disruption_nil",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(-1, 0, 0)}},
+			},
+			want: false,
+		},
+		{
+			name: "max_non_disruption_days_unset_with_old_last_disruption",
+			wc: &workloadsv1.WorkloadClass{
+				Status: workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: now.AddDate(-1, 0, 0)},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "last_disruption_nil_created_recently_not_overdue",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(0, 0, -5)}},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "last_disruption_nil_created_before_max_duration_overdue",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(0, 0, -15)}},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+			},
 			want: true,
 		},
 		{
-			name:              "fields_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want true",
-			setLastDisruption: false,
-			setMNDDD:          false,
-			want:              true,
+			name: "diff_greater_than_max_duration",
+			wc: &workloadsv1.WorkloadClass{
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: now.AddDate(0, -1, 0)},
+				},
+			},
+			want: true,
 		},
 		{
-			name:              "max_non_disruption_days_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set but LastDisrupt ionTime is set, want true",
-			setLastDisruption: true,
-			setMNDDD:          false,
-			want:              true,
-		},
-		{
-			name:              "last_disruption_time_not_set",
-			desc:              "MaxNonDisruptionDurationDays is set but LastDisruptionTime is nil, want ",
-			setLastDisruption: true,
-			setMNDDD:          false,
-			want:              true,
-		},
-		{
-			name:              "fields_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want true",
-			setLastDisruption: false,
-			setMNDDD:          false,
-			want:              true,
-		},
-		{
-			name:                     "diff_greater_than_max_duration",
-			desc:                     "Overdue",
-			setLastDisruption:        true,
-			setMNDDD:                 true,
-			maxNonDisruptionDuration: 10,
-			lastDisruption:           time.Now().AddDate(0, -1, 0),
-			want:                     true,
-		},
-		{
-			name:                     "diff_less_than_max_duration",
-			desc:                     "Not overdue",
-			setLastDisruption:        true,
-			setMNDDD:                 true,
-			maxNonDisruptionDuration: 10,
-			lastDisruption:           time.Now().AddDate(0, 0, -5),
-			want:                     false,
+			name: "diff_less_than_max_duration",
+			wc: &workloadsv1.WorkloadClass{
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: now.AddDate(0, 0, -5)},
+				},
+			},
+			want: false,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			now := time.Now()
-			if tc.setLastDisruption {
-				wc.Status.LastDisruptionTime = &metav1.Time{Time: tc.lastDisruption}
-			}
-			if tc.setMNDDD {
-				wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = int32(tc.maxNonDisruptionDuration)
-			}
-			defer func() {
-				wc.Status.LastDisruptionTime = nil
-				wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 0
-			}()
-
-			if got := overdue(wc, now); got != tc.want {
-				t.Errorf("overdue() returned an unexpected result, got %v, want %v", got, tc.want)
+			if got := overdue(tc.wc, now); got != tc.want {
+				t.Errorf("overdue() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCalculateReadiness_UnsetMaxNonDisruptionDurationRespectsWindow(t *testing.T) {
+	scheme := newTestScheme(t)
+	notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "no-max-duration",
+			Namespace:         "default",
+			CreationTimestamp: metav1.Time{Time: time.Now().UTC().AddDate(-1, 0, 0)},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "other-day", DaysOfWeek: []string{notToday}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"},
+				},
+				// MaxNonDisruptionDurationDays intentionally unset (0).
+			},
+		},
+	}
+
+	r := &WorkloadClassReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).Build(),
+		Scheme: scheme,
+	}
+
+	readiness, _, err := r.calculateReadiness(context.Background(), wc)
+	if err != nil {
+		t.Fatalf("calculateReadiness() unexpected error: %v", err)
+	}
+	if readiness != workloadsv1.ReadinessNotReady {
+		t.Errorf("calculateReadiness() = %v, want %v when maxNonDisruptionDurationDays is unset outside window", readiness, workloadsv1.ReadinessNotReady)
 	}
 }
 
