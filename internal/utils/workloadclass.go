@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
@@ -235,4 +236,28 @@ func IsValidated(cond *metav1.Condition) bool {
 		return false
 	}
 	return cond.Status == metav1.ConditionTrue || cond.Reason == workloadsv1.ReasonSelectorOverlap
+}
+
+// DisruptionValidatedCondition returns the WorkloadClass's DisruptionValidated condition, falling back
+// to the overall Validated condition when DisruptionValidated has not been populated yet.
+func DisruptionValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	if wc == nil {
+		return nil
+	}
+	if cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated); cond != nil {
+		return cond
+	}
+	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
+}
+
+// PlacementValidatedCondition returns the WorkloadClass's PlacementValidated condition, falling back
+// to the overall Validated condition when PlacementValidated has not been populated yet.
+func PlacementValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	if wc == nil {
+		return nil
+	}
+	if cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementValidated); cond != nil {
+		return cond
+	}
+	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
 }

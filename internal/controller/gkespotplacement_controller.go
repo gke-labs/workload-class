@@ -154,11 +154,11 @@ func (r *GKESpotPlacementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// isReady reports whether the central controller has validated the WorkloadClass and, when it references a
-// GKESpotPlacementPolicy, whether the policy controller has attached it. This is the same gate the Pod
-// placement webhook applies before mutating Pods.
+// isReady reports whether the central controller has validated the WorkloadClass's placement configuration
+// and, when it references a GKESpotPlacementPolicy, whether the policy controller has attached it. This is
+// the same gate the Pod placement webhook applies before mutating Pods.
 func isReady(wc *workloadsv1.WorkloadClass) bool {
-	if !utils.IsValidated(meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)) {
+	if !utils.IsValidated(utils.PlacementValidatedCondition(wc)) {
 		return false
 	}
 	return !utils.ReferencesGKESpotPlacementPolicy(wc.Spec.InfrastructureProfileRef) ||
