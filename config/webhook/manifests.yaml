@@ -54,6 +54,26 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-policy-v1-poddisruptionbudget
+  failurePolicy: Ignore
+  name: vpoddisruptionbudget-v1.kb.io
+  rules:
+  - apiGroups:
+    - policy
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - poddisruptionbudgets
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-workloads-gke-io-v1-workloadclassguardrail
   failurePolicy: Fail
   name: vworkloadclassguardrail-v1.kb.io
