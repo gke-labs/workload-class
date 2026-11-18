@@ -61,6 +61,10 @@ type WorkloadClassReconciler struct {
 	// event channel and applies the pending leases of a WorkloadClass when reconciling it. If nil, no leases
 	// are applied.
 	LeaseTracker *utils.PendingLeaseTracker
+
+	// DisruptionTracker holds observed disruption timestamps from the disruption webhook. The reconciler watches
+	// its event channel and persists Status.LastDisruptionTime when reconciling the WorkloadClass.
+	DisruptionTracker *utils.DisruptionTracker
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -80,8 +84,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	wc := &workloadsv1.WorkloadClass{}
 	if err := r.Get(ctx, req.NamespacedName, wc); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Discard any lease requests for a deleted WorkloadClass.
+			// Discard any pending tracker entries for a deleted WorkloadClass.
 			r.LeaseTracker.Drain(req.NamespacedName)
+			r.DisruptionTracker.Drain(req.NamespacedName)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -116,18 +121,33 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	reconcileConditions(&validationCond, pluginPlacementCondition)
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
-	// 2. Calculate Readiness
+	// 2. Apply any recorded disruption timestamp before calculating readiness so an Overdue WorkloadClass
+	// resets immediately once a disruption occurs. Re-record on error so transient conflicts do not lose it.
+	disruptionUpdated := false
+	lastDisruption, hasDisruption := r.DisruptionTracker.Drain(req.NamespacedName)
+	if hasDisruption && (wc.Status.LastDisruptionTime == nil || lastDisruption.After(wc.Status.LastDisruptionTime.Time)) {
+		wc.Status.LastDisruptionTime = &metav1.Time{Time: lastDisruption}
+		disruptionUpdated = true
+	}
+
+	// 3. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
 	if err != nil {
+		if hasDisruption {
+			r.DisruptionTracker.Record(wc, lastDisruption)
+		}
 		log.Error(err, "Failed to calculate readiness")
 		return ctrl.Result{}, err
 	}
 
-	// 3. Update Status
-	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
+	// 4. Update Status
+	if wc.Status.MaintenanceReadiness != readiness || changed || removed || disruptionUpdated {
 		wc.Status.MaintenanceReadiness = readiness
 		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
 		if err := r.Status().Update(ctx, wc); err != nil {
+			if hasDisruption {
+				r.DisruptionTracker.Record(wc, lastDisruption)
+			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -1118,6 +1138,10 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.LeaseTracker != nil {
 		// Apply lease requests from the disruption webhook.
 		b = b.WatchesRawSource(source.Channel(r.LeaseTracker.Events(), &handler.EnqueueRequestForObject{}))
+	}
+	if r.DisruptionTracker != nil {
+		// Persist Status.LastDisruptionTime for disruptions observed by the disruption webhook.
+		b = b.WatchesRawSource(source.Channel(r.DisruptionTracker.Events(), &handler.EnqueueRequestForObject{}))
 	}
 
 	return b.Named("workloadclass").Complete(r)

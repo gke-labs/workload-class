@@ -202,12 +202,14 @@ func main() {
 	// an in-memory tracker. This requires the webhook and the controller to run in the same replica: with
 	// multiple replicas, requests received by a non-leader replica would never be applied.
 	leaseTracker := utils.NewPendingLeaseTracker(utils.DefaultPendingLeaseBufferSize)
+	disruptionTracker := utils.NewDisruptionTracker(utils.DefaultDisruptionBufferSize)
 
 	if err := (&controller.WorkloadClassReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		Recorder:     mgr.GetEventRecorder("workloadclass-controller"),
-		LeaseTracker: leaseTracker,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          mgr.GetEventRecorder("workloadclass-controller"),
+		LeaseTracker:      leaseTracker,
+		DisruptionTracker: disruptionTracker,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadClass")
 		os.Exit(1)
@@ -223,9 +225,10 @@ func main() {
 	setupLog.Info("Registering disruption webhook")
 	mgr.GetWebhookServer().Register("/validate-disruption", &admission.Webhook{
 		Handler: &internalwebhook.DisruptionWebhook{
-			Client:       mgr.GetClient(),
-			Recorder:     mgr.GetEventRecorder("disruption-webhoook"),
-			LeaseTracker: leaseTracker,
+			Client:            mgr.GetClient(),
+			Recorder:          mgr.GetEventRecorder("disruption-webhoook"),
+			LeaseTracker:      leaseTracker,
+			DisruptionTracker: disruptionTracker,
 		},
 	})
 
