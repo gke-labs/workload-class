@@ -180,6 +180,15 @@ spec:
                     - kind
                     - name
                     x-kubernetes-list-type: map
+                  disruptionUnit:
+                    default: Pod
+                    description: |-
+                      DisruptionUnit controls whether disruption budgets are managed per Pod ("Pod", default) or per
+                      gang/group ("Group") for distributed workloads such as JobSet, LeaderWorkerSet, Ray, or Kueue jobs.
+                    enum:
+                    - Pod
+                    - Group
+                    type: string
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
                       immediately.
@@ -192,6 +201,14 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  groupLabelKey:
+                    description: |-
+                      GroupLabelKey optionally specifies the Pod label key used to identify gang membership when
+                      disruptionUnit is "Group". When omitted, well-known gang labels are detected automatically
+                      (jobset.sigs.k8s.io/jobset-name, leaderworkerset.sigs.k8s.io/name, ray.io/cluster,
+                      kueue.x-k8s.io/workload-name).
+                    maxLength: 253
+                    type: string
                   maxNonDisruptionDurationDays:
                     description: |-
                       MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
