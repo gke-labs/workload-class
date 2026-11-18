@@ -632,6 +632,69 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
 			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
 			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(workloadClassName))
+
+			By("Verifying MatchedPods=True and ShadowedByUserPDB=False conditions")
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			matchedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeMatchedPods)
+			Expect(matchedCond).NotTo(BeNil())
+			Expect(matchedCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(matchedCond.Reason).To(Equal(workloadsv1.ReasonPodsMatched))
+			shadowedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeShadowedByUserPDB)
+			Expect(shadowedCond).NotTo(BeNil())
+			Expect(shadowedCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(shadowedCond.Reason).To(Equal(workloadsv1.ReasonNotShadowed))
+		})
+
+		It("should report MatchedPods=False when selector matches zero active Pods", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "nonexistent"}}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			matchedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeMatchedPods)
+			Expect(matchedCond).NotTo(BeNil())
+			Expect(matchedCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(matchedCond.Reason).To(Equal(workloadsv1.ReasonZeroMatchedPods))
+		})
+
+		It("should set ShadowedByUserPDB=True and emit a warning event when a user PDB covers a matched Pod", func() {
+			selectPod()
+
+			userPDB := &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{Name: "custom-user-pdb", Namespace: defaultNamespace},
+				Spec: policyv1.PodDisruptionBudgetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: podLabels},
+				},
+			}
+			Expect(k8sClient.Create(ctx, userPDB)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, userPDB)
+			})
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			shadowedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeShadowedByUserPDB)
+			Expect(shadowedCond).NotTo(BeNil())
+			Expect(shadowedCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(shadowedCond.Reason).To(Equal(workloadsv1.ReasonShadowedByUserPDB))
+			Expect(shadowedCond.Message).To(ContainSubstring("'custom-user-pdb'"))
+			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring(workloadsv1.ReasonShadowedByUserPDB)))
+
+			Expect(k8sClient.Delete(ctx, userPDB)).To(Succeed())
+			reconcileWC(typeNamespacedName)
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			shadowedCond = meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeShadowedByUserPDB)
+			Expect(shadowedCond).NotTo(BeNil())
+			Expect(shadowedCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(shadowedCond.Reason).To(Equal(workloadsv1.ReasonNotShadowed))
 		})
 
 		It("should open the PDBs instead of deleting them if validation fails", func() {
@@ -2344,5 +2407,30 @@ func TestValidateCapacityStrategy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestObservabilityConditions(t *testing.T) {
+	cZero := matchedPodsCondition(2, 0)
+	if cZero.Status != metav1.ConditionFalse || cZero.Reason != workloadsv1.ReasonZeroMatchedPods {
+		t.Errorf("matchedPodsCondition(0) = (%v, %v), want (False, ZeroMatchedPods)", cZero.Status, cZero.Reason)
+	}
+
+	cMatched := matchedPodsCondition(2, 3)
+	if cMatched.Status != metav1.ConditionTrue || cMatched.Reason != workloadsv1.ReasonPodsMatched || !strings.Contains(cMatched.Message, "3 active Pod(s)") {
+		t.Errorf("matchedPodsCondition(3) = (%v, %v, %q), want (True, PodsMatched, contains 3)", cMatched.Status, cMatched.Reason, cMatched.Message)
+	}
+
+	cNone := shadowedByUserPDBCondition(2, 0, nil)
+	if cNone.Status != metav1.ConditionFalse || cNone.Reason != workloadsv1.ReasonNotShadowed {
+		t.Errorf("shadowedByUserPDBCondition(0) = (%v, %v), want (False, NotShadowed)", cNone.Status, cNone.Reason)
+	}
+
+	cMany := shadowedByUserPDBCondition(2, 4, []string{"pdb-1", "pdb-2", "pdb-3", "pdb-4", "pdb-5", "pdb-6", "pdb-7"})
+	if cMany.Status != metav1.ConditionTrue || cMany.Reason != workloadsv1.ReasonShadowedByUserPDB {
+		t.Errorf("shadowedByUserPDBCondition(many) = (%v, %v), want (True, ShadowedByUserPDB)", cMany.Status, cMany.Reason)
+	}
+	if !strings.Contains(cMany.Message, "and 2 more") {
+		t.Errorf("shadowedByUserPDBCondition(many) message = %q, want truncation 'and 2 more'", cMany.Message)
 	}
 }

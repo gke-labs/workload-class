@@ -650,6 +650,25 @@ func TestUserCreatedPDBHelpers(t *testing.T) {
 	if IsPodCoveredByUserPDB(unmatchedPod, userPDBs) {
 		t.Errorf("IsPodCoveredByUserPDB(unmatchedPod) = true, want false")
 	}
+
+	// Verify MatchingUserPDBNames returns sorted unique names and ignores WC-owned / other-namespace PDBs.
+	extraUserPDBs := []policyv1.PodDisruptionBudget{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "z-pdb", Namespace: "default"},
+			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "a-pdb", Namespace: "default"},
+			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-ns-pdb", Namespace: "other"},
+			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+		},
+	}
+	if got := MatchingUserPDBNames(matchingPod, extraUserPDBs); !reflect.DeepEqual(got, []string{"a-pdb", "z-pdb"}) {
+		t.Errorf("MatchingUserPDBNames() = %v, want [a-pdb z-pdb]", got)
+	}
 }
 
 func TestIsPDBOpen(t *testing.T) {
