@@ -543,6 +543,123 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 	}
 }
 
+func TestHandle_RecordsLastDisruptionTime(t *testing.T) {
+	const (
+		namespace     = "namespace"
+		adminUsername = "admin@mycompany.com"
+		otherOwner    = "system:serviceaccount:kube-system:cluster-autoscaler"
+		podName       = "podrick"
+		podUID        = types.UID("podrick-uid")
+	)
+	labels := map[string]string{"labelA": "valueA"}
+	inWindowDay := time.Now().Weekday().String()
+	outOfWindowDay := time.Now().AddDate(0, 0, 1).Weekday().String()
+	adminSubject := workloadsv1.Subject{Kind: rbacv1.UserKind, Name: adminUsername}
+	isController := true
+	closed, open := intstr.FromInt32(0), intstr.FromString("100%")
+
+	newPDB := func(maxUnavailable intstr.IntOrString, leaseOwner string) *policyv1.PodDisruptionBudget {
+		pdb := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: utils.PDBName(podName), Namespace: namespace,
+				Labels:          map[string]string{utils.PodUIDLabel: string(podUID)},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "workloads.gke.io/v1", Kind: "WorkloadClass", Name: "wc", Controller: &isController}},
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &maxUnavailable},
+		}
+		if leaseOwner != "" {
+			pdb.Annotations = map[string]string{
+				utils.BypassOwner:      leaseOwner,
+				utils.BypassExpiration: time.Now().Add(time.Minute).Format(utils.ExpirationFormat),
+			}
+		}
+		return pdb
+	}
+
+	testCases := []struct {
+		name, day, username, subRes string
+		pdb                         *policyv1.PodDisruptionBudget
+		podAgeDays                  int
+		emergency, valFailed        bool
+		readiness                   workloadsv1.MaintenanceReadiness
+		wantAllowed, wantRecorded   bool
+	}{
+		{"emergency_override_records", outOfWindowDay, "other", "eviction", nil, 0, true, false, "", true, true},
+		{"overdue_records", outOfWindowDay, "other", "eviction", nil, 0, false, false, workloadsv1.ReadinessOverdue, true, true},
+		{"in_window_allowed_records", inWindowDay, "other", "eviction", nil, 4, false, false, "", true, true},
+		{"out_of_window_denied", outOfWindowDay, "other", "eviction", nil, 4, false, false, "", false, false},
+		{"pod_too_new_denied", inWindowDay, "other", "eviction", nil, 0, false, false, "", false, false},
+		{"validation_failed_no_record", outOfWindowDay, "other", "eviction", nil, 0, false, true, "", true, false},
+		{"not_an_eviction_no_record", inWindowDay, "other", "status", nil, 0, false, false, "", true, false},
+		{"auth_first_attempt_lease_no_record", outOfWindowDay, adminUsername, "eviction", newPDB(closed, ""), 0, false, false, "", true, false},
+		{"auth_already_leasing_records", outOfWindowDay, adminUsername, "eviction", newPDB(open, utils.BypassOwnerValue(adminSubject)), 0, false, false, "", true, true},
+		{"auth_open_pdb_records", outOfWindowDay, adminUsername, "eviction", newPDB(open, ""), 0, false, false, "", true, true},
+		{"auth_no_pdb_records", outOfWindowDay, adminUsername, "eviction", nil, 0, false, false, "", true, true},
+		{"auth_other_lease_denied", outOfWindowDay, adminUsername, "eviction", newPDB(open, otherOwner), 0, false, false, "", false, false},
+	}
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testWC := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: namespace, CreationTimestamp: metav1.Time{Time: time.Now()}},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: labels},
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						AllowedDisruptionWindows:          []workloadsv1.DisruptionWindow{{Name: "m", DaysOfWeek: []string{tc.day}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"}},
+						MinInitialRunDurationDays:         2,
+						MaxNonDisruptionDurationDays:      30,
+						AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{adminSubject},
+						EmergencyOverride:                 tc.emergency,
+					},
+				},
+				Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: tc.readiness},
+			}
+			if tc.valFailed {
+				testWC.Status.Conditions = []metav1.Condition{{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed}}
+			}
+
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: podName, Namespace: namespace, UID: podUID, Labels: labels,
+				CreationTimestamp: metav1.Time{Time: time.Now().AddDate(0, 0, -tc.podAgeDays)},
+			}}
+			c := createClient(nil, nil, nil, nil, ns, testWC, &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*testWC}}, pod)
+			c.getPDBResult = tc.pdb
+
+			tracker := utils.NewDisruptionTracker(1)
+			v := &DisruptionWebhook{Client: c, LeaseTracker: utils.NewPendingLeaseTracker(1), DisruptionTracker: tracker}
+			req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Name: podName, Namespace: namespace, SubResource: tc.subRes, UserInfo: authv1.UserInfo{Username: tc.username},
+			}}
+			before := time.Now().UTC().Add(-time.Second)
+			resp := v.Handle(t.Context(), req)
+			after := time.Now().UTC().Add(time.Second)
+
+			if resp.Allowed != tc.wantAllowed {
+				t.Fatalf("Handle() allowed = %v, want %v (result: %+v)", resp.Allowed, tc.wantAllowed, resp.Result)
+			}
+			gotTime, ok := tracker.Drain(types.NamespacedName{Namespace: namespace, Name: testWC.Name})
+			if ok != tc.wantRecorded {
+				t.Fatalf("disruption recorded = %v, want %v", ok, tc.wantRecorded)
+			}
+			if !tc.wantRecorded {
+				return
+			}
+			if gotTime.Before(before) || gotTime.After(after) {
+				t.Errorf("recorded disruption time %v outside [%v, %v]", gotTime, before, after)
+			}
+			select {
+			case ev := <-tracker.Events():
+				if ev.Object.GetName() != testWC.Name || ev.Object.GetNamespace() != namespace {
+					t.Errorf("signaled %s/%s, want %s/%s", ev.Object.GetNamespace(), ev.Object.GetName(), namespace, testWC.Name)
+				}
+			default:
+				t.Error("Handle() did not signal WorkloadClass controller via DisruptionTracker")
+			}
+		})
+	}
+}
+
 func TestMatchesUserKind(t *testing.T) {
 	testCases := []struct {
 		name     string

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -33,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -2345,4 +2347,90 @@ func TestValidateCapacityStrategy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReconcile_DisruptionTracker(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, policyv1.AddToScheme, workloadsv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("add scheme: %v", err)
+		}
+	}
+
+	outOfWindowDay := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-wc"}}
+	newWC := func(lastDisruption *metav1.Time) *workloadsv1.WorkloadClass {
+		return &workloadsv1.WorkloadClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+			Spec: workloadsv1.WorkloadClassSpec{
+				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "demo"}},
+				DisruptionPolicy: workloadsv1.DisruptionPolicy{
+					MaxNonDisruptionDurationDays: 2,
+					AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+						{Name: "other-day", DaysOfWeek: []string{outOfWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"},
+					},
+				},
+			},
+			Status: workloadsv1.WorkloadClassStatus{LastDisruptionTime: lastDisruption, MaintenanceReadiness: workloadsv1.ReadinessOverdue},
+		}
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+	t.Run("persists_last_disruption_time_and_resets_overdue", func(t *testing.T) {
+		oldTime := metav1.NewTime(time.Now().UTC().AddDate(0, 0, -5))
+		wc := newWC(&oldTime)
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(ns, wc).Build()
+		tracker := utils.NewDisruptionTracker(4)
+		disruptionTime := time.Now().UTC().Truncate(time.Second)
+		tracker.Record(wc, disruptionTime)
+
+		r := &WorkloadClassReconciler{Client: fc, Scheme: scheme, Recorder: events.NewFakeRecorder(10), DisruptionTracker: tracker}
+		if _, err := r.Reconcile(t.Context(), req); err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		updated := &workloadsv1.WorkloadClass{}
+		if err := fc.Get(t.Context(), req.NamespacedName, updated); err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if updated.Status.LastDisruptionTime == nil || !updated.Status.LastDisruptionTime.Time.Equal(disruptionTime) {
+			t.Errorf("Status.LastDisruptionTime = %v, want %v", updated.Status.LastDisruptionTime, disruptionTime)
+		}
+		if updated.Status.MaintenanceReadiness != workloadsv1.ReadinessNotReady {
+			t.Errorf("Status.MaintenanceReadiness = %q, want %q", updated.Status.MaintenanceReadiness, workloadsv1.ReadinessNotReady)
+		}
+	})
+
+	t.Run("re_records_timestamp_when_status_update_fails", func(t *testing.T) {
+		wc := newWC(nil)
+		statusUpdateErr := stderrors.New("simulated conflict")
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(ns, wc).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+					return statusUpdateErr
+				},
+			}).Build()
+		tracker := utils.NewDisruptionTracker(4)
+		disruptionTime := time.Now().UTC().Truncate(time.Second)
+		tracker.Record(wc, disruptionTime)
+
+		r := &WorkloadClassReconciler{Client: fc, Scheme: scheme, Recorder: events.NewFakeRecorder(10), DisruptionTracker: tracker}
+		if _, err := r.Reconcile(t.Context(), req); !stderrors.Is(err, statusUpdateErr) {
+			t.Fatalf("Reconcile() error = %v, want %v", err, statusUpdateErr)
+		}
+		if gotTime, ok := tracker.Drain(req.NamespacedName); !ok || !gotTime.Equal(disruptionTime) {
+			t.Errorf("Drain() = (%v, %v), want (%v, true)", gotTime, ok, disruptionTime)
+		}
+	})
+
+	t.Run("discards_pending_disruption_when_workloadclass_not_found", func(t *testing.T) {
+		tracker := utils.NewDisruptionTracker(4)
+		tracker.Record(newWC(nil), time.Now().UTC())
+		r := &WorkloadClassReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme, DisruptionTracker: tracker}
+		if _, err := r.Reconcile(t.Context(), req); err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		if _, ok := tracker.Drain(req.NamespacedName); ok {
+			t.Error("expected pending disruption to be discarded when WorkloadClass is NotFound")
+		}
+	})
 }
