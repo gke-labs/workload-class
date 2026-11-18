@@ -83,6 +83,15 @@ type DisruptionPolicy struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// ManageSafeToEvictAnnotation enables automatic lifecycle management of the
+	// "cluster-autoscaler.kubernetes.io/safe-to-evict" annotation on governed Pods.
+	// When true and the WorkloadClass is valid and Ready or Overdue, "safe-to-evict: false" is
+	// temporarily removed (with "workloads.gke.io/safe-to-evict-suspended: true" recorded) so
+	// Cluster Autoscaler can drain nodes during the maintenance window. When the window closes,
+	// validation fails, or this option is disabled, suspended Pods have "safe-to-evict: false" restored.
+	// +optional
+	ManageSafeToEvictAnnotation bool `json:"manageSafeToEvictAnnotation,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
