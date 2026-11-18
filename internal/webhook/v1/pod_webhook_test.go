@@ -115,6 +115,19 @@ var _ = Describe("Pod Webhook", func() {
 			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
 		})
 
+		It("mutates when PlacementValidated is True even if overall Validated is False due to disruption failure", func() {
+			conds := []metav1.Condition{
+				{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+				{Type: workloadsv1.ConditionTypeDisruptionValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+				{Type: workloadsv1.ConditionTypePlacementValidated, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonValidationPassed},
+				{Type: workloadsv1.ConditionTypePlacementPluginAttached, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonProfileResolved},
+			}
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, conds)
+			pod := newIncomingPod()
+			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{})).Default(testCtx, pod)).To(Succeed())
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
+		})
+
 		It("fails open when the GKESpotPlacementPolicy does not exist", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, readyConditions())
 			pod := newIncomingPod()
