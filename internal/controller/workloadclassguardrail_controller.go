@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -52,9 +53,16 @@ func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	validationCondition := r.validate(ctx, g)
-	if meta.SetStatusCondition(&g.Status.Conditions, validationCondition) {
-		err = r.Status().Update(ctx, g)
-	}
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &workloadsv1.WorkloadClassGuardrail{}
+		if getErr := r.Get(ctx, req.NamespacedName, latest); getErr != nil {
+			return client.IgnoreNotFound(getErr)
+		}
+		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCondition) {
+			return nil
+		}
+		return r.Status().Update(ctx, latest)
+	})
 
 	return ctrl.Result{}, err
 }
