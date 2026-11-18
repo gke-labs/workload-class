@@ -203,6 +203,17 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  unhealthyPodEvictionPolicy:
+                    default: AlwaysAllow
+                    description: |-
+                      UnhealthyPodEvictionPolicy defines the criteria for when unhealthy pods should be considered for eviction
+                      on WorkloadClass-managed PodDisruptionBudgets. Defaults to "AlwaysAllow" so crash-looping or non-Ready
+                      pods do not deadlock node drains behind a closed budget. Set to "IfHealthyBudget" to block eviction of
+                      unhealthy pods when the budget is closed.
+                    enum:
+                    - AlwaysAllow
+                    - IfHealthyBudget
+                    type: string
                 type: object
               infrastructureProfileRef:
                 description: |-

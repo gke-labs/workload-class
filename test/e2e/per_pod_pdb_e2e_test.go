@@ -265,7 +265,7 @@ func expectPerPodPDBs(app, owner, maxUnavailable string, n int) []string {
 			g.Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
 			g.Expect(pdb.Spec.MaxUnavailable.String()).To(Equal(maxUnavailable), "PDB %s maxUnavailable", pdb.Name)
 			g.Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
-			g.Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+			g.Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.AlwaysAllow))
 			// The disruption controller counts exactly one healthy Pod matching the PDB's selector. (status.expectedPods
 			// isn't useful here: with maxUnavailable it reports the scale of the Pod's owning workload, not the
 			// number of selected Pods.)

@@ -88,6 +88,15 @@ func PDBBase(pod *corev1.Pod) *policyv1.PodDisruptionBudget {
 	}
 }
 
+// UnhealthyPodEvictionPolicyFor returns the effective UnhealthyPodEvictionPolicy for a WorkloadClass,
+// defaulting to AlwaysAllow when unset so unhealthy pods do not block drains behind a closed budget.
+func UnhealthyPodEvictionPolicyFor(wc *workloadsv1.WorkloadClass) policyv1.UnhealthyPodEvictionPolicyType {
+	if wc != nil && wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy != nil && *wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy != "" {
+		return *wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy
+	}
+	return policyv1.AlwaysAllow
+}
+
 // SyncPDBWithWorkloadClass configures a Per-Pod PDB to match the governing WorkloadClass's disruption policy
 // and validation state for a specific Pod.
 //
@@ -129,8 +138,11 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pd
 		},
 	}
 
-	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget.
-	policy := policyv1.IfHealthyBudget
+	// MinAvailable and MaxUnavailable are mutually exclusive; clear MinAvailable so external edits
+	// cannot leave the PDB in an invalid state.
+	pdb.Spec.MinAvailable = nil
+
+	policy := UnhealthyPodEvictionPolicyFor(wc)
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
 	open := &intstr.IntOrString{
@@ -298,7 +310,9 @@ func PDBWithLease(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject wo
 		},
 	}
 
-	policy := policyv1.IfHealthyBudget
+	pdb.Spec.MinAvailable = nil
+
+	policy := policyv1.AlwaysAllow
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
 	pdb.Spec.MaxUnavailable = &intstr.IntOrString{

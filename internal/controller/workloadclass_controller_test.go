@@ -630,8 +630,30 @@ var _ = Describe("WorkloadClass Controller", func() {
 
 			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(map[string]string{utils.PodUIDLabel: string(pod.UID)}))
 			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
-			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.AlwaysAllow))
 			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(workloadClassName))
+		})
+
+		It("should propagate custom UnhealthyPodEvictionPolicy to the Per-Pod PDB", func() {
+			selectPod()
+
+			By("Configuring IfHealthyBudget on the WorkloadClass")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			policy := policyv1.IfHealthyBudget
+			wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy = &policy
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			reconcileWC(typeNamespacedName)
+
+			By("Verifying the Per-Pod PDB uses IfHealthyBudget")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, podPDBKey, pdb)
+			}, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
 		})
 
 		It("should open the PDBs instead of deleting them if validation fails", func() {

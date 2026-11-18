@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -83,6 +84,15 @@ type DisruptionPolicy struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// UnhealthyPodEvictionPolicy defines the criteria for when unhealthy pods should be considered for eviction
+	// on WorkloadClass-managed PodDisruptionBudgets. Defaults to "AlwaysAllow" so crash-looping or non-Ready
+	// pods do not deadlock node drains behind a closed budget. Set to "IfHealthyBudget" to block eviction of
+	// unhealthy pods when the budget is closed.
+	// +optional
+	// +kubebuilder:validation:Enum=AlwaysAllow;IfHealthyBudget
+	// +kubebuilder:default="AlwaysAllow"
+	UnhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType `json:"unhealthyPodEvictionPolicy,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
