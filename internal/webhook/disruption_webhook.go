@@ -48,6 +48,13 @@ type DisruptionWebhook struct {
 	// LeaseTracker receives Per-Pod PDB lease requests for authorized subjects, which are applied
 	// asynchronously by the WorkloadClass controller. If nil, no leases are requested.
 	LeaseTracker *utils.PendingLeaseTracker
+
+	// BlockedTracker tracks first-blocked timestamps for pods denied by in-window disruption pacing
+	// so break-glass can allow evictions after DisruptionStuckThresholdSeconds without mutating Pods.
+	BlockedTracker *utils.BlockedPodTracker
+
+	// nowFunc overrides the clock in unit tests; defaults to time.Now().UTC().
+	nowFunc func() time.Time
 }
 
 // +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods/eviction,verbs=create,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
@@ -107,11 +114,16 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 	if len(matchingSubjects) > 0 {
+		// Authorized actors bypassing windows are still strictly paced on multi-replica workloads
+		// (without stuck-threshold break-glass) so automated controllers cannot wipe out all replicas at once.
+		if allowed, denyMsg := v.checkDisruptionPacing(ctx, bestWC, pod, false); !allowed {
+			return admission.Denied(denyMsg)
+		}
 		return v.handleAuthorizedSubject(ctx, bestWC, pod, matchingSubjects)
 	}
 
 	// Temporal Enforcement
-	now := time.Now().UTC()
+	now := v.now()
 	inWindow, _ := utils.IsTimeInWindows(ctx, now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 
 	// Maintenance Starvation (Override on Overdue)
@@ -132,7 +144,106 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 
+	// In-Window Concurrent Disruption Pacing (with break-glass after DisruptionStuckThresholdSeconds)
+	if allowed, denyMsg := v.checkDisruptionPacing(ctx, bestWC, pod, true); !allowed {
+		return admission.Denied(denyMsg)
+	}
+
 	return admission.Allowed("Eviction allowed by WorkloadClass policy")
+}
+
+func (v *DisruptionWebhook) now() time.Time {
+	if v.nowFunc != nil {
+		return v.nowFunc()
+	}
+	return time.Now().UTC()
+}
+
+// checkDisruptionPacing enforces MaxUnavailable / MinAvailable across active governed Pods belonging to wc.
+// Single-replica workloads (total <= 1) bypass pacing. When allowStuckBreakGlass is true, an in-window
+// eviction blocked longer than DisruptionStuckThresholdSeconds is allowed through to avoid deadlocks.
+func (v *DisruptionWebhook) checkDisruptionPacing(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	pod *corev1.Pod,
+	allowStuckBreakGlass bool,
+) (bool, string) {
+	if !utils.HasPacingPolicy(wc.Spec.DisruptionPolicy) {
+		return true, ""
+	}
+	log := logf.FromContext(ctx).WithValues("workloadClass", wc.Name, "pod", pod.Name, "namespace", pod.Namespace)
+
+	selector, err := utils.WorkloadClassPodSelector(ctx, v.Client, wc)
+	if err != nil {
+		log.Error(err, "Failed to resolve PodSelector for disruption pacing; allowing eviction")
+		return true, ""
+	}
+	podList := &corev1.PodList{}
+	if err := v.Client.List(ctx, podList, client.InNamespace(pod.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		log.Error(err, "Failed to list Pods for disruption pacing; allowing eviction")
+		return true, ""
+	}
+
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, v.Client, pod.Namespace)
+	if err != nil {
+		log.Error(err, "Failed to check namespace enforced WorkloadClass for pacing; allowing eviction")
+		return true, ""
+	}
+	wcList := &workloadsv1.WorkloadClassList{}
+	if err := v.Client.List(ctx, wcList, client.InNamespace(pod.Namespace)); err != nil {
+		log.Error(err, "Failed to list WorkloadClasses for disruption pacing; allowing eviction")
+		return true, ""
+	}
+
+	total, ready := 0, 0
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if best := utils.BestMatchWorkloadClassForPod(p, enforcedWC, wcList.Items); best == nil || best.Name != wc.Name {
+			continue
+		}
+		total++
+		if utils.IsPodReady(p) {
+			ready++
+		}
+	}
+
+	// Do not deadlock single-replica workloads under concurrent pacing.
+	if total <= 1 {
+		v.BlockedTracker.Clear(pod.UID)
+		return true, ""
+	}
+
+	budget, err := utils.CalculateDisruptionBudget(wc.Spec.DisruptionPolicy, total, ready)
+	if err != nil {
+		log.Error(err, "Failed to calculate disruption pacing budget; allowing eviction")
+		return true, ""
+	}
+	if budget > 0 {
+		v.BlockedTracker.Clear(pod.UID)
+		return true, ""
+	}
+
+	if !allowStuckBreakGlass {
+		return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s",
+			ready, total, wc.Name)
+	}
+
+	now := v.now()
+	v.BlockedTracker.Prune(now.Add(-24 * time.Hour))
+	threshold := utils.StuckThreshold(wc.Spec.DisruptionPolicy)
+	elapsed := v.BlockedTracker.RecordOrElapsed(pod.UID, now)
+	if elapsed >= threshold {
+		v.BlockedTracker.Clear(pod.UID)
+		log.Info("Disruption pacing stuck threshold exceeded, allowing break-glass eviction",
+			"elapsed", elapsed.Round(time.Second), "threshold", threshold)
+		return true, ""
+	}
+
+	return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s (blocked for %v, break-glass after %v)",
+		ready, total, wc.Name, elapsed.Round(time.Second), threshold)
 }
 
 // handleAuthorizedSubject handles an eviction request from a subject listed in the WorkloadClass'
