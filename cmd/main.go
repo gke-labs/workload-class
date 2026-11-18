@@ -257,6 +257,10 @@ func main() {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "Pod")
 			os.Exit(1)
 		}
+		if err := webhookv1.SetupPodDisruptionBudgetWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "PodDisruptionBudget")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
