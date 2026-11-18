@@ -18,6 +18,7 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // SpotPlacementType specifies the desired compute provisioning model for a workload.
@@ -46,6 +47,7 @@ const (
 )
 
 // DisruptionPolicy specifies the policy governing pod disruptions.
+// +kubebuilder:validation:XValidation:rule="!(has(self.maxUnavailable) && has(self.minAvailable))",message="maxUnavailable and minAvailable are mutually exclusive"
 type DisruptionPolicy struct {
 	// AllowedDisruptionWindows defines when disruptions are allowed.
 	// When unset or empty, disruptions are allowed at all times on all days of the week.
@@ -83,6 +85,24 @@ type DisruptionPolicy struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// MaxUnavailable limits how many governed Pods may be concurrently unavailable during disruptions
+	// (an integer such as 1, or a percentage string such as "25%"). Mutually exclusive with MinAvailable.
+	// When neither MaxUnavailable nor MinAvailable is set, in-window pacing is disabled.
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+
+	// MinAvailable specifies the minimum number or percentage of governed Pods that must remain
+	// Ready during disruptions (e.g., 2 or "75%"). Mutually exclusive with MaxUnavailable.
+	// +optional
+	MinAvailable *intstr.IntOrString `json:"minAvailable,omitempty"`
+
+	// DisruptionStuckThresholdSeconds is the number of seconds an in-window eviction may remain
+	// blocked by the pacing budget before break-glass allows it to proceed. Defaults to 120 when unset (0).
+	// Does not apply to automated actors bypassing windows via allowedDisruptionsOutsideOfWindow.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	DisruptionStuckThresholdSeconds int32 `json:"disruptionStuckThresholdSeconds,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
