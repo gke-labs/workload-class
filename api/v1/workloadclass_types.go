@@ -83,6 +83,14 @@ type DisruptionPolicy struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// MaxConcurrentDisruptions limits how many Pods governed by this WorkloadClass may be concurrently
+	// disrupted (terminating or non-Ready) during allowed disruption windows. Useful for quorum and
+	// stateful workloads that cannot tolerate simultaneous multi-pod drains. When unset, no cross-pod
+	// concurrency limit is enforced.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxConcurrentDisruptions *int32 `json:"maxConcurrentDisruptions,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.

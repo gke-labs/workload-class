@@ -33,10 +33,13 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -978,4 +981,156 @@ func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 	}
 
 	return nil
+}
+
+func TestHandleMaxConcurrentDisruptions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(clientgo) failed: %v", err)
+	}
+	if err := workloadsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(workloads) failed: %v", err)
+	}
+
+	now := metav1.Now()
+	labels := map[string]string{"app": "etcd"}
+	readyPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+	}
+	unreadyPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				},
+			},
+		}
+	}
+	terminatingPod := func(name string) *corev1.Pod {
+		p := readyPod(name)
+		p.DeletionTimestamp = &now
+		p.Finalizers = []string{"test/finalizer"}
+		return p
+	}
+	succeededPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: labels},
+			Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+		}
+	}
+
+	int32Ptr := func(v int32) *int32 { return &v }
+	makeWC := func(limit int32, readiness workloadsv1.MaintenanceReadiness) *workloadsv1.WorkloadClass {
+		return &workloadsv1.WorkloadClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "etcd-wc", Namespace: "default"},
+			Spec: workloadsv1.WorkloadClassSpec{
+				PodSelector: &metav1.LabelSelector{MatchLabels: labels},
+				DisruptionPolicy: workloadsv1.DisruptionPolicy{
+					MaxConcurrentDisruptions: int32Ptr(limit),
+				},
+			},
+			Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: readiness},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		wc          *workloadsv1.WorkloadClass
+		pods        []*corev1.Pod
+		target      string
+		wantAllowed bool
+		wantSubstr  string
+	}{
+		{
+			name:        "all_pods_ready_allows_eviction",
+			wc:          makeWC(1, workloadsv1.ReadinessReady),
+			pods:        []*corev1.Pod{readyPod("etcd-0"), readyPod("etcd-1"), readyPod("etcd-2")},
+			target:      "etcd-0",
+			wantAllowed: true,
+		},
+		{
+			name:        "terminating_sibling_blocks_when_limit_1",
+			wc:          makeWC(1, workloadsv1.ReadinessReady),
+			pods:        []*corev1.Pod{readyPod("etcd-0"), terminatingPod("etcd-1"), readyPod("etcd-2")},
+			target:      "etcd-0",
+			wantAllowed: false,
+			wantSubstr:  "maxConcurrentDisruptions=1",
+		},
+		{
+			name:        "unready_sibling_blocks_when_limit_1",
+			wc:          makeWC(1, workloadsv1.ReadinessReady),
+			pods:        []*corev1.Pod{readyPod("etcd-0"), unreadyPod("etcd-1"), readyPod("etcd-2")},
+			target:      "etcd-0",
+			wantAllowed: false,
+			wantSubstr:  "maxConcurrentDisruptions=1",
+		},
+		{
+			name:        "one_terminating_sibling_allows_when_limit_2",
+			wc:          makeWC(2, workloadsv1.ReadinessReady),
+			pods:        []*corev1.Pod{readyPod("etcd-0"), terminatingPod("etcd-1"), readyPod("etcd-2")},
+			target:      "etcd-0",
+			wantAllowed: true,
+		},
+		{
+			name:        "terminal_sibling_is_ignored",
+			wc:          makeWC(1, workloadsv1.ReadinessReady),
+			pods:        []*corev1.Pod{readyPod("etcd-0"), succeededPod("etcd-done")},
+			target:      "etcd-0",
+			wantAllowed: true,
+		},
+		{
+			name:        "target_itself_unready_with_no_other_disrupted_pods_is_allowed",
+			wc:          makeWC(1, workloadsv1.ReadinessReady),
+			pods:        []*corev1.Pod{unreadyPod("etcd-0"), readyPod("etcd-1")},
+			target:      "etcd-0",
+			wantAllowed: true,
+		},
+		{
+			name:        "overdue_bypasses_concurrency_limit",
+			wc:          makeWC(1, workloadsv1.ReadinessOverdue),
+			pods:        []*corev1.Pod{readyPod("etcd-0"), terminatingPod("etcd-1")},
+			target:      "etcd-0",
+			wantAllowed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := make([]client.Object, 0, 2+len(tt.pods))
+			objs = append(objs,
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+				tt.wc,
+			)
+			for _, p := range tt.pods {
+				objs = append(objs, p)
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			wh := &DisruptionWebhook{Client: c}
+			req := admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					Name:        tt.target,
+					Namespace:   "default",
+					SubResource: "eviction",
+					UserInfo:    authv1.UserInfo{Username: "kube-drain"},
+				},
+			}
+			resp := wh.Handle(context.Background(), req)
+			if resp.Allowed != tt.wantAllowed {
+				t.Fatalf("Handle() Allowed = %v, want %v (result: %+v)", resp.Allowed, tt.wantAllowed, resp.Result)
+			}
+			if tt.wantSubstr != "" && (resp.Result == nil || !strings.Contains(resp.Result.Message, tt.wantSubstr)) {
+				t.Errorf("Handle() message = %v, want substring %q", resp.Result, tt.wantSubstr)
+			}
+		})
+	}
 }

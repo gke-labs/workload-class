@@ -132,6 +132,13 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 
+	// Cross-Pod Disruption Concurrency Limit
+	if limit := bestWC.Spec.DisruptionPolicy.MaxConcurrentDisruptions; limit != nil && *limit > 0 {
+		if resp, blocked := v.checkConcurrentDisruptions(ctx, bestWC, pod, int(*limit)); blocked {
+			return resp
+		}
+	}
+
 	return admission.Allowed("Eviction allowed by WorkloadClass policy")
 }
 
@@ -232,6 +239,72 @@ func matchesGroupKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bo
 func matchesServiceAccountKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
 	expectedUsername := fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
 	return userInfo.Username == expectedUsername, nil
+}
+
+// checkConcurrentDisruptions checks whether evicting targetPod would exceed the WorkloadClass's
+// MaxConcurrentDisruptions limit by counting other non-terminal Pods governed by the same WorkloadClass
+// that are currently terminating or not Ready.
+func (v *DisruptionWebhook) checkConcurrentDisruptions(ctx context.Context, wc *workloadsv1.WorkloadClass, targetPod *corev1.Pod, limit int) (admission.Response, bool) {
+	log := logf.FromContext(ctx).WithValues("workloadClass", wc.Name, "namespace", wc.Namespace, "maxConcurrentDisruptions", limit)
+
+	selector, err := utils.WorkloadClassPodSelector(ctx, v.Client, wc)
+	if err != nil {
+		log.Error(err, "Failed to resolve PodSelector for concurrency check; allowing eviction")
+		return admission.Response{}, false
+	}
+
+	pods := &corev1.PodList{}
+	if err := v.Client.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		log.Error(err, "Failed to list Pods for concurrency check; allowing eviction")
+		return admission.Response{}, false
+	}
+
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, v.Client, wc.Namespace)
+	if err != nil {
+		log.Error(err, "Failed to resolve namespace enforced WorkloadClass for concurrency check; allowing eviction")
+		return admission.Response{}, false
+	}
+
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := v.Client.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+		log.Error(err, "Failed to list WorkloadClasses for concurrency check; allowing eviction")
+		return admission.Response{}, false
+	}
+
+	otherDisrupted := 0
+	for i := range pods.Items {
+		other := &pods.Items[i]
+		if other.Name == targetPod.Name || other.Status.Phase == corev1.PodSucceeded || other.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if bestMatch := utils.BestMatchWorkloadClassForPod(other, enforcedWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
+			continue
+		}
+		if !isPodReady(other) {
+			otherDisrupted++
+		}
+	}
+
+	if otherDisrupted >= limit {
+		return admission.Denied(fmt.Sprintf(
+			"Eviction blocked: %d other Pod(s) in WorkloadClass %s are already terminating or not Ready (maxConcurrentDisruptions=%d)",
+			otherDisrupted, wc.Name, limit,
+		)), true
+	}
+	return admission.Response{}, false
+}
+
+// isPodReady returns true if the Pod is not terminating, is in PodRunning phase, and has PodReady=True.
+func isPodReady(pod *corev1.Pod) bool {
+	if pod == nil || !pod.DeletionTimestamp.IsZero() || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // InjectDecoder injects the decoder.
