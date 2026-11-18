@@ -75,9 +75,9 @@ spec:
       - kind: ServiceAccount
         name: vpa-updater
         namespace: kube-system
-      - kind: ServiceAccount
-        name: cluster-autoscaler
-        namespace: kube-system
+      # Managed GKE Cluster Autoscaler authenticates as User "system:cluster-autoscaler".
+      - kind: User
+        name: system:cluster-autoscaler
 ```
 
 **3. (Optional) Assign a Default WorkloadClass to a Namespace**

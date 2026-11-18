@@ -1,0 +1,30 @@
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: spot-batch-workload
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      app: spot-batch
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "nightly-maintenance"
+        daysOfWeek:
+          - Monday
+          - Tuesday
+          - Wednesday
+          - Thursday
+          - Friday
+        startTime: "02:00"
+        endTime: "06:00"
+        timeZone: "UTC"
+    maxNonDisruptionDurationDays: 14
+  capacityStrategy:
+    type: Spot
+    spotRatio: "80%"
+    action: FallbackToOnDemand
+  infrastructureProfileRef:
+    group: workloads.gke.io
+    kind: GKESpotPlacementPolicy
+    name: gke-spot-balanced
