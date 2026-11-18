@@ -45,6 +45,19 @@ const (
 	FallbackActionFallbackToOnDemand FallbackAction = "FallbackToOnDemand"
 )
 
+// DisruptionUnit defines the granularity at which WorkloadClass manages disruption budgets and readiness.
+// +kubebuilder:validation:Enum=Pod;Group
+type DisruptionUnit string
+
+const (
+	// DisruptionUnitPod manages disruption budgets independently per Pod (default).
+	DisruptionUnitPod DisruptionUnit = "Pod"
+
+	// DisruptionUnitGroup treats gang-scheduled worker Pods (e.g., JobSet, LeaderWorkerSet, Ray, Kueue)
+	// as an atomic disruption unit so single workers are not evicted piecemeal while the gang is protected.
+	DisruptionUnitGroup DisruptionUnit = "Group"
+)
+
 // DisruptionPolicy specifies the policy governing pod disruptions.
 type DisruptionPolicy struct {
 	// AllowedDisruptionWindows defines when disruptions are allowed.
@@ -83,6 +96,20 @@ type DisruptionPolicy struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// DisruptionUnit controls whether disruption budgets are managed per Pod ("Pod", default) or per
+	// gang/group ("Group") for distributed workloads such as JobSet, LeaderWorkerSet, Ray, or Kueue jobs.
+	// +optional
+	// +kubebuilder:default="Pod"
+	DisruptionUnit DisruptionUnit `json:"disruptionUnit,omitempty"`
+
+	// GroupLabelKey optionally specifies the Pod label key used to identify gang membership when
+	// disruptionUnit is "Group". When omitted, well-known gang labels are detected automatically
+	// (jobset.sigs.k8s.io/jobset-name, leaderworkerset.sigs.k8s.io/name, ray.io/cluster,
+	// kueue.x-k8s.io/workload-name).
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	GroupLabelKey string `json:"groupLabelKey,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
@@ -226,6 +253,10 @@ const (
 	// PodUIDLabel is the label set on governed Pods and their Per-Pod PodDisruptionBudgets
 	// to associate each PDB with a single Pod instance by UID.
 	PodUIDLabel = "workloads.gke.io/pod-uid"
+
+	// PodGroupLabel is the label set on governed gang Pods and their Group PodDisruptionBudget
+	// when DisruptionUnit is Group.
+	PodGroupLabel = "workloads.gke.io/pod-group"
 
 	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails.
 	ConditionTypeValidated = "Validated"
