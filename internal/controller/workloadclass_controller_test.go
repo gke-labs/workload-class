@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -28,11 +29,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -2344,5 +2347,81 @@ func TestValidateCapacityStrategy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReconcile_RetriesOnConflict(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, policyv1.AddToScheme, workloadsv1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("add scheme: %v", err)
+		}
+	}
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	guardrail := &workloadsv1.WorkloadClassGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: "g"},
+		Spec:       workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxAllowedWindows: 2}}},
+	}
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default", UID: types.UID("wc-uid")},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector:      &metav1.LabelSelector{MatchLabels: map[string]string{"app": "demo"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+		},
+		Status: workloadsv1.WorkloadClassStatus{
+			Conditions: []metav1.Condition{{Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonFallbackActive}},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default", UID: types.UID("pod-uid"), Labels: map[string]string{"app": "demo", utils.PodUIDLabel: "pod-uid"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	existingPDB := utils.PDBBase(pod)
+	existingPDB.Spec.MaxUnavailable = &intstr.IntOrString{Type: intstr.Int, IntVal: 0}
+	isController := true
+	existingPDB.OwnerReferences = []metav1.OwnerReference{{APIVersion: "workloads.gke.io/v1", Kind: "WorkloadClass", Name: wc.Name, UID: wc.UID, Controller: &isController}}
+
+	var statusAttempts, pdbAttempts int
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&workloadsv1.WorkloadClass{}, &workloadsv1.WorkloadClassGuardrail{}).
+		WithObjects(ns, guardrail, wc, pod, existingPDB).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				statusAttempts++
+				if statusAttempts == 1 {
+					return errors.NewConflict(schema.GroupResource{Group: "workloads.gke.io", Resource: "workloadclasses"}, obj.GetName(), stderrors.New("conflict"))
+				}
+				return c.Status().Update(ctx, obj, opts...)
+			},
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*policyv1.PodDisruptionBudget); ok {
+					pdbAttempts++
+					if pdbAttempts == 1 {
+						return errors.NewConflict(schema.GroupResource{Group: "policy", Resource: "poddisruptionbudgets"}, obj.GetName(), stderrors.New("conflict"))
+					}
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).Build()
+
+	r := &WorkloadClassReconciler{Client: fc, Scheme: scheme, Recorder: events.NewFakeRecorder(10)}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "wc"}}); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if statusAttempts != 2 {
+		t.Errorf("statusAttempts = %d, want 2", statusAttempts)
+	}
+	if pdbAttempts != 2 {
+		t.Errorf("pdbAttempts = %d, want 2", pdbAttempts)
+	}
+
+	updatedWC := &workloadsv1.WorkloadClass{}
+	if err := fc.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "wc"}, updatedWC); err != nil {
+		t.Fatalf("Get(wc) error = %v", err)
+	}
+	if !meta.IsStatusConditionTrue(updatedWC.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
+		t.Error("expected concurrent InFallback condition to survive status retry")
 	}
 }

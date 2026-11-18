@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -100,21 +101,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	validationCond := validatedCondition(ctx, wc, guardrails, overlapping)
-
-	// 1.2 Check for plugin placement attachment conditions
-	changed, removed := false, false
-	pluginPlacementCondition := placementPluginCondition(ctx, wc)
-	if pluginPlacementCondition != nil {
-		changed = meta.SetStatusCondition(&wc.Status.Conditions, *pluginPlacementCondition)
-	} else {
-		// Clean up stale PluginPlacementAttached condition
-		removed = meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
-	}
-
-	// 1.3 If the plugin has not attached, mark the WorkloadClass as not yet validated
-	reconcileConditions(&validationCond, pluginPlacementCondition)
-	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
+	baseValidationCond := validatedCondition(ctx, wc, guardrails, overlapping)
 
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
@@ -123,13 +110,28 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 3. Update Status
-	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
-		wc.Status.MaintenanceReadiness = readiness
-		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
-		if err := r.Status().Update(ctx, wc); err != nil {
-			return ctrl.Result{}, err
+	// 3. Update Status with RetryOnConflict so concurrent condition updates from plugin controllers
+	// (e.g., PlacementPluginAttached, InFallback) are preserved rather than clobbered or failing with 409.
+	validationCond := baseValidationCond
+	if err := utils.UpdateWorkloadClassStatus(ctx, r.Client, wc, func(latest *workloadsv1.WorkloadClass) bool {
+		changed := false
+		cond := baseValidationCond
+		if latestPluginCond := placementPluginCondition(ctx, latest); latestPluginCond != nil {
+			changed = meta.SetStatusCondition(&latest.Status.Conditions, *latestPluginCond) || changed
+			reconcileConditions(&cond, latestPluginCond)
+		} else {
+			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached) || changed
 		}
+		validationCond = cond
+		changed = meta.SetStatusCondition(&latest.Status.Conditions, cond) || changed
+		if latest.Status.MaintenanceReadiness != readiness {
+			latest.Status.MaintenanceReadiness = readiness
+			log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
+			changed = true
+		}
+		return changed
+	}); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
@@ -388,15 +390,22 @@ func (r *WorkloadClassReconciler) ensurePodUIDLabel(ctx context.Context, pod *co
 
 // syncPodPDB creates or updates the Pod's PDB to match the WorkloadClass' disruption policy.
 func (r *WorkloadClassReconciler) syncPodPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, isValid bool) error {
-	pdb := utils.PDBBase(pod)
-	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
-		if err := r.claimPDB(wc, pdb); err != nil {
-			return err
-		}
-		return utils.SyncPDBWithWorkloadClass(wc, pod, pdb, isValid)
-	})
-	if err != nil {
-		return fmt.Errorf("failed to reconcile PDB %s: %w", pdb.Name, err)
+	var (
+		pdb *policyv1.PodDisruptionBudget
+		op  controllerutil.OperationResult
+	)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		pdb = utils.PDBBase(pod)
+		var err error
+		op, err = controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+			if err := r.claimPDB(wc, pdb); err != nil {
+				return err
+			}
+			return utils.SyncPDBWithWorkloadClass(wc, pod, pdb, isValid)
+		})
+		return err
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile PDB %s: %w", utils.PDBName(pod.Name), err)
 	}
 	logf.FromContext(ctx).V(1).Info("Reconciled PDB", "pdb", pdb.Name, "operation", op)
 	return nil
@@ -404,14 +413,17 @@ func (r *WorkloadClassReconciler) syncPodPDB(ctx context.Context, wc *workloadsv
 
 // leasePodPDB creates or updates the Pod's PDB with a lease for the subject.
 func (r *WorkloadClassReconciler) leasePodPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
-	pdb := utils.PDBBase(pod)
-	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
-		if err := r.claimPDB(wc, pdb); err != nil {
-			return err
-		}
-		return utils.PDBWithLease(pdb, pod, subject)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		pdb := utils.PDBBase(pod)
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+			if err := r.claimPDB(wc, pdb); err != nil {
+				return err
+			}
+			return utils.PDBWithLease(pdb, pod, subject)
+		})
+		return err
 	}); err != nil {
-		return fmt.Errorf("failed to lease PDB %s: %w", pdb.Name, err)
+		return fmt.Errorf("failed to lease PDB %s: %w", utils.PDBName(pod.Name), err)
 	}
 	return nil
 }

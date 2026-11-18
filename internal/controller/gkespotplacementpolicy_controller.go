@@ -75,10 +75,17 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
-	if meta.SetStatusCondition(&spotPolicy.Status.Conditions, validationCond) {
-		if err := r.Status().Update(ctx, spotPolicy); err != nil {
-			return ctrl.Result{}, err
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &workloadsv1.GKESpotPlacementPolicy{}
+		if getErr := r.Get(ctx, req.NamespacedName, latest); getErr != nil {
+			return client.IgnoreNotFound(getErr)
 		}
+		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCond) {
+			return nil
+		}
+		return r.Status().Update(ctx, latest)
+	}); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	wcStatusOpts := statusOptions{
