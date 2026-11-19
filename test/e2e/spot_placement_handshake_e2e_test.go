@@ -64,7 +64,6 @@ kind: GKESpotPlacementPolicy
 metadata:
   name: gke-t2d-spot
 spec:
-  customComputeClass: t2d-spot
   fallbackAllowedMachineFamilies:
     - e2
     - n2d
@@ -79,7 +78,6 @@ kind: GKESpotPlacementPolicy
 metadata:
   name: gke-t2d-spot
 spec:
-  customComputeClass: t2d-spot
   fallbackAllowedMachineFamilies:
     - e2
   reversion:

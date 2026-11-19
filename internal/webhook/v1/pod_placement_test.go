@@ -127,7 +127,7 @@ var _ = Describe("Pod placement helpers", func() {
 			pod.Spec.Tolerations = []corev1.Toleration{other}
 			ensureSpotToleration(pod)
 
-			mutateForOnDemand(pod)
+			mutateForOnDemand(pod, nil)
 
 			expectOnDemand(pod)
 			Expect(pod.Spec.Tolerations).To(Equal([]corev1.Toleration{other}))
@@ -144,11 +144,44 @@ var _ = Describe("Pod placement helpers", func() {
 				}},
 			}}
 
-			mutateForOnDemand(pod)
+			mutateForOnDemand(pod, nil)
 
 			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
 				{MatchExpressions: []corev1.NodeSelectorRequirement{zoneA, spotDoesNotExist()}},
 				{MatchExpressions: []corev1.NodeSelectorRequirement{zoneB, spotDoesNotExist()}},
+			}))
+		})
+
+		It("uses gke-provisioning NotIn [spot] and injects ComputeClass toleration when CustomComputeClass is active", func() {
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})
+			pod := newIncomingPod()
+			setNodeSelector(pod, SpotLabelKey, SpotLabelValue)
+			ensureSpotToleration(pod)
+
+			mutateForOnDemand(pod, policy)
+
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeFalse())
+			Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "spot-first"}))
+			Expect(pod.Spec.Tolerations).To(Equal([]corev1.Toleration{{
+				Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "spot-first", Effect: corev1.TaintEffectNoSchedule,
+			}}))
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotNotIn()}},
+			}))
+		})
+
+		It("preserves pre-existing Pod ComputeClass and avoids gke-spot affinity", func() {
+			pod := newIncomingPod()
+			setNodeSelector(pod, ComputeClassLabelKey, "user-ccc")
+
+			mutateForOnDemand(pod, nil)
+
+			Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "user-ccc"}))
+			Expect(pod.Spec.Tolerations).To(ContainElement(corev1.Toleration{
+				Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "user-ccc", Effect: corev1.TaintEffectNoSchedule,
+			}))
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotNotIn()}},
 			}))
 		})
 	})
@@ -191,17 +224,48 @@ var _ = Describe("Pod placement helpers", func() {
 			}))
 		})
 
-		It("targets the policy's CustomComputeClass unless the Pod already selects one", func() {
+		It("targets the policy's CustomComputeClass with toleration and Warden-safe gke-provisioning affinity", func() {
 			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})
 
 			pod := newIncomingPod()
 			mutateForSpot(pod, workloadsv1.FallbackActionFail, policy)
-			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(ComputeClassLabelKey, "spot-first"))
+			Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "spot-first"}))
+			Expect(pod.Spec.NodeSelector).NotTo(HaveKey(SpotLabelKey))
+			Expect(pod.Spec.Tolerations).To(ContainElement(corev1.Toleration{
+				Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "spot-first", Effect: corev1.TaintEffectNoSchedule,
+			}))
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotIn()}},
+			}))
+			Expect(utils.IsPodTargetedForSpot(pod)).To(BeTrue())
 
 			preset := newIncomingPod()
 			setNodeSelector(preset, ComputeClassLabelKey, "user-choice")
+			preset.Spec.Tolerations = []corev1.Toleration{{
+				Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "stale", Effect: corev1.TaintEffectNoSchedule,
+			}}
 			mutateForSpot(preset, workloadsv1.FallbackActionFail, policy)
-			Expect(preset.Spec.NodeSelector).To(HaveKeyWithValue(ComputeClassLabelKey, "user-choice"))
+			Expect(preset.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "user-choice"}))
+			Expect(preset.Spec.Tolerations).To(ContainElement(corev1.Toleration{
+				Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "user-choice", Effect: corev1.TaintEffectNoSchedule,
+			}))
+			Expect(preset.Spec.Tolerations).NotTo(ContainElement(HaveField("Value", "stale")))
+		})
+
+		It("uses gke-provisioning preference and omits machine-family required affinity when FallbackToOnDemand has CustomComputeClass", func() {
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				CustomComputeClass:             "spot-first",
+				FallbackAllowedMachineFamilies: []string{"e2"},
+			})
+			pod := newIncomingPod()
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "spot-first"}))
+			Expect(pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution).To(Equal([]corev1.PreferredSchedulingTerm{{
+				Weight:     100,
+				Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotIn()}},
+			}}))
+			Expect(requiredTerms(pod)).To(BeEmpty())
 		})
 	})
 
