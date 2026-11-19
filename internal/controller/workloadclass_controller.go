@@ -149,6 +149,12 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 5. Manage Cluster Autoscaler safe-to-evict annotations on governed Pods when opted in.
+	if err := r.reconcileSafeToEvictAnnotations(ctx, wc, readiness, protectsPods(validationCond.Reason, hasGuardrails)); err != nil {
+		log.Error(err, "Failed to reconcile safe-to-evict annotations")
+		return ctrl.Result{}, err
+	}
+
 	// Requeue at the next readiness change, or when the earliest active lease expires so its PDB is re-synced.
 	return ctrl.Result{RequeueAfter: minPositiveDuration(nextReconcile, leaseRequeue)}, nil
 }
