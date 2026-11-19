@@ -129,6 +129,10 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pd
 		},
 	}
 
+	// MinAvailable and MaxUnavailable are mutually exclusive; clear MinAvailable so external edits
+	// cannot leave the PDB in an invalid state.
+	pdb.Spec.MinAvailable = nil
+
 	open := &intstr.IntOrString{
 		Type:   openType,
 		StrVal: openValue,
@@ -307,6 +311,8 @@ func PDBWithLease(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject wo
 			PodUIDLabel: string(pod.UID),
 		},
 	}
+
+	pdb.Spec.MinAvailable = nil
 
 	policy := policyv1.AlwaysAllow
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
