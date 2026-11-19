@@ -1044,6 +1044,10 @@ func TestTimeUntilOverdueAndGuardrailCeiling(t *testing.T) {
 	if got := effectiveMaxNonDisruptionDays(wc, strictestMax); got != 3 {
 		t.Errorf("effectiveMaxNonDisruptionDays() = %d, want 3 (guardrail ceiling)", got)
 	}
+	wcUnset := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now}}}
+	if got := effectiveMaxNonDisruptionDays(wcUnset, strictestMax); got != 0 {
+		t.Errorf("effectiveMaxNonDisruptionDays(unset) = %d, want 0", got)
+	}
 
 	isOverdue, remaining := timeUntilOverdue(wc, 3, now)
 	if isOverdue {

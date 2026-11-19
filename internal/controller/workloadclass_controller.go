@@ -692,13 +692,17 @@ func effectiveGuardrailDisruption(guardrails []workloadsv1.WorkloadClassGuardrai
 }
 
 // effectiveMaxNonDisruptionDays returns the effective maximum undisrupted duration in days,
-// bounded by the strictest positive guardrail limit when present.
+// bounded by the strictest positive guardrail limit when the WorkloadClass sets a positive duration.
+// When the WorkloadClass sets 0 (unset), 0 is preserved so existing overdue semantics remain unchanged.
 func effectiveMaxNonDisruptionDays(wc *workloadsv1.WorkloadClass, strictestGuardrailMaxDays int32) int32 {
 	if wc == nil {
 		return 0
 	}
 	maxDays := wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays
-	if strictestGuardrailMaxDays > 0 && (maxDays <= 0 || strictestGuardrailMaxDays < maxDays) {
+	if maxDays <= 0 {
+		return 0
+	}
+	if strictestGuardrailMaxDays > 0 && strictestGuardrailMaxDays < maxDays {
 		return strictestGuardrailMaxDays
 	}
 	return maxDays
