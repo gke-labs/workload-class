@@ -383,6 +383,34 @@ spec:
 | `reversion.action` | What happens to fallback Pods once Spot capacity returns (see [Fallback and Reversion](#fallback-and-reversion)). Default: `None`. |
 | `reversion.minDurationOnFallback` | Minimum time a Pod must run on fallback before Active reversion evicts it. When omitted, a **5m** floor applies so a wrong capacity signal can't evict the same Pod in a loop. Set `0s` to opt out. Values above `0s` require `action: Active`. |
 
+#### Splitting between a preferred compute class and default capacity (experimental)
+
+`spotRatio` accounting and fallback detection classify a Spot-targeted Pod by whether its node carries the
+`cloud.google.com/gke-spot` label. If `customComputeClass` names an **on-demand** compute class (for example a
+faster machine family), running Pods on that class look like fallback: the WorkloadClass reports `InFallback=True`
+and later Pods keep being sent to the compute class, so the split drifts. Opt in with an annotation to count nodes
+of the policy's compute class as on target:
+
+```yaml
+apiVersion: workloads.gke.io/v1
+kind: GKESpotPlacementPolicy
+metadata:
+  name: performance
+  annotations:
+    workloads.gke.io/count-compute-class-as-target: "true"
+spec:
+  customComputeClass: performance-od   # on-demand C3, falling back to N2 inside the compute class
+  reversion:
+    action: Lazy
+```
+
+With `capacityStrategy: {type: Spot, spotRatio: "50%", action: FallbackToOnDemand}`, half of the Pods target
+`performance-od` and the rest go to On-Demand capacity without a compute class. Nodes that are neither Spot nor in
+the policy's compute class still count as fallback. Note that GKE rejects Pods that combine a compute class with a
+required `cloud.google.com/gke-spot` or `cloud.google.com/machine-family` constraint, so don't set
+`fallbackAllowedMachineFamilies` together with `customComputeClass`, and don't set a namespace default compute
+class in namespaces where the plugin places On-Demand Pods.
+
 Check the policy with `kubectl get gkespotpolicy`. The `Validated` column shows whether the policy satisfies the guardrails.
 
 ### 3. Workload Owner: Add a Capacity Strategy to a WorkloadClass

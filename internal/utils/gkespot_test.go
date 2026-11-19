@@ -83,3 +83,21 @@ func TestTargetsSpotAndIsGKESpotManaged(t *testing.T) {
 		})
 	}
 }
+
+func TestOnTargetComputeClass(t *testing.T) {
+	p := &workloadsv1.GKESpotPlacementPolicy{Spec: workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "performance"}}
+	if got := OnTargetComputeClass(p); got != "" {
+		t.Errorf("without annotation: got %q", got)
+	}
+	p.Annotations = map[string]string{CountComputeClassAsTargetAnnotation: "true"}
+	if got := OnTargetComputeClass(p); got != "performance" {
+		t.Errorf("with annotation: got %q", got)
+	}
+	p.Spec.CustomComputeClass = ""
+	if got := OnTargetComputeClass(p); got != "" {
+		t.Errorf("no ccc: got %q", got)
+	}
+	if got := OnTargetComputeClass(nil); got != "" {
+		t.Errorf("nil: got %q", got)
+	}
+}
