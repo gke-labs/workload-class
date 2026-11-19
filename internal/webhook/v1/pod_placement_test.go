@@ -203,6 +203,77 @@ var _ = Describe("Pod placement helpers", func() {
 			mutateForSpot(preset, workloadsv1.FallbackActionFail, policy)
 			Expect(preset.Spec.NodeSelector).To(HaveKeyWithValue(ComputeClassLabelKey, "user-choice"))
 		})
+
+		It("targets a specific GKE reservation on fallback while preserving existing node affinity", func() {
+			pod := newIncomingPod()
+			pod.Spec.Affinity = &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{MatchExpressions: []corev1.NodeSelectorRequirement{
+								{Key: "kueue.x-k8s.io/pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu-pool"}},
+							}},
+						},
+					},
+				},
+			}
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackAllowedMachineFamilies: []string{"a3"},
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Affinity: workloadsv1.ReservationAffinitySpecific,
+					Name:     "ml-a3-res",
+					Project:  "shared-host-proj",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			kueueReq := corev1.NodeSelectorRequirement{Key: "kueue.x-k8s.io/pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu-pool"}}
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{kueueReq, spotIn()}},
+				{MatchExpressions: []corev1.NodeSelectorRequirement{
+					kueueReq,
+					spotDoesNotExist(),
+					{Key: MachineFamilyLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"a3"}},
+					{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
+					{Key: ReservationNameLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"ml-a3-res"}},
+					{Key: ReservationProjectLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"shared-host-proj"}},
+				}},
+			}))
+		})
+
+		It("targets any matching GKE reservation on fallback when affinity is Any", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Affinity: workloadsv1.ReservationAffinityAny,
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
+				{MatchExpressions: []corev1.NodeSelectorRequirement{
+					spotDoesNotExist(),
+					{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"any"}},
+				}},
+			}))
+		})
+
+		It("ignores FallbackReservation when fallback action is Fail", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Affinity: workloadsv1.ReservationAffinityAny,
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFail, policy)
+
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
+			Expect(requiredTerms(pod)).To(BeEmpty())
+		})
 	})
 
 	Context("Pod state inspection", func() {

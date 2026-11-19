@@ -77,6 +77,39 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: set
+              fallbackReservation:
+                description: |-
+                  FallbackReservation directs Pods falling back from Spot during a stockout onto available GKE
+                  reservation capacity (specific or any matching reservation). Pods scheduled onto fallback
+                  reservation nodes are tracked as in-fallback and automatically revert to Spot under Active reversion.
+                properties:
+                  affinity:
+                    description: Affinity selects whether fallback targets any matching
+                      reservation ("Any") or a specific named reservation ("Specific").
+                    enum:
+                    - Any
+                    - Specific
+                    type: string
+                  name:
+                    description: Name is the GCE reservation name (cloud.google.com/reservation-name),
+                      required when affinity is "Specific".
+                    maxLength: 63
+                    type: string
+                  project:
+                    description: Project is the optional GCP project ID owning a shared
+                      GCE reservation (cloud.google.com/reservation-project).
+                    maxLength: 63
+                    type: string
+                required:
+                - affinity
+                type: object
+                x-kubernetes-validations:
+                - message: name is required when affinity is Specific
+                  rule: self.affinity != 'Specific' || (has(self.name) && size(self.name)
+                    > 0)
+                - message: name can only be set when affinity is Specific
+                  rule: self.affinity == 'Specific' || !has(self.name) || size(self.name)
+                    == 0
               reversion:
                 default: {}
                 description: |-

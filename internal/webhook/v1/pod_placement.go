@@ -41,6 +41,12 @@ const (
 	MachineFamilyLabelKey = "cloud.google.com/machine-family"
 	// ComputeClassLabelKey is the GKE node label / nodeSelector key used to target a Custom Compute Class.
 	ComputeClassLabelKey = "cloud.google.com/compute-class"
+	// ReservationAffinityLabelKey is the GKE node label selecting reservation consumption mode ("any" or "specific").
+	ReservationAffinityLabelKey = "cloud.google.com/reservation-affinity"
+	// ReservationNameLabelKey is the GKE node label selecting a specific GCE reservation by name.
+	ReservationNameLabelKey = "cloud.google.com/reservation-name"
+	// ReservationProjectLabelKey is the GKE node label selecting the host project for a shared GCE reservation.
+	ReservationProjectLabelKey = "cloud.google.com/reservation-project"
 )
 
 // existingPodCounts holds placement counts for the active Pods currently selected by a WorkloadClass
@@ -207,9 +213,11 @@ func mutateForOnDemand(pod *corev1.Pod) {
 func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, spotPolicy *workloadsv1.GKESpotPlacementPolicy) {
 	var ccc string
 	var families []string
+	var reservation *workloadsv1.FallbackReservationPolicy
 	if spotPolicy != nil {
 		ccc = spotPolicy.Spec.CustomComputeClass
 		families = spotPolicy.Spec.FallbackAllowedMachineFamilies
+		reservation = spotPolicy.Spec.FallbackReservation
 	}
 
 	ensureSpotToleration(pod)
@@ -225,21 +233,61 @@ func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, s
 		return
 	}
 
-	// FallbackToOnDemand: prefer Spot capacity, allow On-Demand fallback.
+	// FallbackToOnDemand: prefer Spot capacity, allow fallback to On-Demand / reservation nodes.
 	addPreferredSchedulingTerm(pod, corev1.PreferredSchedulingTerm{
 		Weight:     100,
 		Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
 	})
 
+	fallbackReqs := []corev1.NodeSelectorRequirement{spotDoesNotExist()}
 	if len(families) > 0 {
-		// Spot nodes of any family, OR On-Demand nodes of an allowed family.
+		fallbackReqs = append(fallbackReqs, corev1.NodeSelectorRequirement{
+			Key:      MachineFamilyLabelKey,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   families,
+		})
+	}
+	fallbackReqs = append(fallbackReqs, fallbackReservationRequirements(reservation)...)
+
+	if len(fallbackReqs) > 1 {
+		// Spot nodes, OR non-Spot fallback nodes matching the allowed machine families / reservation.
 		requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
 			{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
-			{MatchExpressions: []corev1.NodeSelectorRequirement{
-				spotDoesNotExist(),
-				{Key: MachineFamilyLabelKey, Operator: corev1.NodeSelectorOpIn, Values: families},
-			}},
+			{MatchExpressions: fallbackReqs},
 		})
+	}
+}
+
+func fallbackReservationRequirements(res *workloadsv1.FallbackReservationPolicy) []corev1.NodeSelectorRequirement {
+	if res == nil {
+		return nil
+	}
+	switch res.Affinity {
+	case workloadsv1.ReservationAffinityAny:
+		return []corev1.NodeSelectorRequirement{
+			{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"any"}},
+		}
+	case workloadsv1.ReservationAffinitySpecific:
+		reqs := []corev1.NodeSelectorRequirement{
+			{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
+		}
+		if res.Name != "" {
+			reqs = append(reqs, corev1.NodeSelectorRequirement{
+				Key:      ReservationNameLabelKey,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{res.Name},
+			})
+		}
+		if res.Project != "" {
+			reqs = append(reqs, corev1.NodeSelectorRequirement{
+				Key:      ReservationProjectLabelKey,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{res.Project},
+			})
+		}
+		return reqs
+	default:
+		return nil
 	}
 }
 
