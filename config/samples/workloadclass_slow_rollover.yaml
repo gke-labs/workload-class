@@ -1,0 +1,46 @@
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: slow-rollover-service
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      app: slow-rollover-demo
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "daily-window"
+        startTime: "00:00"
+        endTime: "23:59"
+        timeZone: "UTC"
+    maxNonDisruptionDurationDays: 7
+    graceTerminationDurationSeconds: 120
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slow-rollover-demo
+  namespace: sample
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: slow-rollover-demo
+  template:
+    metadata:
+      labels:
+        app: slow-rollover-demo
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "false"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

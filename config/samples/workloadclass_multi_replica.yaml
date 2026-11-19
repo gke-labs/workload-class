@@ -1,0 +1,47 @@
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: multi-replica-service
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      app: multi-replica-demo
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+        startTime: "00:00"
+        endTime: "06:00"
+        timeZone: "UTC"
+    minInitialRunDurationDays: 1
+    maxNonDisruptionDurationDays: 14
+    graceTerminationDurationSeconds: 60
+    allowedDisruptionsOutsideOfWindow:
+      - kind: User
+        name: system:cluster-autoscaler
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-replica-demo
+  namespace: sample
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: multi-replica-demo
+  template:
+    metadata:
+      labels:
+        app: multi-replica-demo
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
