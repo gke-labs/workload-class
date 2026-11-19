@@ -172,7 +172,9 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 		csType = workloadsv1.SpotPlacementTypeSpot
 	}
 	if csType == workloadsv1.SpotPlacementTypeOnDemand {
-		mutateForOnDemand(pod, spotPolicy)
+		// Explicit OnDemand opt-out does not inherit spotPolicy.Spec.CustomComputeClass,
+		// while still staying Warden-safe if the Pod itself already selects a compute class.
+		mutateForOnDemand(pod, nil)
 		return nil
 	}
 

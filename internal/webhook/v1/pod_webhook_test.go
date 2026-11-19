@@ -230,14 +230,15 @@ var _ = Describe("Pod Webhook", func() {
 	})
 
 	Context("When the WorkloadClass targets OnDemand", func() {
-		It("pins the Pod to On-Demand and strips Spot targeting", func() {
+		It("pins the Pod to On-Demand and strips Spot targeting without inheriting policy CustomComputeClass", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeOnDemand}, readyConditions())
 			pod := newIncomingPod()
 			setNodeSelector(pod, SpotLabelKey, SpotLabelValue)
 			ensureSpotToleration(pod)
-			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{})).Default(testCtx, pod)).To(Succeed())
+			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})).Default(testCtx, pod)).To(Succeed())
 
 			expectOnDemand(pod)
+			Expect(pod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
 		})
 	})
 
