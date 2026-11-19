@@ -43,12 +43,8 @@ type Disruption struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays"`
 
-	// EnforcedDisruptionTimeoutSeconds is the maximum time in seconds before a disruption is forced.
-	// +optional
-	// +kubebuilder:validation:Maximum=3600
-	EnforcedDisruptionTimeoutSeconds int32 `json:"enforcedDisruptionTimeoutSeconds,omitempty"`
-
-	// EmergencyOverride allows bypassing all constraints immediately.
+	// EmergencyOverride enables a cluster-wide emergency override that bypasses disruption
+	// constraints and opens Per-Pod PDBs for all WorkloadClasses immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
 }
