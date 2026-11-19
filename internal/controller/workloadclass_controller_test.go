@@ -2346,3 +2346,124 @@ func TestValidateCapacityStrategy(t *testing.T) {
 		})
 	}
 }
+
+func TestReconcileGroupPDBs(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := time.Now().UTC()
+	oldTime := metav1.Time{Time: now.Add(-72 * time.Hour)}
+	youngTime := metav1.Time{Time: now.Add(-2 * time.Hour)}
+
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "train-wc",
+			Namespace: "default",
+			UID:       types.UID("wc-uid-1"),
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "training"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				DisruptionUnit:            workloadsv1.DisruptionUnitGroup,
+				MinInitialRunDurationDays: 1,
+			},
+		},
+		Status: workloadsv1.WorkloadClassStatus{
+			MaintenanceReadiness: workloadsv1.ReadinessReady,
+		},
+	}
+
+	makeGangPod := func(name, jobset string, created metav1.Time) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         "default",
+				UID:               types.UID("uid-" + name),
+				CreationTimestamp: created,
+				Labels: map[string]string{
+					"role":                           "training",
+					"jobset.sigs.k8s.io/jobset-name": jobset,
+				},
+			},
+		}
+	}
+
+	// Gang 1 has an old worker + a young worker -> protected (closed) atomically.
+	// Gang 2 has two old workers -> ready (open 100%) for all-or-nothing eviction.
+	p1a := makeGangPod("gang1-w0", "job-1", oldTime)
+	p1b := makeGangPod("gang1-w1", "job-1", youngTime)
+	p2a := makeGangPod("gang2-w0", "job-2", oldTime)
+	p2b := makeGangPod("gang2-w1", "job-2", oldTime)
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+		wc, p1a, p1b, p2a, p2b,
+	).Build()
+	r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
+	validCond := metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonValidationPassed}
+
+	if _, err := r.reconcilePDBs(t.Context(), wc, validCond, true, nil); err != nil {
+		t.Fatalf("reconcilePDBs() error = %v", err)
+	}
+
+	g1, _ := utils.PodGroupID(p1a, "")
+	g2, _ := utils.PodGroupID(p2a, "")
+
+	// Both gangs get exactly 1 Group PDB each (total 2 PDBs, not 4 per-pod PDBs).
+	pdbList := &policyv1.PodDisruptionBudgetList{}
+	if err := c.List(t.Context(), pdbList, client.InNamespace("default")); err != nil {
+		t.Fatalf("List(PDB) error = %v", err)
+	}
+	if len(pdbList.Items) != 2 {
+		t.Fatalf("got %d PDBs, want 2 Group PDBs", len(pdbList.Items))
+	}
+
+	pdb1 := &policyv1.PodDisruptionBudget{}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1); err != nil {
+		t.Fatalf("Get(gang1 PDB) error = %v", err)
+	}
+	if utils.IsPDBOpen(pdb1) {
+		t.Errorf("gang1 PDB should be closed because gang1-w1 is younger than MinInitialRunDurationDays")
+	}
+
+	pdb2 := &policyv1.PodDisruptionBudget{}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g2), Namespace: "default"}, pdb2); err != nil {
+		t.Fatalf("Get(gang2 PDB) error = %v", err)
+	}
+	if !utils.IsPDBOpen(pdb2) {
+		t.Errorf("gang2 PDB should be open because all workers satisfy MinInitialRunDurationDays")
+	}
+
+	// Verify both gang1 pods were labeled with workloads.gke.io/pod-group.
+	gotPod := &corev1.Pod{}
+	if err := c.Get(t.Context(), client.ObjectKeyFromObject(p1a), gotPod); err != nil {
+		t.Fatalf("Get(p1a) error = %v", err)
+	}
+	if gotPod.Labels[utils.PodGroupLabel] != g1 {
+		t.Errorf("p1a label %s = %q, want %q", utils.PodGroupLabel, gotPod.Labels[utils.PodGroupLabel], g1)
+	}
+
+	// Invalid WorkloadClass opens gang1's Group PDB instead of deleting it.
+	invalidCond := metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed}
+	if _, err := r.reconcilePDBs(t.Context(), wc, invalidCond, true, nil); err != nil {
+		t.Fatalf("reconcilePDBs(invalid) error = %v", err)
+	}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1); err != nil {
+		t.Fatalf("Get(gang1 PDB after invalid) error = %v", err)
+	}
+	if !utils.IsPDBOpen(pdb1) {
+		t.Errorf("gang1 PDB should be open when WorkloadClass fails validation")
+	}
+
+	// Deleting all pods of gang2 removes gang2's Group PDB on next valid reconcile.
+	if err := c.Delete(t.Context(), p2a); err != nil {
+		t.Fatalf("Delete(p2a) error = %v", err)
+	}
+	if err := c.Delete(t.Context(), p2b); err != nil {
+		t.Fatalf("Delete(p2b) error = %v", err)
+	}
+	if _, err := r.reconcilePDBs(t.Context(), wc, validCond, true, nil); err != nil {
+		t.Fatalf("reconcilePDBs(after gang2 delete) error = %v", err)
+	}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g2), Namespace: "default"}, &policyv1.PodDisruptionBudget{}); !errors.IsNotFound(err) {
+		t.Errorf("expected gang2 Group PDB to be deleted, got err = %v", err)
+	}
+}
