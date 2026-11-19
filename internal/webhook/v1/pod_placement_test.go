@@ -203,6 +203,31 @@ var _ = Describe("Pod placement helpers", func() {
 			mutateForSpot(preset, workloadsv1.FallbackActionFail, policy)
 			Expect(preset.Spec.NodeSelector).To(HaveKeyWithValue(ComputeClassLabelKey, "user-choice"))
 		})
+
+		It("tolerates the compute-class node taint when it sets the CustomComputeClass", func() {
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})
+			cccTol := corev1.Toleration{Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "spot-first", Effect: corev1.TaintEffectNoSchedule}
+
+			pod := newIncomingPod()
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+			Expect(pod.Spec.Tolerations).To(ContainElement(cccTol))
+
+			// Idempotent on re-mutation.
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+			n := 0
+			for _, t := range pod.Spec.Tolerations {
+				if t.Key == ComputeClassLabelKey {
+					n++
+				}
+			}
+			Expect(n).To(Equal(1))
+
+			// A Pod that already selects a compute class keeps whatever GKE added for it.
+			preset := newIncomingPod()
+			setNodeSelector(preset, ComputeClassLabelKey, "user-choice")
+			mutateForSpot(preset, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+			Expect(preset.Spec.Tolerations).NotTo(ContainElement(cccTol))
+		})
 	})
 
 	Context("Pod state inspection", func() {
