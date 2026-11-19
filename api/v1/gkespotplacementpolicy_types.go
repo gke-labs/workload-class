@@ -67,6 +67,37 @@ const (
 	ReasonSpotStockout = "SpotStockout"
 )
 
+// ReservationAffinityType specifies how fallback Pods target GKE reservations during a Spot stockout.
+// +kubebuilder:validation:Enum=Any;Specific
+type ReservationAffinityType string
+
+const (
+	// ReservationAffinityAny targets any matching available GKE reservation on fallback nodes.
+	ReservationAffinityAny ReservationAffinityType = "Any"
+
+	// ReservationAffinitySpecific targets a specific named GKE reservation on fallback nodes.
+	ReservationAffinitySpecific ReservationAffinityType = "Specific"
+)
+
+// FallbackReservationPolicy directs Spot-fallback Pods onto GKE reservation capacity during Spot stockouts.
+// +kubebuilder:validation:XValidation:rule="self.affinity != 'Specific' || (has(self.name) && size(self.name) > 0)",message="name is required when affinity is Specific"
+// +kubebuilder:validation:XValidation:rule="self.affinity == 'Specific' || !has(self.name) || size(self.name) == 0",message="name can only be set when affinity is Specific"
+type FallbackReservationPolicy struct {
+	// Affinity selects whether fallback targets any matching reservation ("Any") or a specific named reservation ("Specific").
+	// +kubebuilder:validation:Required
+	Affinity ReservationAffinityType `json:"affinity"`
+
+	// Name is the GCE reservation name (cloud.google.com/reservation-name), required when affinity is "Specific".
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name,omitempty"`
+
+	// Project is the optional GCP project ID owning a shared GCE reservation (cloud.google.com/reservation-project).
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	Project string `json:"project,omitempty"`
+}
+
 // GKESpotPlacementPolicySpec defines the desired state of GKESpotPlacementPolicy.
 type GKESpotPlacementPolicySpec struct {
 	// CustomComputeClass is the optional name of a GKE Custom Compute Class
@@ -82,6 +113,12 @@ type GKESpotPlacementPolicySpec struct {
 	// +optional
 	// +listType=set
 	FallbackAllowedMachineFamilies []string `json:"fallbackAllowedMachineFamilies,omitempty"`
+
+	// FallbackReservation directs Pods falling back from Spot during a stockout onto available GKE
+	// reservation capacity (specific or any matching reservation). Pods scheduled onto fallback
+	// reservation nodes are tracked as in-fallback and automatically revert to Spot under Active reversion.
+	// +optional
+	FallbackReservation *FallbackReservationPolicy `json:"fallbackReservation,omitempty"`
 
 	// Reversion configures how fallback Pods running on On-Demand nodes return to GKE Spot VMs
 	// once Spot capacity recovers (Active, Lazy, or None).
