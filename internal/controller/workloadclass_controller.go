@@ -116,11 +116,19 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	reconcileConditions(&validationCond, pluginPlacementCondition)
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
-	// 2. Calculate Readiness
-	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
-	if err != nil {
-		log.Error(err, "Failed to calculate readiness")
-		return ctrl.Result{}, err
+	// 2. Calculate Readiness (cluster-wide guardrail EmergencyOverride immediately opens maintenance readiness)
+	var (
+		readiness     workloadsv1.MaintenanceReadiness
+		nextReconcile time.Duration
+	)
+	if utils.HasGuardrailEmergencyOverride(guardrails.Items) {
+		readiness = workloadsv1.ReadinessReady
+	} else {
+		readiness, nextReconcile, err = r.calculateReadiness(ctx, wc)
+		if err != nil {
+			log.Error(err, "Failed to calculate readiness")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 3. Update Status

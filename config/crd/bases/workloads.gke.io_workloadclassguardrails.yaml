@@ -55,15 +55,10 @@ spec:
                           type: string
                         type: array
                       emergencyOverride:
-                        description: EmergencyOverride allows bypassing all constraints
-                          immediately.
+                        description: |-
+                          EmergencyOverride enables a cluster-wide emergency override that bypasses disruption
+                          constraints and opens Per-Pod PDBs for all WorkloadClasses immediately.
                         type: boolean
-                      enforcedDisruptionTimeoutSeconds:
-                        description: EnforcedDisruptionTimeoutSeconds is the maximum
-                          time in seconds before a disruption is forced.
-                        format: int32
-                        maximum: 3600
-                        type: integer
                       maxAllowedWindows:
                         description: |-
                           MaxAllowedWindows sets the limit of how many windows workload owners can set.

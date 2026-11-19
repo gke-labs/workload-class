@@ -866,6 +866,40 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationPassed))
 			Expect(validatedCond.Message).To(Equal("WorkloadClass adheres to all Guardrail constraints"))
 		})
+
+		It("should mark WorkloadClass Ready and open its Per-Pod PDB when a Guardrail enables cluster-wide EmergencyOverride", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+
+			By("Enabling cluster-wide EmergencyOverride on the WorkloadClassGuardrail")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Disruption.EmergencyOverride = true
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessReady))
+
+			Eventually(func() (string, error) {
+				if err := k8sClient.Get(ctx, podPDBKey, pdb); err != nil {
+					return "", err
+				}
+				return pdb.Spec.MaxUnavailable.StrVal, nil
+			}, "10s", "1s").Should(Equal("100%"))
+		})
 	})
 })
 

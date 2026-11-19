@@ -17,6 +17,16 @@ webhooks:
       path: /validate-disruption
   failurePolicy: Fail
   name: vpoddisruption.gke.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      {{- if not (has .Release.Namespace (list "kube-system" "cert-manager")) }}
+      - {{ .Release.Namespace }}
+      {{- end }}
   rules:
   - apiGroups:
     - ""

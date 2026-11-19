@@ -1,0 +1,20 @@
+# Exclude system namespaces from the Pod disruption validating webhook. With failurePolicy: Fail and no
+# namespaceSelector, evictions of system Pods (including controller-manager or cert-manager Pods during
+# node drains) could deadlock if the webhook endpoint is temporarily unavailable.
+#
+# This is a strategic merge patch: webhooks are merged by name, so the selector is applied to
+# vpoddisruption.gke.io regardless of where controller-gen places it in the list.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- name: vpoddisruption.gke.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      - workload-class-system

@@ -236,3 +236,14 @@ func IsValidated(cond *metav1.Condition) bool {
 	}
 	return cond.Status == metav1.ConditionTrue || cond.Reason == workloadsv1.ReasonSelectorOverlap
 }
+
+// HasGuardrailEmergencyOverride reports whether any cluster-scoped WorkloadClassGuardrail
+// currently has spec.constraints.disruption.emergencyOverride set to true.
+func HasGuardrailEmergencyOverride(guardrails []workloadsv1.WorkloadClassGuardrail) bool {
+	for i := range guardrails {
+		if guardrails[i].Spec.Constraints.Disruption.EmergencyOverride {
+			return true
+		}
+	}
+	return false
+}

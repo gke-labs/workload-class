@@ -893,3 +893,20 @@ func TestIsValidated(t *testing.T) {
 		})
 	}
 }
+
+func TestHasGuardrailEmergencyOverride(t *testing.T) {
+	if HasGuardrailEmergencyOverride(nil) {
+		t.Error("expected false for nil guardrails")
+	}
+	noOverride := []workloadsv1.WorkloadClassGuardrail{{}}
+	if HasGuardrailEmergencyOverride(noOverride) {
+		t.Error("expected false when no guardrail sets emergencyOverride")
+	}
+	withOverride := []workloadsv1.WorkloadClassGuardrail{
+		{},
+		{Spec: workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{EmergencyOverride: true}}}},
+	}
+	if !HasGuardrailEmergencyOverride(withOverride) {
+		t.Error("expected true when any guardrail sets emergencyOverride")
+	}
+}
