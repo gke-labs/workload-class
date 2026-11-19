@@ -221,7 +221,32 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 	var errs []error
 	var requeue time.Duration
 	governedPDBs := make(map[string]bool, len(governed))
-	for _, pod := range governed {
+
+	podsForPerPodPDB := governed
+	if utils.IsGroupDisruptionUnit(wc) {
+		var ungrouped []*corev1.Pod
+		groups := make(map[string][]*corev1.Pod)
+		for _, pod := range governed {
+			if groupID, ok := utils.PodGroupID(pod, wc.Spec.DisruptionPolicy.GroupLabelKey); ok {
+				groups[groupID] = append(groups[groupID], pod)
+			} else {
+				ungrouped = append(ungrouped, pod)
+			}
+		}
+		groupIDs := slices.Sorted(maps.Keys(groups))
+		now := time.Now().UTC()
+		for _, groupID := range groupIDs {
+			gangPods := groups[groupID]
+			pdbName := utils.GroupPDBName(wc.Name, groupID)
+			governedPDBs[pdbName] = true
+			if err := r.reconcileGroupPDB(ctx, wc, groupID, gangPods, now); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		podsForPerPodPDB = ungrouped
+	}
+
+	for _, pod := range podsForPerPodPDB {
 		governedPDBs[utils.PDBName(pod.Name)] = true
 		remaining, err := r.reconcilePodPDB(ctx, wc, pod, leases)
 		if err != nil {
@@ -236,6 +261,10 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 	for i := range owned {
 		pdb := &owned[i]
 		if governedPDBs[pdb.Name] {
+			continue
+		}
+		if pdb.Labels[utils.PodGroupLabel] != "" {
+			errs = append(errs, r.deletePDB(ctx, wc, pdb))
 			continue
 		}
 
@@ -356,6 +385,10 @@ func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloa
 	var errs []error
 	for i := range owned {
 		pdb := &owned[i]
+		if groupID := pdb.Labels[utils.PodGroupLabel]; groupID != "" {
+			errs = append(errs, r.syncGroupPDB(ctx, wc, groupID, false, true))
+			continue
+		}
 		pod, err := r.getPodForPDB(ctx, wc.Namespace, pdb)
 		if err != nil {
 			errs = append(errs, err)
@@ -368,6 +401,75 @@ func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloa
 		errs = append(errs, r.syncPodPDB(ctx, wc, pod, false))
 	}
 	return errors.Join(errs...)
+}
+
+// reconcileGroupPDB labels every Pod in a gang with workloads.gke.io/pod-group and reconciles
+// a single Group PDB protecting the gang atomically.
+func (r *WorkloadClassReconciler) reconcileGroupPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, groupID string, gangPods []*corev1.Pod, now time.Time) error {
+	var errs []error
+	for _, pod := range gangPods {
+		if err := r.ensurePodGroupLabel(ctx, pod, groupID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	gangReady := gangReadyForDisruption(wc, gangPods, now)
+	if err := r.syncGroupPDB(ctx, wc, groupID, true, gangReady); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// gangReadyForDisruption reports whether an entire gang is ready for disruption.
+// A gang is ready when the WorkloadClass is Ready/Overdue (or EmergencyOverride is active)
+// and every active worker Pod in the gang satisfies MinInitialRunDurationDays.
+func gangReadyForDisruption(wc *workloadsv1.WorkloadClass, gangPods []*corev1.Pod, now time.Time) bool {
+	if wc.Spec.DisruptionPolicy.EmergencyOverride || wc.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
+		return true
+	}
+	if wc.Status.MaintenanceReadiness != workloadsv1.ReadinessReady {
+		return false
+	}
+	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
+		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
+		for _, pod := range gangPods {
+			if utils.IsPodActive(pod) && now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ensurePodGroupLabel labels the Pod with workloads.gke.io/pod-group so its Group PDB can select it.
+func (r *WorkloadClassReconciler) ensurePodGroupLabel(ctx context.Context, pod *corev1.Pod, groupID string) error {
+	if pod.Labels[utils.PodGroupLabel] == groupID {
+		return nil
+	}
+	patch := client.MergeFrom(pod.DeepCopy())
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	pod.Labels[utils.PodGroupLabel] = groupID
+	if err := r.Patch(ctx, pod, patch); err != nil {
+		return fmt.Errorf("failed to label Pod %s with gang group: %w", pod.Name, err)
+	}
+	return nil
+}
+
+// syncGroupPDB creates or updates the gang's Group PDB to match the WorkloadClass policy.
+func (r *WorkloadClassReconciler) syncGroupPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, groupID string, isValid, gangReady bool) error {
+	pdb := utils.GroupPDBBase(wc, groupID)
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		if err := r.claimPDB(wc, pdb); err != nil {
+			return err
+		}
+		return utils.SyncGroupPDBWithWorkloadClass(wc, groupID, pdb, isValid, gangReady)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reconcile Group PDB %s: %w", pdb.Name, err)
+	}
+	logf.FromContext(ctx).V(1).Info("Reconciled Group PDB", "pdb", pdb.Name, "group", groupID, "operation", op)
+	return nil
 }
 
 // ensurePodUIDLabel labels the Pod with workloads.gke.io/pod-uid so that its Per-Pod PDB can select it.
@@ -1196,17 +1298,24 @@ func podPredicate() predicate.Funcs {
 				// The workloads.gke.io/pod-uid label was removed or changed; restore it.
 				return true
 			}
-			return !maps.Equal(labelsWithoutPodUID(oldPod.Labels), labelsWithoutPodUID(newPod.Labels))
+			if oldPod.Labels[utils.PodGroupLabel] != "" && newPod.Labels[utils.PodGroupLabel] != oldPod.Labels[utils.PodGroupLabel] {
+				// The workloads.gke.io/pod-group label was removed or changed; restore it.
+				return true
+			}
+			return !maps.Equal(labelsWithoutManagedLabels(oldPod.Labels), labelsWithoutManagedLabels(newPod.Labels))
 		},
 	}
 }
 
-func labelsWithoutPodUID(podLabels map[string]string) map[string]string {
-	if _, ok := podLabels[utils.PodUIDLabel]; !ok {
+func labelsWithoutManagedLabels(podLabels map[string]string) map[string]string {
+	_, hasUID := podLabels[utils.PodUIDLabel]
+	_, hasGroup := podLabels[utils.PodGroupLabel]
+	if !hasUID && !hasGroup {
 		return podLabels
 	}
 	filtered := maps.Clone(podLabels)
 	delete(filtered, utils.PodUIDLabel)
+	delete(filtered, utils.PodGroupLabel)
 	return filtered
 }
 
