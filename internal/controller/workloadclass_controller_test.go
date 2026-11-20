@@ -404,6 +404,33 @@ var _ = Describe("WorkloadClass Controller", func() {
 				}
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue
 			}, "10s", "1s").Should(BeTrue())
+
+			By("Verifying an OverdueForMaintenance Warning event was recorded")
+			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring("OverdueForMaintenance")))
+		})
+
+		It("should requeue at the overdue deadline when it arrives before the next window", func() {
+			notToday := time.Now().AddDate(0, 0, 3).Weekday().String()
+
+			By("Configuring a window 3 days away and a 1-day maxNonDisruptionDurationDays nearly elapsed")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "later", DaysOfWeek: []string{notToday}, StartTime: "10:00", EndTime: "12:00"},
+			}
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 1
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			// 23h55m ago => ~5m until 24h overdue deadline, well before the window 3 days away.
+			wc.Status.LastDisruptionTime = &metav1.Time{Time: time.Now().Add(-23*time.Hour - 55*time.Minute)}
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			res, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(res.RequeueAfter).To(BeNumerically("<=", 10*time.Minute))
 		})
 
 		It("should not be ready if not within allowed disruption window", func() {
@@ -957,6 +984,46 @@ func TestOverdue(t *testing.T) {
 				t.Errorf("overdue() returned an unexpected result, got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestTimeUntilOverdueAndGuardrailCeiling(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	guardrails := []workloadsv1.WorkloadClassGuardrail{
+		{Spec: workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 7}}}},
+		{Spec: workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 3}}}},
+	}
+	strictestMax := strictestGuardrailMaxNonDisruptionDays(guardrails)
+	if strictestMax != 3 {
+		t.Errorf("strictestGuardrailMaxNonDisruptionDays() = %d, want 3", strictestMax)
+	}
+
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-48 * time.Hour)}},
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+		},
+	}
+	if got := effectiveMaxNonDisruptionDays(wc, strictestMax); got != 3 {
+		t.Errorf("effectiveMaxNonDisruptionDays() = %d, want 3 (guardrail ceiling)", got)
+	}
+	wcUnset := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now}}}
+	if got := effectiveMaxNonDisruptionDays(wcUnset, strictestMax); got != 0 {
+		t.Errorf("effectiveMaxNonDisruptionDays(unset) = %d, want 0", got)
+	}
+
+	isOverdue, remaining := timeUntilOverdue(wc, 3, now)
+	if isOverdue {
+		t.Fatalf("timeUntilOverdue() isOverdue = true, want false")
+	}
+	if remaining != 24*time.Hour {
+		t.Errorf("timeUntilOverdue() remaining = %v, want 24h", remaining)
+	}
+
+	isOverdue, remaining = timeUntilOverdue(wc, 1, now)
+	if !isOverdue || remaining != 0 {
+		t.Errorf("timeUntilOverdue() = (%v, %v), want (true, 0)", isOverdue, remaining)
 	}
 }
 
@@ -1643,7 +1710,7 @@ func TestCalculateReadinessBestMatchAndTerminalPods(t *testing.T) {
 	).Build()
 	r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
 
-	readiness, _, err := r.calculateReadiness(t.Context(), generalWC)
+	readiness, _, err := r.calculateReadiness(t.Context(), generalWC, nil)
 	if err != nil {
 		t.Fatalf("calculateReadiness() unexpected error: %v", err)
 	}

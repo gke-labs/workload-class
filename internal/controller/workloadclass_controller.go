@@ -117,18 +117,29 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
 	// 2. Calculate Readiness
-	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
+	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc, guardrails.Items)
 	if err != nil {
 		log.Error(err, "Failed to calculate readiness")
 		return ctrl.Result{}, err
 	}
 
 	// 3. Update Status
-	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
+	prevReadiness := wc.Status.MaintenanceReadiness
+	if prevReadiness != readiness || changed || removed {
 		wc.Status.MaintenanceReadiness = readiness
 		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
 		if err := r.Status().Update(ctx, wc); err != nil {
 			return ctrl.Result{}, err
+		}
+		if r.Recorder != nil && prevReadiness != workloadsv1.ReadinessOverdue && readiness == workloadsv1.ReadinessOverdue {
+			r.Recorder.Eventf(
+				wc,
+				nil,
+				corev1.EventTypeWarning,
+				"OverdueForMaintenance",
+				"Reconciling MaintenanceReadiness",
+				"WorkloadClass exceeded maxNonDisruptionDurationDays; opening managed PodDisruptionBudgets for maintenance",
+			)
 		}
 	}
 
@@ -505,7 +516,7 @@ func protectsPods(reason string, hasGuardrails bool) bool {
 	return reason == workloadsv1.ReasonValidationPassed || (reason == workloadsv1.ReasonSelectorOverlap && hasGuardrails)
 }
 
-func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
+func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *workloadsv1.WorkloadClass, guardrails []workloadsv1.WorkloadClassGuardrail) (workloadsv1.MaintenanceReadiness, time.Duration, error) {
 	log := logf.FromContext(ctx)
 	now := time.Now().UTC()
 
@@ -514,8 +525,10 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		return workloadsv1.ReadinessReady, 0, nil
 	}
 
-	// 2. Check Overdue (Maximum Protected Duration)
-	if overdue(wc, now) {
+	// 2. Check Overdue (Maximum Protected Duration, capped by strictest guardrail limit)
+	maxDays := effectiveMaxNonDisruptionDays(wc, strictestGuardrailMaxNonDisruptionDays(guardrails))
+	isOverdue, untilOverdue := timeUntilOverdue(wc, maxDays, now)
+	if isOverdue {
 		log.Info(fmt.Sprintf("Time since last disruption for WorkloadClass %s/%s exceeds MaxNonDisruptionDurationDays. WorkloadClass is overdue for maintenance", wc.Namespace, wc.Name))
 		return workloadsv1.ReadinessOverdue, 0, nil
 	}
@@ -523,7 +536,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	// 3. Check Temporal Windows
 	inWindow, nextWindow := utils.IsTimeInWindows(ctx, now, wc.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 	if !inWindow {
-		return workloadsv1.ReadinessNotReady, nextWindow, nil
+		return workloadsv1.ReadinessNotReady, minPositiveDuration(nextWindow, untilOverdue), nil
 	}
 
 	// Get pods for the next two checks
@@ -564,7 +577,7 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 			}
 			if now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
 				// Pod hasn't run long enough
-				return workloadsv1.ReadinessNotReady, minRunDuration - now.Sub(pod.CreationTimestamp.Time), nil
+				return workloadsv1.ReadinessNotReady, minPositiveDuration(minRunDuration-now.Sub(pod.CreationTimestamp.Time), untilOverdue), nil
 			}
 		}
 	}
@@ -580,11 +593,11 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 
 		if !gracePeriodsPassed {
 			// Grace periods have not passed
-			return workloadsv1.ReadinessNotReady, maxTimeForGracePeriod, nil
+			return workloadsv1.ReadinessNotReady, minPositiveDuration(maxTimeForGracePeriod, untilOverdue), nil
 		}
 	}
 
-	return workloadsv1.ReadinessReady, nextWindow, nil
+	return workloadsv1.ReadinessReady, minPositiveDuration(nextWindow, untilOverdue), nil
 }
 
 // placementPluginCondition returns a PlacementPluginAttached metav1.Condition from the WorkloadClass status if it matches
@@ -648,15 +661,60 @@ func addPlacementViolation(validation, placement *metav1.Condition) {
 	validation.LastTransitionTime = metav1.Now()
 }
 
-func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
-	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 {
-		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
-		if wc.Status.LastDisruptionTime != nil {
-			return now.Sub(wc.Status.LastDisruptionTime.Time) > maxDuration
+// strictestGuardrailMaxNonDisruptionDays returns the minimum positive maxNonDisruptionDurationDays
+// across all cluster guardrails, or 0 if none sets a positive limit.
+func strictestGuardrailMaxNonDisruptionDays(guardrails []workloadsv1.WorkloadClassGuardrail) int32 {
+	var strictestMaxDays int32
+	for i := range guardrails {
+		d := guardrails[i].Spec.Constraints.Disruption
+		if d.MaxNonDisruptionDurationDays > 0 && (strictestMaxDays == 0 || d.MaxNonDisruptionDurationDays < strictestMaxDays) {
+			strictestMaxDays = d.MaxNonDisruptionDurationDays
 		}
-		return now.Sub(wc.CreationTimestamp.Time) > maxDuration
 	}
-	return true
+	return strictestMaxDays
+}
+
+// effectiveMaxNonDisruptionDays returns the effective maximum undisrupted duration in days,
+// bounded by the strictest positive guardrail limit when the WorkloadClass sets a positive duration.
+// When the WorkloadClass sets 0 (unset), 0 is preserved so existing overdue semantics remain unchanged.
+func effectiveMaxNonDisruptionDays(wc *workloadsv1.WorkloadClass, strictestGuardrailMaxDays int32) int32 {
+	if wc == nil {
+		return 0
+	}
+	maxDays := wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays
+	if maxDays <= 0 {
+		return 0
+	}
+	if strictestGuardrailMaxDays > 0 && strictestGuardrailMaxDays < maxDays {
+		return strictestGuardrailMaxDays
+	}
+	return maxDays
+}
+
+// timeUntilOverdue evaluates whether the WorkloadClass has exceeded maxDays without disruption
+// and, if not, returns how long remains until it becomes overdue.
+func timeUntilOverdue(wc *workloadsv1.WorkloadClass, maxDays int32, now time.Time) (bool, time.Duration) {
+	if wc == nil || maxDays <= 0 {
+		return true, 0
+	}
+	maxDuration := time.Duration(maxDays) * 24 * time.Hour
+	anchor := wc.CreationTimestamp.Time
+	if wc.Status.LastDisruptionTime != nil {
+		anchor = wc.Status.LastDisruptionTime.Time
+	}
+	elapsed := now.Sub(anchor)
+	if elapsed > maxDuration {
+		return true, 0
+	}
+	return false, maxDuration - elapsed
+}
+
+func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
+	if wc == nil {
+		return true
+	}
+	isOverdue, _ := timeUntilOverdue(wc, wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays, now)
+	return isOverdue
 }
 
 func evaluatePodGracePeriod(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {
