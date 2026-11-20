@@ -1,0 +1,7 @@
+# Two-Lane Governance Lock for WorkloadClass Runtime Safety Invariants
+# Feature and bugfix pull requests (Lane 1) must not weaken or modify invariant rules
+# without explicit human owner sign-off.
+/internal/invariants/ @orizabal @aprajitaarora13
+/docs/invariants.md @orizabal @aprajitaarora13
+/.github/CODEOWNERS @orizabal @aprajitaarora13
+/verification-suite/verify_invariant_governance.sh @orizabal @aprajitaarora13
