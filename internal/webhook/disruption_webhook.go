@@ -90,12 +90,9 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		return admission.Allowed("WorkloadClass failed Guardrail validation")
 	}
 
-	// Emergency Override (WorkloadClass or any cluster WorkloadClassGuardrail)
+	// Emergency Override
 	if bestWC.Spec.DisruptionPolicy.EmergencyOverride {
 		return admission.Allowed("Emergency override active")
-	}
-	if v.hasGuardrailEmergencyOverride(ctx) {
-		return admission.Allowed("Guardrail emergency override active")
 	}
 
 	// Identity-Based Filtering
@@ -235,21 +232,6 @@ func matchesGroupKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bo
 func matchesServiceAccountKind(userInfo authv1.UserInfo, subject workloadsv1.Subject) (bool, error) {
 	expectedUsername := fmt.Sprintf("system:serviceaccount:%s:%s", subject.Namespace, subject.Name)
 	return userInfo.Username == expectedUsername, nil
-}
-
-// hasGuardrailEmergencyOverride returns true if any cluster-scoped WorkloadClassGuardrail has emergencyOverride enabled.
-func (v *DisruptionWebhook) hasGuardrailEmergencyOverride(ctx context.Context) bool {
-	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
-	if err := v.Client.List(ctx, guardrails); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to list WorkloadClassGuardrails for emergencyOverride check")
-		return false
-	}
-	for i := range guardrails.Items {
-		if guardrails.Items[i].Spec.Constraints.Disruption.EmergencyOverride {
-			return true
-		}
-	}
-	return false
 }
 
 // InjectDecoder injects the decoder.

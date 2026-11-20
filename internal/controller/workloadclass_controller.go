@@ -117,7 +117,6 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
 	// 2. Calculate Readiness
-	guardrailEmergencyOverride, _ := effectiveGuardrailDisruption(guardrails.Items)
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc, guardrails.Items)
 	if err != nil {
 		log.Error(err, "Failed to calculate readiness")
@@ -132,27 +131,15 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.Status().Update(ctx, wc); err != nil {
 			return ctrl.Result{}, err
 		}
-		if r.Recorder != nil && prevReadiness != readiness {
-			switch {
-			case readiness == workloadsv1.ReadinessOverdue:
-				r.Recorder.Eventf(
-					wc,
-					nil,
-					corev1.EventTypeWarning,
-					"OverdueForMaintenance",
-					"Reconciling MaintenanceReadiness",
-					"WorkloadClass exceeded maxNonDisruptionDurationDays; opening managed PodDisruptionBudgets for maintenance",
-				)
-			case guardrailEmergencyOverride && readiness == workloadsv1.ReadinessReady:
-				r.Recorder.Eventf(
-					wc,
-					nil,
-					corev1.EventTypeNormal,
-					"GuardrailEmergencyOverride",
-					"Reconciling MaintenanceReadiness",
-					"Guardrail emergencyOverride is active; opening managed PodDisruptionBudgets for maintenance",
-				)
-			}
+		if r.Recorder != nil && prevReadiness != workloadsv1.ReadinessOverdue && readiness == workloadsv1.ReadinessOverdue {
+			r.Recorder.Eventf(
+				wc,
+				nil,
+				corev1.EventTypeWarning,
+				"OverdueForMaintenance",
+				"Reconciling MaintenanceReadiness",
+				"WorkloadClass exceeded maxNonDisruptionDurationDays; opening managed PodDisruptionBudgets for maintenance",
+			)
 		}
 	}
 
@@ -533,15 +520,13 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	log := logf.FromContext(ctx)
 	now := time.Now().UTC()
 
-	guardrailEmergencyOverride, guardrailMaxDays := effectiveGuardrailDisruption(guardrails)
-
-	// 1. Emergency Override (WorkloadClass or any cluster WorkloadClassGuardrail)
-	if wc.Spec.DisruptionPolicy.EmergencyOverride || guardrailEmergencyOverride {
+	// 1. Emergency Override
+	if wc.Spec.DisruptionPolicy.EmergencyOverride {
 		return workloadsv1.ReadinessReady, 0, nil
 	}
 
 	// 2. Check Overdue (Maximum Protected Duration, capped by strictest guardrail limit)
-	maxDays := effectiveMaxNonDisruptionDays(wc, guardrailMaxDays)
+	maxDays := effectiveMaxNonDisruptionDays(wc, strictestGuardrailMaxNonDisruptionDays(guardrails))
 	isOverdue, untilOverdue := timeUntilOverdue(wc, maxDays, now)
 	if isOverdue {
 		log.Info(fmt.Sprintf("Time since last disruption for WorkloadClass %s/%s exceeds MaxNonDisruptionDurationDays. WorkloadClass is overdue for maintenance", wc.Namespace, wc.Name))
@@ -676,19 +661,17 @@ func addPlacementViolation(validation, placement *metav1.Condition) {
 	validation.LastTransitionTime = metav1.Now()
 }
 
-// effectiveGuardrailDisruption aggregates cluster-wide disruption override and the strictest
-// maxNonDisruptionDurationDays limit across all guardrails.
-func effectiveGuardrailDisruption(guardrails []workloadsv1.WorkloadClassGuardrail) (emergencyOverride bool, strictestMaxDays int32) {
+// strictestGuardrailMaxNonDisruptionDays returns the minimum positive maxNonDisruptionDurationDays
+// across all cluster guardrails, or 0 if none sets a positive limit.
+func strictestGuardrailMaxNonDisruptionDays(guardrails []workloadsv1.WorkloadClassGuardrail) int32 {
+	var strictestMaxDays int32
 	for i := range guardrails {
 		d := guardrails[i].Spec.Constraints.Disruption
-		if d.EmergencyOverride {
-			emergencyOverride = true
-		}
 		if d.MaxNonDisruptionDurationDays > 0 && (strictestMaxDays == 0 || d.MaxNonDisruptionDurationDays < strictestMaxDays) {
 			strictestMaxDays = d.MaxNonDisruptionDurationDays
 		}
 	}
-	return emergencyOverride, strictestMaxDays
+	return strictestMaxDays
 }
 
 // effectiveMaxNonDisruptionDays returns the effective maximum undisrupted duration in days,

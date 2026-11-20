@@ -928,9 +928,6 @@ type fakeClient struct {
 	// getPDBResult is returned for PodDisruptionBudget Gets. If nil, a NotFound error is returned.
 	getPDBError  error
 	getPDBResult *policyv1.PodDisruptionBudget
-
-	listGuardrailError  error
-	listGuardrailResult *workloadsv1.WorkloadClassGuardrailList
 }
 
 func createClient(getNSErr, getWCErr, listWCErr, getPodErr error, getNSResult *corev1.Namespace, getWCResult *workloadsv1.WorkloadClass, listWCResult *workloadsv1.WorkloadClassList, getPodResult *corev1.Pod) fakeClient {
@@ -947,71 +944,8 @@ func createClient(getNSErr, getWCErr, listWCErr, getPodErr error, getNSResult *c
 }
 
 func (fc fakeClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	switch typedList := list.(type) {
-	case *workloadsv1.WorkloadClassList:
-		if fc.listWCResult != nil {
-			fc.listWCResult.DeepCopyInto(typedList)
-		}
-		return fc.listWCError
-	case *workloadsv1.WorkloadClassGuardrailList:
-		if fc.listGuardrailResult != nil {
-			fc.listGuardrailResult.DeepCopyInto(typedList)
-		}
-		return fc.listGuardrailError
-	default:
-		return fmt.Errorf("unknown list type %T", list)
-	}
-}
-
-func TestHandleGuardrailEmergencyOverride(t *testing.T) {
-	outOfWindowDay := time.Now().AddDate(0, 0, 2).Weekday().String()
-	labels := map[string]string{"app": "training"}
-	wc := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default"},
-		Spec: workloadsv1.WorkloadClassSpec{
-			PodSelector: &metav1.LabelSelector{MatchLabels: labels},
-			DisruptionPolicy: workloadsv1.DisruptionPolicy{
-				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
-					{Name: "future", DaysOfWeek: []string{outOfWindowDay}, StartTime: "10:00", EndTime: "12:00"},
-				},
-			},
-		},
-	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-1", Namespace: "default", Labels: labels}}
-	fc := fakeClient{
-		getNamespaceResult: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-		getPodResult:       pod,
-		listWCResult:       &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}},
-		listGuardrailResult: &workloadsv1.WorkloadClassGuardrailList{
-			Items: []workloadsv1.WorkloadClassGuardrail{
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "cluster-override"},
-					Spec: workloadsv1.WorkloadClassGuardrailSpec{
-						Constraints: workloadsv1.Constraints{
-							Disruption: workloadsv1.Disruption{
-								MaxNonDisruptionDurationDays: 7,
-								EmergencyOverride:            true,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	wh := &DisruptionWebhook{Client: fc}
-	req := admission.Request{
-		AdmissionRequest: admissionv1.AdmissionRequest{
-			Name:        pod.Name,
-			Namespace:   pod.Namespace,
-			SubResource: "eviction",
-			UserInfo:    authv1.UserInfo{Username: "kube-drain"},
-		},
-	}
-	resp := wh.Handle(context.Background(), req)
-	if !resp.Allowed {
-		t.Fatalf("Handle() Allowed = false, want true when guardrail EmergencyOverride is active; reason: %v", resp.Result)
-	}
+	fc.listWCResult.DeepCopyInto(list.(*workloadsv1.WorkloadClassList))
+	return fc.listWCError
 }
 
 func (fc fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {

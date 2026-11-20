@@ -433,39 +433,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(res.RequeueAfter).To(BeNumerically("<=", 10*time.Minute))
 		})
 
-		It("should become Ready, open PDBs, and emit an event when guardrail EmergencyOverride is enabled", func() {
-			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
-
-			By("Configuring WorkloadClass outside any disruption window and matching the Pod")
-			wc := &workloadsv1.WorkloadClass{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
-			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
-			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
-				{Name: "later", DaysOfWeek: []string{notToday}, StartTime: "10:00", EndTime: "12:00"},
-			}
-			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
-
-			By("Enabling EmergencyOverride on the WorkloadClassGuardrail")
-			guardrail := &workloadsv1.WorkloadClassGuardrail{}
-			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
-			guardrail.Spec.Constraints.Disruption.EmergencyOverride = true
-			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
-
-			By("Reconciling")
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Verifying MaintenanceReadiness is Ready and Per-Pod PDB is open")
-			updatedWC := &workloadsv1.WorkloadClass{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
-			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessReady))
-
-			pdb := &policyv1.PodDisruptionBudget{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: utils.PDBName(podName), Namespace: defaultNamespace}, pdb)).To(Succeed())
-			Expect(utils.IsPDBOpen(pdb)).To(BeTrue())
-			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring("GuardrailEmergencyOverride")))
-		})
-
 		It("should not be ready if not within allowed disruption window", func() {
 			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
 
@@ -1025,14 +992,11 @@ func TestTimeUntilOverdueAndGuardrailCeiling(t *testing.T) {
 
 	guardrails := []workloadsv1.WorkloadClassGuardrail{
 		{Spec: workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 7}}}},
-		{Spec: workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 3, EmergencyOverride: true}}}},
+		{Spec: workloadsv1.WorkloadClassGuardrailSpec{Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 3}}}},
 	}
-	override, strictestMax := effectiveGuardrailDisruption(guardrails)
-	if !override {
-		t.Errorf("effectiveGuardrailDisruption() override = false, want true")
-	}
+	strictestMax := strictestGuardrailMaxNonDisruptionDays(guardrails)
 	if strictestMax != 3 {
-		t.Errorf("effectiveGuardrailDisruption() strictestMax = %d, want 3", strictestMax)
+		t.Errorf("strictestGuardrailMaxNonDisruptionDays() = %d, want 3", strictestMax)
 	}
 
 	wc := &workloadsv1.WorkloadClass{
