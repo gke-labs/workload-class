@@ -572,6 +572,7 @@ func TestHandle_DisruptionPacing(t *testing.T) {
 	}
 
 	makeWC := func(day string, emergency bool, readiness workloadsv1.MaintenanceReadiness) *workloadsv1.WorkloadClass {
+		threshold := int32(60)
 		return &workloadsv1.WorkloadClass{
 			ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: namespace},
 			Spec: workloadsv1.WorkloadClassSpec{
@@ -583,7 +584,7 @@ func TestHandle_DisruptionPacing(t *testing.T) {
 					AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{{Kind: rbacv1.UserKind, Name: adminUsername}},
 					EmergencyOverride:                 emergency,
 					MaxUnavailable:                    &maxUnavailOne,
-					DisruptionStuckThresholdSeconds:   60,
+					DisruptionStuckThresholdSeconds:   &threshold,
 				},
 			},
 			Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: readiness},
@@ -677,6 +678,95 @@ func TestHandle_DisruptionPacing(t *testing.T) {
 		v.Client = c
 		if resp := v.Handle(t.Context(), evictReq("db-0", "node-drain")); !resp.Allowed {
 			t.Fatalf("ReadinessOverdue should bypass pacing, got %+v", resp.Result)
+		}
+	})
+
+	t.Run("back_to_back_evictions_consume_in_memory_budget", func(t *testing.T) {
+		wc := makeWC(inWindowDay, false, workloadsv1.ReadinessReady)
+		p0, p1, p2 := makePod("db-0", "u0", true), makePod("db-1", "u1", true), makePod("db-2", "u2", true)
+		c := createClient(nil, nil, nil, nil, ns, wc, &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}}, &p0)
+		c.listPodResult = &corev1.PodList{Items: []corev1.Pod{p0, p1, p2}}
+		now := time.Now().UTC()
+		v := &DisruptionWebhook{Client: c, BlockedTracker: utils.NewBlockedPodTracker(), nowFunc: func() time.Time { return now }}
+		if resp := v.Handle(t.Context(), evictReq("db-0", "node-drain")); !resp.Allowed {
+			t.Fatalf("first eviction should succeed with budget=1, got %+v", resp.Result)
+		}
+		// Immediately evicting db-1 while db-0 is still Ready in cache must be denied.
+		c.getPodResult = &p1
+		v.Client = c
+		if resp := v.Handle(t.Context(), evictReq("db-1", "node-drain")); resp.Allowed {
+			t.Fatalf("second back-to-back eviction should be denied while db-0 is in flight")
+		}
+		// Once the ledger entry expires past TTL, db-1 can proceed.
+		now = now.Add(recentEvictionTTL + time.Second)
+		if resp := v.Handle(t.Context(), evictReq("db-1", "node-drain")); !resp.Allowed {
+			t.Fatalf("eviction after TTL expiry should succeed, got %+v", resp.Result)
+		}
+	})
+
+	t.Run("terminating_pod_counts_unavailable_and_unready_pod_eviction_allowed", func(t *testing.T) {
+		wc := makeWC(outOfWindowDay, false, workloadsv1.ReadinessNotReady)
+		nowMeta := metav1.Now()
+		p0, p1, p2 := makePod("db-0", "u0", true), makePod("db-1", "u1", true), makePod("db-2", "u2", true)
+		p2.DeletionTimestamp = &nowMeta // Ready=True condition still set, but terminating
+		c := createClient(nil, nil, nil, nil, ns, wc, &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}}, &p0)
+		c.listPodResult = &corev1.PodList{Items: []corev1.Pod{p0, p1, p2}}
+		v := &DisruptionWebhook{Client: c, BlockedTracker: utils.NewBlockedPodTracker()}
+		if resp := v.Handle(t.Context(), evictReq("db-0", adminUsername)); resp.Allowed {
+			t.Fatalf("healthy pod eviction should be denied when terminating pod exhausts budget")
+		}
+		// Evicting an unready pod itself is always allowed even when budget is 0.
+		unready := makePod("db-3", "u3", false)
+		c.getPodResult = &unready
+		v.Client = c
+		if resp := v.Handle(t.Context(), evictReq("db-3", adminUsername)); !resp.Allowed {
+			t.Fatalf("unready pod eviction should always be allowed, got %+v", resp.Result)
+		}
+	})
+
+	t.Run("parallel_break_glass_rate_limited_and_zero_disables_break_glass", func(t *testing.T) {
+		wc := makeWC(inWindowDay, false, workloadsv1.ReadinessReady)
+		p0, p1, p2 := makePod("db-0", "u0", true), makePod("db-1", "u1", true), makePod("db-2", "u2", false)
+		c := createClient(nil, nil, nil, nil, ns, wc, &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}}, &p0)
+		c.listPodResult = &corev1.PodList{Items: []corev1.Pod{p0, p1, p2}}
+		now := time.Now().UTC()
+		v := &DisruptionWebhook{Client: c, BlockedTracker: utils.NewBlockedPodTracker(), nowFunc: func() time.Time { return now }}
+		_ = v.Handle(t.Context(), evictReq("db-0", "drain"))
+		c.getPodResult = &p1
+		v.Client = c
+		_ = v.Handle(t.Context(), evictReq("db-1", "drain"))
+		now = now.Add(60 * time.Second)
+		c.getPodResult = &p0
+		v.Client = c
+		if resp := v.Handle(t.Context(), evictReq("db-0", "drain")); !resp.Allowed {
+			t.Fatalf("first stuck pod should break glass, got %+v", resp.Result)
+		}
+		c.getPodResult = &p1
+		v.Client = c
+		if resp := v.Handle(t.Context(), evictReq("db-1", "drain")); resp.Allowed {
+			t.Fatalf("second parallel stuck pod should be held during cooldown")
+		}
+		// In-window authorized actor falls through to break-glass (not permanently locked).
+		now = now.Add(60 * time.Second)
+		if resp := v.Handle(t.Context(), evictReq("db-1", adminUsername)); !resp.Allowed {
+			t.Fatalf("authorized actor in window should break glass after cooldown, got %+v", resp.Result)
+		}
+		// Overdue overrides pacing even for an authorized subject.
+		wcOverdue := makeWC(outOfWindowDay, false, workloadsv1.ReadinessOverdue)
+		c.listWCResult = &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wcOverdue}}
+		v.Client = c
+		if resp := v.Handle(t.Context(), evictReq("db-1", adminUsername)); !resp.Allowed {
+			t.Fatalf("authorized actor when Overdue should be allowed, got %+v", resp.Result)
+		}
+		// Threshold 0 disables break-glass.
+		zeroSec := int32(0)
+		wcStrict := makeWC(inWindowDay, false, workloadsv1.ReadinessReady)
+		wcStrict.Spec.DisruptionPolicy.DisruptionStuckThresholdSeconds = &zeroSec
+		c.listWCResult = &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wcStrict}}
+		c.getPodResult = &p0
+		v.Client = c
+		if resp := v.Handle(t.Context(), evictReq("db-0", "drain")); resp.Allowed {
+			t.Fatalf("expected eviction denied when break-glass is disabled")
 		}
 	})
 
