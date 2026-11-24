@@ -886,6 +886,32 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("maxUnavailable and minAvailable are mutually exclusive"))
 		})
+
+		It("should reject malformed or negative maxUnavailable/minAvailable via CEL validation", func() {
+			cases := []struct {
+				name string
+				val  intstr.IntOrString
+			}{
+				{name: "neg-int", val: intstr.FromInt32(-1)},
+				{name: "bare-string", val: intstr.FromString("25")},
+				{name: "alpha-pct", val: intstr.FromString("abc%")},
+				{name: "over-100-pct", val: intstr.FromString("150%")},
+			}
+			for _, tc := range cases {
+				v := tc.val
+				wcMax := &workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-max-" + tc.name, Namespace: defaultNamespace},
+					Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxUnavailable: &v}},
+				}
+				Expect(k8sClient.Create(ctx, wcMax)).To(MatchError(ContainSubstring("maxUnavailable must be a non-negative integer or a percentage string")))
+
+				wcMin := &workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-min-" + tc.name, Namespace: defaultNamespace},
+					Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MinAvailable: &v}},
+				}
+				Expect(k8sClient.Create(ctx, wcMin)).To(MatchError(ContainSubstring("minAvailable must be a non-negative integer or a percentage string")))
+			}
+		})
 	})
 })
 

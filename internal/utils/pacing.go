@@ -29,7 +29,7 @@ import (
 )
 
 // DefaultDisruptionStuckThreshold is the default duration an in-window eviction may remain blocked
-// by pacing before break-glass permits it to proceed.
+// by pacing before break-glass permits it to proceed when DisruptionStuckThresholdSeconds is omitted.
 const DefaultDisruptionStuckThreshold = 120 * time.Second
 
 // HasPacingPolicy reports whether the DisruptionPolicy configures concurrent disruption pacing.
@@ -37,13 +37,17 @@ func HasPacingPolicy(dp workloadsv1.DisruptionPolicy) bool {
 	return dp.MaxUnavailable != nil || dp.MinAvailable != nil
 }
 
-// StuckThreshold returns the configured stuck-eviction break-glass threshold, defaulting to
-// DefaultDisruptionStuckThreshold when unset or non-positive.
-func StuckThreshold(dp workloadsv1.DisruptionPolicy) time.Duration {
-	if dp.DisruptionStuckThresholdSeconds <= 0 {
-		return DefaultDisruptionStuckThreshold
+// StuckThreshold returns the configured stuck-eviction break-glass threshold and whether break-glass
+// is enabled. When DisruptionStuckThresholdSeconds is nil, it defaults to (DefaultDisruptionStuckThreshold, true).
+// When explicitly set to 0 (or less), break-glass is disabled and (0, false) is returned.
+func StuckThreshold(dp workloadsv1.DisruptionPolicy) (time.Duration, bool) {
+	if dp.DisruptionStuckThresholdSeconds == nil {
+		return DefaultDisruptionStuckThreshold, true
 	}
-	return time.Duration(dp.DisruptionStuckThresholdSeconds) * time.Second
+	if *dp.DisruptionStuckThresholdSeconds <= 0 {
+		return 0, false
+	}
+	return time.Duration(*dp.DisruptionStuckThresholdSeconds) * time.Second, true
 }
 
 // IsPodReady reports whether pod is active, Running, and has PodReady=True.
@@ -95,55 +99,96 @@ func CalculateDisruptionBudget(dp workloadsv1.DisruptionPolicy, totalPods, ready
 	return max(0, readyPods-desiredHealthy), nil
 }
 
-// BlockedPodTracker tracks when a Pod's eviction was first blocked by in-window pacing so the
-// disruption webhook can apply break-glass after StuckThreshold without mutating the Pod.
+type blockedPodEntry struct {
+	firstBlocked time.Time
+	lastSeen     time.Time
+}
+
+// BlockedPodTracker tracks when Pods are continuously blocked by in-window pacing and rate-limits
+// break-glass evictions per WorkloadClass so concurrent drains cannot release all blocked Pods at once.
+//
+// Note: state is kept in memory per webhook replica and is not shared across manager replicas or
+// persisted across restarts. Running multiple webhook replicas causes each instance to track its
+// own independent timer and cooldown state.
 type BlockedPodTracker struct {
-	mu        sync.Mutex
-	blockedAt map[types.UID]time.Time
+	mu             sync.Mutex
+	blocked        map[types.UID]blockedPodEntry
+	lastBreakGlass map[types.NamespacedName]time.Time
 }
 
 // NewBlockedPodTracker constructs an empty BlockedPodTracker.
 func NewBlockedPodTracker() *BlockedPodTracker {
 	return &BlockedPodTracker{
-		blockedAt: map[types.UID]time.Time{},
+		blocked:        map[types.UID]blockedPodEntry{},
+		lastBreakGlass: map[types.NamespacedName]time.Time{},
 	}
 }
 
-// RecordOrElapsed records now as the first-blocked timestamp for uid if not already present,
-// and returns the elapsed duration since uid was first blocked.
-func (t *BlockedPodTracker) RecordOrElapsed(uid types.UID, now time.Time) time.Duration {
+// RecordOrElapsed tracks blocked eviction attempts for uid and returns how long uid has been
+// continuously blocked. If resetGap > 0 and the time since uid was last seen exceeds resetGap,
+// the timer resets to now (so a cancelled drain hours earlier does not immediately break glass).
+func (t *BlockedPodTracker) RecordOrElapsed(uid types.UID, now time.Time, resetGap time.Duration) time.Duration {
 	if t == nil || uid == "" {
 		return 0
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	first, ok := t.blockedAt[uid]
-	if !ok {
-		t.blockedAt[uid] = now
+	entry, ok := t.blocked[uid]
+	if !ok || (resetGap > 0 && now.Sub(entry.lastSeen) > resetGap) {
+		t.blocked[uid] = blockedPodEntry{firstBlocked: now, lastSeen: now}
 		return 0
 	}
-	return max(0, now.Sub(first))
+	if now.After(entry.lastSeen) {
+		entry.lastSeen = now
+		t.blocked[uid] = entry
+	}
+	return max(0, now.Sub(entry.firstBlocked))
 }
 
-// Clear removes any tracked first-blocked timestamp for uid.
+// TryBreakGlass checks whether wcKey may perform a break-glass eviction at now. At most one
+// break-glass eviction per WorkloadClass is allowed within cooldown. On success, it records now
+// as wcKey's latest break-glass timestamp, clears uid's blocked entry, and returns true.
+func (t *BlockedPodTracker) TryBreakGlass(wcKey types.NamespacedName, uid types.UID, now time.Time, cooldown time.Duration) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if last, ok := t.lastBreakGlass[wcKey]; ok && cooldown > 0 && now.Sub(last) < cooldown {
+		return false
+	}
+	t.lastBreakGlass[wcKey] = now
+	if uid != "" {
+		delete(t.blocked, uid)
+	}
+	return true
+}
+
+// Clear removes any tracked blocked entry for uid.
 func (t *BlockedPodTracker) Clear(uid types.UID) {
 	if t == nil || uid == "" {
 		return
 	}
 	t.mu.Lock()
-	delete(t.blockedAt, uid)
+	delete(t.blocked, uid)
 	t.mu.Unlock()
 }
 
-// Prune removes entries whose first-blocked timestamp is strictly before cutoff.
+// Prune removes blocked Pod entries whose last-seen timestamp is strictly before cutoff,
+// and per-WorkloadClass break-glass records strictly before cutoff.
 func (t *BlockedPodTracker) Prune(cutoff time.Time) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
-	for uid, at := range t.blockedAt {
+	for uid, entry := range t.blocked {
+		if entry.lastSeen.Before(cutoff) {
+			delete(t.blocked, uid)
+		}
+	}
+	for wcKey, at := range t.lastBreakGlass {
 		if at.Before(cutoff) {
-			delete(t.blockedAt, uid)
+			delete(t.lastBreakGlass, wcKey)
 		}
 	}
 	t.mu.Unlock()

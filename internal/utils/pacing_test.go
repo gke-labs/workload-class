@@ -29,22 +29,15 @@ import (
 )
 
 func TestCalculateDisruptionBudget(t *testing.T) {
-	intVal := func(v int32) *intstr.IntOrString {
-		val := intstr.FromInt32(v)
-		return &val
-	}
-	strVal := func(s string) *intstr.IntOrString {
-		val := intstr.FromString(s)
-		return &val
-	}
+	intVal := func(v int32) *intstr.IntOrString { val := intstr.FromInt32(v); return &val }
+	strVal := func(s string) *intstr.IntOrString { val := intstr.FromString(s); return &val }
 
 	testCases := []struct {
-		name    string
-		dp      workloadsv1.DisruptionPolicy
-		total   int
-		ready   int
-		want    int
-		wantErr bool
+		name         string
+		dp           workloadsv1.DisruptionPolicy
+		total, ready int
+		want         int
+		wantErr      bool
 	}{
 		{name: "no_pacing_policy", dp: workloadsv1.DisruptionPolicy{}, total: 4, ready: 4, want: 4},
 		{name: "maxUnavailable_int_all_ready", dp: workloadsv1.DisruptionPolicy{MaxUnavailable: intVal(1)}, total: 4, ready: 4, want: 1},
@@ -59,34 +52,29 @@ func TestCalculateDisruptionBudget(t *testing.T) {
 		{name: "negative_maxUnavailable_errors", dp: workloadsv1.DisruptionPolicy{MaxUnavailable: intVal(-1)}, total: 4, ready: 4, wantErr: true},
 		{name: "invalid_percent_errors", dp: workloadsv1.DisruptionPolicy{MaxUnavailable: strVal("abc%")}, total: 4, ready: 4, wantErr: true},
 	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := CalculateDisruptionBudget(tc.dp, tc.total, tc.ready)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("CalculateDisruptionBudget() error = %v, wantErr %v", err, tc.wantErr)
-			}
-			if got != tc.want {
-				t.Errorf("CalculateDisruptionBudget() = %d, want %d", got, tc.want)
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("CalculateDisruptionBudget() = (%d, %v), want (%d, err=%v)", got, err, tc.want, tc.wantErr)
 			}
 		})
 	}
 }
 
 func TestStuckThresholdAndIsPodReady(t *testing.T) {
-	if got := StuckThreshold(workloadsv1.DisruptionPolicy{}); got != DefaultDisruptionStuckThreshold {
-		t.Errorf("default StuckThreshold = %v, want %v", got, DefaultDisruptionStuckThreshold)
+	zero, custom := int32(0), int32(45)
+	if got, ok := StuckThreshold(workloadsv1.DisruptionPolicy{}); !ok || got != DefaultDisruptionStuckThreshold {
+		t.Errorf("default StuckThreshold = (%v, %v), want (%v, true)", got, ok, DefaultDisruptionStuckThreshold)
 	}
-	if got := StuckThreshold(workloadsv1.DisruptionPolicy{DisruptionStuckThresholdSeconds: 45}); got != 45*time.Second {
-		t.Errorf("custom StuckThreshold = %v, want 45s", got)
+	if got, ok := StuckThreshold(workloadsv1.DisruptionPolicy{DisruptionStuckThresholdSeconds: &zero}); ok || got != 0 {
+		t.Errorf("disabled StuckThreshold(0) = (%v, %v), want (0, false)", got, ok)
+	}
+	if got, ok := StuckThreshold(workloadsv1.DisruptionPolicy{DisruptionStuckThresholdSeconds: &custom}); !ok || got != 45*time.Second {
+		t.Errorf("custom StuckThreshold = (%v, %v), want (45s, true)", got, ok)
 	}
 
-	readyPod := &corev1.Pod{
-		Status: corev1.PodStatus{
-			Phase:      corev1.PodRunning,
-			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
-		},
-	}
+	readyPod := &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
 	if !IsPodReady(readyPod) {
 		t.Error("expected Running+Ready pod to be ready")
 	}
@@ -96,37 +84,63 @@ func TestStuckThresholdAndIsPodReady(t *testing.T) {
 		t.Error("expected unready pod not to be ready")
 	}
 	now := metav1.Now()
-	terminatingPod := readyPod.DeepCopy()
-	terminatingPod.DeletionTimestamp = &now
-	if IsPodReady(terminatingPod) {
+	termPod := readyPod.DeepCopy()
+	termPod.DeletionTimestamp = &now
+	if IsPodReady(termPod) {
 		t.Error("expected terminating pod not to be ready")
 	}
 }
 
 func TestBlockedPodTracker(t *testing.T) {
 	var nilTracker *BlockedPodTracker
-	if got := nilTracker.RecordOrElapsed("uid-1", time.Now()); got != 0 {
+	wcKey := types.NamespacedName{Namespace: "default", Name: "web"}
+	if got := nilTracker.RecordOrElapsed("uid-1", time.Now(), time.Minute); got != 0 {
 		t.Errorf("nil tracker returned %v, want 0", got)
+	}
+	if !nilTracker.TryBreakGlass(wcKey, "uid-1", time.Now(), time.Minute) {
+		t.Error("nil tracker TryBreakGlass want true")
 	}
 	nilTracker.Clear("uid-1")
 	nilTracker.Prune(time.Now())
 
 	tracker := NewBlockedPodTracker()
 	t0 := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	if got := tracker.RecordOrElapsed(types.UID("pod-1"), t0); got != 0 {
-		t.Errorf("first RecordOrElapsed = %v, want 0", got)
+	gap := 2 * time.Minute
+
+	// Continuous retries advance elapsed since firstBlocked.
+	if got := tracker.RecordOrElapsed("pod-1", t0, gap); got != 0 {
+		t.Fatalf("first RecordOrElapsed = %v, want 0", got)
 	}
-	if got := tracker.RecordOrElapsed(types.UID("pod-1"), t0.Add(90*time.Second)); got != 90*time.Second {
-		t.Errorf("second RecordOrElapsed = %v, want 90s", got)
+	if got := tracker.RecordOrElapsed("pod-1", t0.Add(90*time.Second), gap); got != 90*time.Second {
+		t.Fatalf("second RecordOrElapsed = %v, want 90s", got)
 	}
-	tracker.Clear(types.UID("pod-1"))
-	if got := tracker.RecordOrElapsed(types.UID("pod-1"), t0.Add(150*time.Second)); got != 0 {
-		t.Errorf("RecordOrElapsed after Clear = %v, want 0", got)
+	// A quiet gap larger than resetGap resets the timer (cancelled drain later retried).
+	if got := tracker.RecordOrElapsed("pod-1", t0.Add(5*time.Minute), gap); got != 0 {
+		t.Fatalf("after gap RecordOrElapsed = %v, want 0 (timer reset)", got)
 	}
 
-	tracker.RecordOrElapsed(types.UID("old-pod"), t0)
-	tracker.Prune(t0.Add(time.Minute))
-	if got := tracker.RecordOrElapsed(types.UID("old-pod"), t0.Add(2*time.Minute)); got != 0 {
-		t.Errorf("expected old-pod to be pruned, got elapsed %v", got)
+	// Rate-limiting per WorkloadClass: parallel pods only break glass one at a time per cooldown.
+	tracker.RecordOrElapsed("p-a", t0, gap)
+	tracker.RecordOrElapsed("p-b", t0, gap)
+	if !tracker.TryBreakGlass(wcKey, "p-a", t0.Add(gap), gap) {
+		t.Fatal("first pod break-glass want true")
+	}
+	if tracker.TryBreakGlass(wcKey, "p-b", t0.Add(gap), gap) {
+		t.Fatal("second concurrent pod break-glass within cooldown want false")
+	}
+	if !tracker.TryBreakGlass(wcKey, "p-b", t0.Add(2*gap), gap) {
+		t.Fatal("second pod break-glass after cooldown want true")
+	}
+
+	// Prune drops based on lastSeen (not firstBlocked).
+	tracker.RecordOrElapsed("active-pod", t0, gap)
+	tracker.RecordOrElapsed("active-pod", t0.Add(90*time.Second), gap)
+	tracker.Prune(t0.Add(60 * time.Second))
+	if got := tracker.RecordOrElapsed("active-pod", t0.Add(150*time.Second), gap); got != 150*time.Second {
+		t.Errorf("active-pod pruned prematurely, elapsed = %v, want 150s", got)
+	}
+	tracker.Prune(t0.Add(10 * time.Minute))
+	if got := tracker.RecordOrElapsed("active-pod", t0.Add(10*time.Minute), gap); got != 0 {
+		t.Errorf("expected stale active-pod pruned, got %v", got)
 	}
 }

@@ -48,6 +48,8 @@ const (
 
 // DisruptionPolicy specifies the policy governing pod disruptions.
 // +kubebuilder:validation:XValidation:rule="!(has(self.maxUnavailable) && has(self.minAvailable))",message="maxUnavailable and minAvailable are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxUnavailable) || (type(self.maxUnavailable) == int ? self.maxUnavailable >= 0 : self.maxUnavailable.matches('^(100|[1-9]?[0-9])%$'))",message="maxUnavailable must be a non-negative integer or a percentage string between 0% and 100%"
+// +kubebuilder:validation:XValidation:rule="!has(self.minAvailable) || (type(self.minAvailable) == int ? self.minAvailable >= 0 : self.minAvailable.matches('^(100|[1-9]?[0-9])%$'))",message="minAvailable must be a non-negative integer or a percentage string between 0% and 100%"
 type DisruptionPolicy struct {
 	// AllowedDisruptionWindows defines when disruptions are allowed.
 	// When unset or empty, disruptions are allowed at all times on all days of the week.
@@ -98,11 +100,13 @@ type DisruptionPolicy struct {
 	MinAvailable *intstr.IntOrString `json:"minAvailable,omitempty"`
 
 	// DisruptionStuckThresholdSeconds is the number of seconds an in-window eviction may remain
-	// blocked by the pacing budget before break-glass allows it to proceed. Defaults to 120 when unset (0).
+	// blocked by the pacing budget before break-glass allows it to proceed. Defaults to 120 when unset.
+	// Set to 0 to disable break-glass (strict budget enforcement with no timeout override, e.g., for quorum systems).
 	// Does not apply to automated actors bypassing windows via allowedDisruptionsOutsideOfWindow.
 	// +optional
+	// +kubebuilder:default=120
 	// +kubebuilder:validation:Minimum=0
-	DisruptionStuckThresholdSeconds int32 `json:"disruptionStuckThresholdSeconds,omitempty"`
+	DisruptionStuckThresholdSeconds *int32 `json:"disruptionStuckThresholdSeconds,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
