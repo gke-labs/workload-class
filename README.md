@@ -234,7 +234,17 @@ NAME                                        MIN AVAILABLE   MAX UNAVAILABLE   AL
 workload-test-deployment-5f8c7d9b6c-x2k4p   N/A             0                 0                     2m
 ```
 
-> **NOTE:** The controller only creates PDBs for a `WorkloadClass` that passed validation against at least one `WorkloadClassGuardrail`.
+> **NOTE:** The controller only creates PDBs for a `WorkloadClass` that passed validation against at least one `WorkloadClassGuardrail`. The system namespaces `kube-system`, `cert-manager`, and `workload-class-system` (or the Helm `.Release.Namespace`) are excluded from the `vpoddisruption.gke.io` validating webhook to prevent node-drain deadlocks; `WorkloadClass` objects placed in those namespaces are marked `Validated=False` and do not receive closed Per-Pod PDBs.
+
+### Emergency Override & Last-Resort Recovery
+
+Setting `spec.constraints.disruption.emergencyOverride: true` on any `WorkloadClassGuardrail` places every `WorkloadClass` in the cluster into `MaintenanceReadiness: Ready`, opens managed Per-Pod PDBs to `maxUnavailable: 100%`, and instructs the disruption webhook to admit evictions immediately.
+
+> **WARNING:** Because both `vpoddisruption.gke.io` and `vworkloadclassguardrail-v1.kb.io` run with `failurePolicy: Fail`, toggling `emergencyOverride: true` requires a healthy controller-manager. If the manager is down and blocking drains or `WorkloadClassGuardrail` updates, remove the validating webhook configuration and managed Per-Pod PDBs directly:
+> ```sh
+> kubectl delete validatingwebhookconfiguration workload-class-validating-webhook-configuration
+> kubectl delete pdb -A -l workloads.gke.io/pod-uid
+> ```
 
 ### Ownership and Cleanup
 

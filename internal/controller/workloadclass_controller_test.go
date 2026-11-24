@@ -2380,3 +2380,18 @@ func TestValidateCapacityStrategy(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateSpec_ExcludedSystemNamespaces(t *testing.T) {
+	for _, ns := range []string{"kube-system", "cert-manager", "workload-class-system"} {
+		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: ns}}
+		if got := validateSpec(wc); len(got) == 0 {
+			t.Errorf("validateSpec(namespace=%q) returned no violation, want excluded-namespace violation", ns)
+		}
+	}
+	for _, ns := range []string{"", "default", "sample"} {
+		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: ns}}
+		if got := validateSpec(wc); len(got) != 0 {
+			t.Errorf("validateSpec(namespace=%q) = %v, want no violation", ns, got)
+		}
+	}
+}

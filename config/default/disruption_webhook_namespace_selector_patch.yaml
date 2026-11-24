@@ -4,6 +4,10 @@
 #
 # This is a strategic merge patch: webhooks are merged by name, so the selector is applied to
 # vpoddisruption.gke.io regardless of where controller-gen places it in the list.
+# Note: "workload-class-system" matches the default namespace in config/default/kustomization.yaml;
+# update this list if deploying into a different namespace with Kustomize (the Helm chart uses
+# .Release.Namespace automatically). Do not create WorkloadClass objects inside excluded namespaces,
+# as admission-webhook-based features (leases, minInitialRunDurationDays checks) will not be invoked.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
