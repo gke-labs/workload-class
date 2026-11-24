@@ -1652,6 +1652,20 @@ func TestCalculateReadinessBestMatchAndTerminalPods(t *testing.T) {
 	}
 }
 
+func TestGetPodForPDBRejectsGroupPDB(t *testing.T) {
+	scheme := newTestScheme(t)
+	r := &WorkloadClassReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme}
+	groupPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "wcg-wc-train-1", Namespace: "default",
+			Labels: map[string]string{utils.PodGroupLabel: "train-1"},
+		},
+	}
+	if _, err := r.getPodForPDB(t.Context(), "default", groupPDB); err == nil {
+		t.Fatalf("expected getPodForPDB to reject Group PDB %q", groupPDB.Name)
+	}
+}
+
 func TestNamespaceEnforcedClassPredicate(t *testing.T) {
 	withDefault := func(value string) *corev1.Namespace {
 		n := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default", Labels: map[string]string{"other": "label"}}}

@@ -99,14 +99,16 @@ type DisruptionPolicy struct {
 
 	// DisruptionUnit controls whether disruption budgets are managed per Pod ("Pod", default) or per
 	// gang/group ("Group") for distributed workloads such as JobSet, LeaderWorkerSet, Ray, or Kueue jobs.
+	// Note: in Group mode, atomicity applies to the open/closed protection decision (maxUnavailable 0 vs "100%")
+	// evaluated for each gang as a unit; Kubernetes still admits individual Pod eviction calls once open.
 	// +optional
 	// +kubebuilder:default="Pod"
 	DisruptionUnit DisruptionUnit `json:"disruptionUnit,omitempty"`
 
 	// GroupLabelKey optionally specifies the Pod label key used to identify gang membership when
 	// disruptionUnit is "Group". When omitted, well-known gang labels are detected automatically
-	// (jobset.sigs.k8s.io/jobset-name, leaderworkerset.sigs.k8s.io/name, ray.io/cluster,
-	// kueue.x-k8s.io/workload-name).
+	// (jobset.sigs.k8s.io/jobset-name, leaderworkerset.sigs.k8s.io/group-key or name+group-index,
+	// ray.io/cluster, kueue.x-k8s.io/pod-group-name, kueue.x-k8s.io/workload-name).
 	// +optional
 	// +kubebuilder:validation:MaxLength=253
 	GroupLabelKey string `json:"groupLabelKey,omitempty"`

@@ -471,7 +471,14 @@ func (r *WorkloadClassReconciler) getPod(ctx context.Context, namespace, name st
 // For PDB names that were truncated to MaxPDBNameLength, it falls back to matching Pods in the namespace by
 // utils.PDBName(pod.Name) if the direct lookup by stripped prefix finds no Pod.
 func (r *WorkloadClassReconciler) getPodForPDB(ctx context.Context, namespace string, pdb *policyv1.PodDisruptionBudget) (*corev1.Pod, error) {
-	pod, err := r.getPod(ctx, namespace, utils.PodNameFromPDBName(pdb.Name))
+	if utils.IsGroupPDB(pdb) {
+		return nil, fmt.Errorf("PDB %s/%s is a Group PDB, not a Per-Pod PDB", namespace, pdb.Name)
+	}
+	podName := utils.PodNameFromPDBName(pdb.Name)
+	if podName == "" {
+		return nil, fmt.Errorf("PDB %s/%s does not match the Per-Pod PDB naming prefix", namespace, pdb.Name)
+	}
+	pod, err := r.getPod(ctx, namespace, podName)
 	if err != nil || pod != nil || len(pdb.Name) < utils.MaxPDBNameLength {
 		return pod, err
 	}
