@@ -86,6 +86,15 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if !wc.DeletionTimestamp.IsZero() {
+		if err := r.restoreSafeToEvictOnDelete(ctx, wc); err != nil {
+			log.Error(err, "Failed to restore safe-to-evict annotations on deletion")
+			return ctrl.Result{}, err
+		}
+		r.LeaseTracker.Drain(req.NamespacedName)
+		return ctrl.Result{}, nil
+	}
+
 	// 1.1 Fetch Guardrails and the other WorkloadClasses whose PodSelector overlaps, and validate
 	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
 	if err := r.List(ctx, guardrails); err != nil {
@@ -135,8 +144,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
 	// Leases are drained only now, so earlier failures (e.g., status update conflicts) do not discard them.
 	pendingLeases := r.LeaseTracker.Drain(req.NamespacedName)
-	leaseRequeue, err := r.reconcilePDBs(ctx, wc, validationCond, hasGuardrails, pendingLeases)
-	if err != nil {
+	leaseRequeue, pdbErr := r.reconcilePDBs(ctx, wc, validationCond, hasGuardrails, pendingLeases)
+	if pdbErr != nil && r.Recorder != nil {
 		r.Recorder.Eventf(
 			wc,
 			nil,
@@ -144,14 +153,18 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			"ReconcilePDBFailed",
 			"Reconciling PodDisruptionBudget",
 			"Failed to reconcile PDB: %s",
-			err.Error(),
+			pdbErr.Error(),
 		)
-		return ctrl.Result{}, err
 	}
 
-	// 5. Manage Cluster Autoscaler safe-to-evict annotations on governed Pods when opted in.
-	if err := r.reconcileSafeToEvictAnnotations(ctx, wc, readiness, protectsPods(validationCond.Reason, hasGuardrails)); err != nil {
-		log.Error(err, "Failed to reconcile safe-to-evict annotations")
+	// 5. Manage Cluster Autoscaler safe-to-evict annotations on governed Pods independently of PDB
+	// reconciliation errors so a failing PDB cannot block restoring safe-to-evict="false".
+	steErr := r.reconcileSafeToEvictAnnotations(ctx, wc, readiness, protectsPods(validationCond.Reason, hasGuardrails))
+	if steErr != nil {
+		log.Error(steErr, "Failed to reconcile safe-to-evict annotations")
+	}
+
+	if err := errors.Join(pdbErr, steErr); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1153,8 +1166,9 @@ func (r *WorkloadClassReconciler) workloadClassRequestsInNamespace(ctx context.C
 	return requests
 }
 
-// findWorkloadClassesForPod enqueues the Pod's best-match WorkloadClass, and the WorkloadClass that currently owns
-// the Pod's PDB if it differs (e.g., the Pod was deleted or no longer matches it).
+// findWorkloadClassesForPod enqueues the Pod's best-match WorkloadClass, the WorkloadClass that
+// currently owns the Pod's PDB if it differs, and any WorkloadClass recorded as having suspended the
+// Pod's safe-to-evict annotation so ownership changes trigger immediate restoration.
 func (r *WorkloadClassReconciler) findWorkloadClassesForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -1173,6 +1187,10 @@ func (r *WorkloadClassReconciler) findWorkloadClassesForPod(ctx context.Context,
 		if owner := metav1.GetControllerOf(pdb); owner != nil && owner.Kind == "WorkloadClass" {
 			names[owner.Name] = true
 		}
+	}
+
+	if suspendedBy := pod.Annotations[SafeToEvictSuspendedAnnotation]; suspendedBy != "" {
+		names[suspendedBy] = true
 	}
 
 	requests := make([]reconcile.Request, 0, len(names))
@@ -1200,6 +1218,9 @@ func podPredicate() predicate.Funcs {
 			}
 			if newPod.Labels[utils.PodUIDLabel] != string(newPod.UID) && oldPod.Labels[utils.PodUIDLabel] == string(oldPod.UID) {
 				// The workloads.gke.io/pod-uid label was removed or changed; restore it.
+				return true
+			}
+			if oldPod.Annotations[SafeToEvictAnnotation] != newPod.Annotations[SafeToEvictAnnotation] {
 				return true
 			}
 			return !maps.Equal(labelsWithoutPodUID(oldPod.Labels), labelsWithoutPodUID(newPod.Labels))

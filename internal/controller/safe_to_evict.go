@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -32,43 +33,29 @@ import (
 )
 
 const (
-	// SafeToEvictAnnotation is the Cluster Autoscaler annotation that blocks pod eviction when set to "false".
+	// SafeToEvictAnnotation is the Cluster Autoscaler annotation that blocks pod eviction when "false".
 	SafeToEvictAnnotation = "cluster-autoscaler.kubernetes.io/safe-to-evict"
-
-	// SafeToEvictSuspendedAnnotation records that WorkloadClass temporarily removed safe-to-evict="false"
-	// while a disruption window is open so it can be restored when the window closes.
+	// SafeToEvictSuspendedAnnotation stores the owning WorkloadClass name while safe-to-evict="false" is removed.
 	SafeToEvictSuspendedAnnotation = "workloads.gke.io/safe-to-evict-suspended"
-
+	// SafeToEvictFinalizer ensures suspended annotations are restored before WorkloadClass deletion completes.
+	SafeToEvictFinalizer = "workloads.gke.io/safe-to-evict-cleanup"
 	annotationValueFalse = "false"
-	annotationValueTrue  = "true"
 )
 
-// reconcileSafeToEvictAnnotations toggles the Cluster Autoscaler safe-to-evict="false" annotation on
-// active Pods governed by wc when wc.Spec.DisruptionPolicy.ManageSafeToEvictAnnotation is enabled.
-//
-// During open maintenance windows (Ready/Overdue) for a valid WorkloadClass, safe-to-evict="false" is
-// removed and SafeToEvictSuspendedAnnotation="true" is recorded. Outside windows, when invalid, or when
-// ManageSafeToEvictAnnotation is turned off, any previously suspended Pod has safe-to-evict="false" restored.
-// Pods that never had safe-to-evict="false" (including "true" or unset) are left untouched.
+// reconcileSafeToEvictAnnotations suspends safe-to-evict="false" on governed Pods during open
+// windows (Ready/Overdue) for valid WorkloadClasses, recording SafeToEvictSuspendedAnnotation=<wc.Name>.
+// It restores safe-to-evict="false" on any Pod in wc.Namespace suspended by wc when the window closes,
+// validation fails, the option is disabled, ownership/selector changes, or wc is deleted.
 func (r *WorkloadClassReconciler) reconcileSafeToEvictAnnotations(
-	ctx context.Context,
-	wc *workloadsv1.WorkloadClass,
-	readiness workloadsv1.MaintenanceReadiness,
-	isValid bool,
+	ctx context.Context, wc *workloadsv1.WorkloadClass, readiness workloadsv1.MaintenanceReadiness, isValid bool,
 ) error {
 	if !wc.DeletionTimestamp.IsZero() {
-		return nil
-	}
-
-	selector, err := utils.WorkloadClassPodSelector(ctx, r.Client, wc)
-	if err != nil {
-		return fmt.Errorf("failed to resolve PodSelector for safe-to-evict reconciliation: %w", err)
+		return r.restoreSafeToEvictOnDelete(ctx, wc)
 	}
 	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace)); err != nil {
 		return fmt.Errorf("failed to list Pods for safe-to-evict reconciliation: %w", err)
 	}
-
 	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
 		return err
@@ -77,40 +64,93 @@ func (r *WorkloadClassReconciler) reconcileSafeToEvictAnnotations(
 	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
 		return fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
-
 	shouldSuspend := wc.Spec.DisruptionPolicy.ManageSafeToEvictAnnotation &&
-		isValid &&
-		(readiness == workloadsv1.ReadinessReady || readiness == workloadsv1.ReadinessOverdue)
+		isValid && (readiness == workloadsv1.ReadinessReady || readiness == workloadsv1.ReadinessOverdue)
 
 	var errs []error
+	hasSuspended := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if !utils.IsPodActive(pod) {
 			continue
 		}
-		if best := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs.Items); best == nil || best.Name != wc.Name {
-			continue
-		}
-		if shouldSuspend {
-			if pod.Annotations[SafeToEvictAnnotation] == annotationValueFalse {
-				if err := r.patchSafeToEvict(ctx, client.ObjectKeyFromObject(pod), true); err != nil {
+		best := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs.Items)
+		isOwner := best != nil && best.Name == wc.Name
+		suspendedBySelf := pod.Annotations[SafeToEvictSuspendedAnnotation] == wc.Name
+		if isOwner && shouldSuspend {
+			if suspendedBySelf {
+				hasSuspended = true
+			} else if pod.Annotations[SafeToEvictAnnotation] == annotationValueFalse {
+				if err := r.setSafeToEvictFinalizer(ctx, wc, true); err != nil {
 					errs = append(errs, err)
+				} else if err := r.patchSafeToEvict(ctx, client.ObjectKeyFromObject(pod), wc.Name, true); err != nil {
+					errs = append(errs, err)
+				} else {
+					hasSuspended = true
 				}
 			}
-		} else {
-			if pod.Annotations[SafeToEvictSuspendedAnnotation] == annotationValueTrue {
-				if err := r.patchSafeToEvict(ctx, client.ObjectKeyFromObject(pod), false); err != nil {
-					errs = append(errs, err)
-				}
+			continue
+		}
+		if suspendedBySelf {
+			if err := r.patchSafeToEvict(ctx, client.ObjectKeyFromObject(pod), wc.Name, false); err != nil {
+				errs = append(errs, err)
+				hasSuspended = true
 			}
 		}
 	}
-
+	if len(errs) == 0 && !hasSuspended && controllerutil.ContainsFinalizer(wc, SafeToEvictFinalizer) {
+		if err := r.setSafeToEvictFinalizer(ctx, wc, false); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
 }
 
-func (r *WorkloadClassReconciler) patchSafeToEvict(ctx context.Context, key client.ObjectKey, suspend bool) error {
-	log := logf.FromContext(ctx).WithValues("pod", key.Name, "namespace", key.Namespace)
+func (r *WorkloadClassReconciler) restoreSafeToEvictOnDelete(ctx context.Context, wc *workloadsv1.WorkloadClass) error {
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace)); err != nil {
+		return fmt.Errorf("failed to list Pods for safe-to-evict cleanup on delete: %w", err)
+	}
+	var errs []error
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if utils.IsPodActive(pod) && pod.Annotations[SafeToEvictSuspendedAnnotation] == wc.Name {
+			if err := r.patchSafeToEvict(ctx, client.ObjectKeyFromObject(pod), wc.Name, false); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	return r.setSafeToEvictFinalizer(ctx, wc, false)
+}
+
+func (r *WorkloadClassReconciler) setSafeToEvictFinalizer(ctx context.Context, wc *workloadsv1.WorkloadClass, add bool) error {
+	before := wc.DeepCopy()
+	if add {
+		if !controllerutil.AddFinalizer(wc, SafeToEvictFinalizer) {
+			return nil
+		}
+	} else if !controllerutil.RemoveFinalizer(wc, SafeToEvictFinalizer) {
+		return nil
+	}
+	if err := r.Patch(ctx, wc, client.MergeFrom(before)); err != nil {
+		if !add && apierrors.IsNotFound(err) {
+			return nil
+		}
+		if add {
+			controllerutil.RemoveFinalizer(wc, SafeToEvictFinalizer)
+		} else {
+			controllerutil.AddFinalizer(wc, SafeToEvictFinalizer)
+		}
+		return fmt.Errorf("failed to update safe-to-evict finalizer on WorkloadClass %s: %w", wc.Name, err)
+	}
+	return nil
+}
+
+func (r *WorkloadClassReconciler) patchSafeToEvict(ctx context.Context, key client.ObjectKey, wcName string, suspend bool) error {
+	log := logf.FromContext(ctx).WithValues("pod", key.Name, "namespace", key.Namespace, "workloadClass", wcName)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &corev1.Pod{}
 		if err := r.Get(ctx, key, latest); err != nil {
@@ -119,26 +159,23 @@ func (r *WorkloadClassReconciler) patchSafeToEvict(ctx context.Context, key clie
 			}
 			return fmt.Errorf("failed to get Pod %s: %w", key.Name, err)
 		}
-
 		patch := client.MergeFrom(latest.DeepCopy())
 		if latest.Annotations == nil {
 			latest.Annotations = map[string]string{}
 		}
-
 		if suspend {
 			if latest.Annotations[SafeToEvictAnnotation] != annotationValueFalse {
 				return nil
 			}
 			delete(latest.Annotations, SafeToEvictAnnotation)
-			latest.Annotations[SafeToEvictSuspendedAnnotation] = annotationValueTrue
+			latest.Annotations[SafeToEvictSuspendedAnnotation] = wcName
 			if err := r.Patch(ctx, latest, patch); err != nil {
 				return fmt.Errorf("failed to suspend safe-to-evict on Pod %s: %w", key.Name, err)
 			}
 			log.Info("Suspended safe-to-evict annotation during open disruption window")
 			return nil
 		}
-
-		if latest.Annotations[SafeToEvictSuspendedAnnotation] != annotationValueTrue {
+		if latest.Annotations[SafeToEvictSuspendedAnnotation] != wcName {
 			return nil
 		}
 		latest.Annotations[SafeToEvictAnnotation] = annotationValueFalse
