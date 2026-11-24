@@ -918,4 +918,9 @@ func TestPerPillarValidatedConditionHelpers(t *testing.T) {
 	if got := PlacementValidatedCondition(wcLegacy); got == nil || got.Type != workloadsv1.ConditionTypeValidated {
 		t.Errorf("PlacementValidatedCondition(legacy) = %+v, want fallback to Validated", got)
 	}
+
+	wcDisruptionOnly := &workloadsv1.WorkloadClass{Status: workloadsv1.WorkloadClassStatus{Conditions: []metav1.Condition{rollupFalse, disruptionTrue}}}
+	if got := PlacementValidatedCondition(wcDisruptionOnly); got != nil {
+		t.Errorf("PlacementValidatedCondition(disruption-only) = %+v, want nil (no fallback when DisruptionValidated is present)", got)
+	}
 }

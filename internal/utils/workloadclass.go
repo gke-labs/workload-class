@@ -250,14 +250,21 @@ func DisruptionValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Conditi
 	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
 }
 
-// PlacementValidatedCondition returns the WorkloadClass's PlacementValidated condition, falling back
-// to the overall Validated condition when PlacementValidated has not been populated yet.
+// PlacementValidatedCondition returns the WorkloadClass's PlacementValidated condition.
+// For backwards compatibility with WorkloadClasses reconciled by an older controller that predates
+// per-pillar conditions, it falls back to the overall Validated condition only when DisruptionValidated
+// is also absent. When DisruptionValidated is present and PlacementValidated was intentionally cleared
+// (no capacityStrategy or infrastructureProfileRef), it returns nil so placement checks stay decoupled
+// from disruption guardrail violations.
 func PlacementValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {
 	if wc == nil {
 		return nil
 	}
 	if cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementValidated); cond != nil {
 		return cond
+	}
+	if meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated) != nil {
+		return nil
 	}
 	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
 }

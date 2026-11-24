@@ -110,7 +110,12 @@ func (r *GKESpotPlacementReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Spot reversion: when Pods are running on On-Demand fallback, evict them once Spot capacity is back so
-	// they are recreated on Spot.
+	// they are recreated on Spot. Gate eviction-based reversion on DisruptionValidated so Active reversion
+	// does not evict Pods outside windows while Per-Pod PDBs are open (100%) due to a disruption violation.
+	if !utils.IsValidated(utils.DisruptionValidatedCondition(wc)) {
+		log.V(1).Info("Skipping Spot reversion evictions while DisruptionValidated is not ready")
+		return ctrl.Result{}, nil
+	}
 	requeue, err := r.reconcileSpotReversion(ctx, wc, policy, pods, time.Now().UTC())
 	if err != nil {
 		log.Error(err, "Failed to reconcile Spot reversion")
