@@ -32,28 +32,36 @@ func TestApplyRestConfigRateLimits(t *testing.T) {
 		wantBurst int
 	}{
 		{
-			name:      "default_values_applied",
-			initial:   &rest.Config{},
+			name:      "defaults_preserve_controller_runtime_unlimited_config",
+			initial:   &rest.Config{QPS: -1, Burst: -1},
 			qps:       defaultKubeAPIQPS,
 			burst:     defaultKubeAPIBurst,
-			wantQPS:   50,
-			wantBurst: 100,
+			wantQPS:   -1,
+			wantBurst: -1,
 		},
 		{
-			name:      "custom_values_applied",
-			initial:   &rest.Config{},
+			name:      "positive_values_override_unlimited_config",
+			initial:   &rest.Config{QPS: -1, Burst: -1},
 			qps:       75.5,
 			burst:     150,
 			wantQPS:   75.5,
 			wantBurst: 150,
 		},
 		{
-			name:      "non_positive_values_preserve_existing_config",
+			name:      "zero_preserves_existing_positive_config",
 			initial:   &rest.Config{QPS: 20, Burst: 30},
 			qps:       0,
-			burst:     -1,
+			burst:     0,
 			wantQPS:   20,
 			wantBurst: 30,
+		},
+		{
+			name:      "negative_values_passed_through_to_disable_limiter",
+			initial:   &rest.Config{QPS: 20, Burst: 30},
+			qps:       -1,
+			burst:     -1,
+			wantQPS:   -1,
+			wantBurst: -1,
 		},
 	}
 

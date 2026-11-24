@@ -51,18 +51,24 @@ import (
 )
 
 const (
-	defaultKubeAPIQPS   = 50.0
-	defaultKubeAPIBurst = 100
+	defaultKubeAPIQPS   = 0.0
+	defaultKubeAPIBurst = 0
 )
 
+// applyRestConfigRateLimits overrides cfg.QPS and cfg.Burst when the corresponding
+// flag value is non-zero. A value of 0 leaves controller-runtime's default intact
+// (since controller-runtime v0.21, GetConfigOrDie returns negative values to disable
+// client-side throttling in favor of server-side API Priority and Fairness).
+// Positive values configure a client-side token-bucket limiter, and negative values
+// (e.g. -1) are passed through to explicitly disable client-side limiting.
 func applyRestConfigRateLimits(cfg *rest.Config, qps float64, burst int) {
 	if cfg == nil {
 		return
 	}
-	if qps > 0 {
+	if qps != 0 {
 		cfg.QPS = float32(qps)
 	}
-	if burst > 0 {
+	if burst != 0 {
 		cfg.Burst = burst
 	}
 }
@@ -109,9 +115,13 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", defaultKubeAPIQPS,
-		"QPS to use while talking with kubernetes apiserver.")
+		"QPS limit when talking to the Kubernetes API server. 0 keeps controller-runtime's default "+
+			"(client-side limiting disabled); a positive value enables a client-side limit; "+
+			"a negative value (e.g. -1) is passed through to explicitly disable the limiter.")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", defaultKubeAPIBurst,
-		"Burst to use while talking with kubernetes apiserver.")
+		"Burst limit when talking to the Kubernetes API server. 0 keeps controller-runtime's default "+
+			"(client-side limiting disabled); a positive value sets the client-side burst; "+
+			"a negative value (e.g. -1) is passed through.")
 	opts := zap.Options{
 		Development: true,
 	}
