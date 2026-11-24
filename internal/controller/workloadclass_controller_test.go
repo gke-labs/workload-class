@@ -28,11 +28,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -684,8 +686,14 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(shadowedCond).NotTo(BeNil())
 			Expect(shadowedCond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(shadowedCond.Reason).To(Equal(workloadsv1.ReasonShadowedByUserPDB))
-			Expect(shadowedCond.Message).To(ContainSubstring("'custom-user-pdb'"))
-			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring(workloadsv1.ReasonShadowedByUserPDB)))
+			Eventually(fakeRecorder.Events).Should(Receive(And(
+				ContainSubstring(workloadsv1.ReasonShadowedByUserPDB),
+				ContainSubstring("'custom-user-pdb'"),
+			)))
+
+			By("Reconciling a second time while still shadowed should not emit a duplicate event")
+			reconcileWC(typeNamespacedName)
+			Consistently(fakeRecorder.Events, "200ms", "50ms").ShouldNot(Receive(ContainSubstring(workloadsv1.ReasonShadowedByUserPDB)))
 
 			Expect(k8sClient.Delete(ctx, userPDB)).To(Succeed())
 			reconcileWC(typeNamespacedName)
@@ -2411,26 +2419,134 @@ func TestValidateCapacityStrategy(t *testing.T) {
 }
 
 func TestObservabilityConditions(t *testing.T) {
-	cZero := matchedPodsCondition(2, 0)
+	cZero := matchedPodsCondition(2, podGovernanceSummary{})
 	if cZero.Status != metav1.ConditionFalse || cZero.Reason != workloadsv1.ReasonZeroMatchedPods {
 		t.Errorf("matchedPodsCondition(0) = (%v, %v), want (False, ZeroMatchedPods)", cZero.Status, cZero.Reason)
 	}
-
-	cMatched := matchedPodsCondition(2, 3)
-	if cMatched.Status != metav1.ConditionTrue || cMatched.Reason != workloadsv1.ReasonPodsMatched || !strings.Contains(cMatched.Message, "3 active Pod(s)") {
-		t.Errorf("matchedPodsCondition(3) = (%v, %v, %q), want (True, PodsMatched, contains 3)", cMatched.Status, cMatched.Reason, cMatched.Message)
+	cOne := matchedPodsCondition(2, podGovernanceSummary{matchedCount: 1})
+	cFive := matchedPodsCondition(2, podGovernanceSummary{matchedCount: 5})
+	if cOne.Status != metav1.ConditionTrue || cOne.Reason != workloadsv1.ReasonPodsMatched || cOne.Message != cFive.Message {
+		t.Errorf("matchedPodsCondition not count-free: 1=%q 5=%q", cOne.Message, cFive.Message)
+	}
+	conds := []metav1.Condition{cOne}
+	if meta.SetStatusCondition(&conds, cFive) {
+		t.Errorf("expected no condition change when matched pod count changed from 1 to 5")
 	}
 
-	cNone := shadowedByUserPDBCondition(2, 0, nil)
-	if cNone.Status != metav1.ConditionFalse || cNone.Reason != workloadsv1.ReasonNotShadowed {
-		t.Errorf("shadowedByUserPDBCondition(0) = (%v, %v), want (False, NotShadowed)", cNone.Status, cNone.Reason)
+	sNone := shadowedByUserPDBCondition(2, podGovernanceSummary{})
+	if sNone.Status != metav1.ConditionFalse || sNone.Reason != workloadsv1.ReasonNotShadowed {
+		t.Errorf("shadowedByUserPDBCondition(0) = (%v, %v), want (False, NotShadowed)", sNone.Status, sNone.Reason)
+	}
+	sOne := shadowedByUserPDBCondition(2, podGovernanceSummary{shadowedCount: 1, shadowingPDBs: []string{"pdb-1"}})
+	sMany := shadowedByUserPDBCondition(2, podGovernanceSummary{shadowedCount: 4, shadowingPDBs: []string{"pdb-1", "pdb-2"}})
+	if sOne.Status != metav1.ConditionTrue || sOne.Reason != workloadsv1.ReasonShadowedByUserPDB || sOne.Message != sMany.Message {
+		t.Errorf("shadowedByUserPDBCondition not count/list-free: 1=%q many=%q", sOne.Message, sMany.Message)
+	}
+	if msg := shadowedByUserPDBEventMessage(4, []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7"}); !strings.Contains(msg, "and 2 more") {
+		t.Errorf("shadowedByUserPDBEventMessage() = %q, want 'and 2 more'", msg)
 	}
 
-	cMany := shadowedByUserPDBCondition(2, 4, []string{"pdb-1", "pdb-2", "pdb-3", "pdb-4", "pdb-5", "pdb-6", "pdb-7"})
-	if cMany.Status != metav1.ConditionTrue || cMany.Reason != workloadsv1.ReasonShadowedByUserPDB {
-		t.Errorf("shadowedByUserPDBCondition(many) = (%v, %v), want (True, ShadowedByUserPDB)", cMany.Status, cMany.Reason)
+	cBad := matchedPodsCondition(2, podGovernanceSummary{invalidSelector: true})
+	sBad := shadowedByUserPDBCondition(2, podGovernanceSummary{invalidSelector: true})
+	if cBad.Status != metav1.ConditionUnknown || cBad.Reason != workloadsv1.ReasonInvalidPodSelector ||
+		sBad.Status != metav1.ConditionUnknown || sBad.Reason != workloadsv1.ReasonInvalidPodSelector {
+		t.Errorf("invalid selector conditions = (%v/%v, %v/%v), want Unknown/InvalidPodSelector", cBad.Status, cBad.Reason, sBad.Status, sBad.Reason)
 	}
-	if !strings.Contains(cMany.Message, "and 2 more") {
-		t.Errorf("shadowedByUserPDBCondition(many) message = %q, want truncation 'and 2 more'", cMany.Message)
+}
+
+func TestObservabilityConflictRetryAndEnforcedAndInvalidSelector(t *testing.T) {
+	scheme := newTestScheme(t)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	pod := newTestPod("web-0", map[string]string{"app": "web"})
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "web-wc", Namespace: "default", Generation: 1},
+		Spec:       workloadsv1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+	}
+	userPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-pdb", Namespace: "default"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+	}
+
+	var failOnce = true
+	rec := events.NewFakeRecorder(10)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).
+		WithObjects(ns, pod, wc, userPDB).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if failOnce && sub == "status" {
+					failOnce = false
+					return errors.NewConflict(schema.GroupResource{Group: "workloads.gke.io", Resource: "workloadclasses"}, obj.GetName(), nil)
+				}
+				return cl.SubResource(sub).Update(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &WorkloadClassReconciler{Client: c, Scheme: scheme, Recorder: rec}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "web-wc", Namespace: "default"}}
+
+	if _, err := r.Reconcile(t.Context(), req); !errors.IsConflict(err) {
+		t.Fatalf("first Reconcile err = %v, want conflict", err)
+	}
+	if len(rec.Events) != 0 {
+		t.Fatalf("expected 0 events after conflicted status update, got %d", len(rec.Events))
+	}
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("retry Reconcile err = %v", err)
+	}
+	if len(rec.Events) != 1 || !strings.Contains(<-rec.Events, "'user-pdb'") {
+		t.Fatalf("expected 1 ShadowedByUserPDB warning event after retry")
+	}
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("repeat Reconcile err = %v", err)
+	}
+	if len(rec.Events) != 0 {
+		t.Fatalf("expected 0 duplicate events on repeat reconcile, got %d", len(rec.Events))
+	}
+
+	// Non-enforced WorkloadClass reports MatchedPods=False when namespace pins another class.
+	enforcedNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "enforced", Labels: map[string]string{workloadsv1.EnforcedClassLabel: "primary"},
+	}}
+	primary := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "primary", Namespace: "enforced"}}
+	other := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "enforced"},
+		Spec:       workloadsv1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+	}
+	epod := newTestPod("web-1", map[string]string{"app": "web"})
+	epod.Namespace = "enforced"
+	ec := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).
+		WithObjects(enforcedNS, primary, other, epod).Build()
+	er := &WorkloadClassReconciler{Client: ec, Scheme: scheme}
+	for _, name := range []string{"primary", "other"} {
+		if _, err := er.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "enforced"}}); err != nil {
+			t.Fatalf("Reconcile(%s) err = %v", name, err)
+		}
+	}
+	gotPrimary, gotOther := &workloadsv1.WorkloadClass{}, &workloadsv1.WorkloadClass{}
+	_ = ec.Get(t.Context(), types.NamespacedName{Name: "primary", Namespace: "enforced"}, gotPrimary)
+	_ = ec.Get(t.Context(), types.NamespacedName{Name: "other", Namespace: "enforced"}, gotOther)
+	if !meta.IsStatusConditionTrue(gotPrimary.Status.Conditions, workloadsv1.ConditionTypeMatchedPods) {
+		t.Errorf("enforced class MatchedPods want True, got %v", meta.FindStatusCondition(gotPrimary.Status.Conditions, workloadsv1.ConditionTypeMatchedPods))
+	}
+	if !meta.IsStatusConditionFalse(gotOther.Status.Conditions, workloadsv1.ConditionTypeMatchedPods) {
+		t.Errorf("non-enforced class MatchedPods want False, got %v", meta.FindStatusCondition(gotOther.Status.Conditions, workloadsv1.ConditionTypeMatchedPods))
+	}
+
+	// Unparsable PodSelector sets Validated=False (ValidationFailed) with and without guardrails.
+	badWC := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "default"},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: "BadOp"}},
+			},
+		},
+	}
+	for _, guardrails := range []*workloadsv1.WorkloadClassGuardrailList{{}, {Items: []workloadsv1.WorkloadClassGuardrail{{}}}} {
+		cond := validatedCondition(t.Context(), badWC, guardrails, nil)
+		if cond.Reason != workloadsv1.ReasonValidationFailed || protectsPods(cond.Reason, len(guardrails.Items) > 0) {
+			t.Errorf("validatedCondition(invalid selector, guardrails=%d) = %v, want non-protecting ValidationFailed", len(guardrails.Items), cond)
+		}
+	}
+	if sum, err := r.classifyClassPods(t.Context(), badWC, nil, []workloadsv1.WorkloadClass{*badWC}, nil); err != nil || !sum.invalidSelector {
+		t.Errorf("classifyClassPods(invalid selector) = (%+v, %v), want invalidSelector=true", sum, err)
 	}
 }

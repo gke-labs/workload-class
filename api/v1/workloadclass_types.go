@@ -268,6 +268,8 @@ const (
 	ReasonPodsMatched = "PodsMatched"
 	// ReasonZeroMatchedPods indicates that no active Pods currently match this WorkloadClass.
 	ReasonZeroMatchedPods = "ZeroMatchedPods"
+	// ReasonInvalidPodSelector indicates that Pod matching could not be evaluated because podSelector is invalid.
+	ReasonInvalidPodSelector = "InvalidPodSelector"
 
 	// ConditionTypeShadowedByUserPDB indicates whether one or more Pods matched by this WorkloadClass
 	// are covered by user-created PodDisruptionBudgets, causing the WorkloadClass to yield PDB management.
