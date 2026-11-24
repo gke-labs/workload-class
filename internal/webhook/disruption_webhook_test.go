@@ -543,6 +543,60 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 	}
 }
 
+func TestHandle_AuthorizedSubjectGroupLease(t *testing.T) {
+	isController := true
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "train-wc", Namespace: "default"},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "training"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				DisruptionUnit:                    workloadsv1.DisruptionUnitGroup,
+				AllowedDisruptionsOutsideOfWindow: []workloadsv1.Subject{{Kind: rbacv1.UserKind, Name: "system:cluster-autoscaler"}},
+			},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "worker-0", Namespace: "default", UID: "pod-uid-0",
+			Labels: map[string]string{"role": "training", "jobset.sigs.k8s.io/jobset-name": "job-1"},
+		},
+	}
+	gid, _ := utils.PodGroupID(pod, wc.Name, "")
+	closed := intstr.FromInt32(0)
+	groupPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: utils.GroupPDBName(wc.Name, gid), Namespace: "default",
+			Labels:          map[string]string{utils.PodGroupLabel: gid},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "workloads.gke.io/v1", Kind: "WorkloadClass", Name: wc.Name, Controller: &isController}},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &closed},
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	tracker := utils.NewPendingLeaseTracker(10)
+	c := createClient(nil, nil, nil, nil, ns, wc, &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}}, pod)
+	c.getPDBResult = groupPDB
+	v := &DisruptionWebhook{Client: c, LeaseTracker: tracker}
+	req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: "worker-0", Namespace: "default", SubResource: "eviction",
+		UserInfo: authv1.UserInfo{Username: "system:cluster-autoscaler"},
+	}}
+	if resp := v.Handle(t.Context(), req); !resp.Allowed {
+		t.Fatalf("closed Group PDB should allow and enqueue lease, got %+v", resp.Result)
+	}
+	if queued := tracker.Drain(types.NamespacedName{Namespace: "default", Name: wc.Name}); len(queued) != 1 || queued[0].PodName != "worker-0" {
+		t.Fatalf("expected 1 queued group lease, got %+v", queued)
+	}
+
+	// Ongoing lease owned by another subject denies the eviction.
+	groupPDB.Annotations = map[string]string{
+		utils.BypassOwner:      "user:other-actor",
+		utils.BypassExpiration: time.Now().UTC().Add(time.Minute).Format(utils.ExpirationFormat),
+	}
+	if resp := v.Handle(t.Context(), req); resp.Allowed {
+		t.Fatalf("expected denial when Group PDB is leased by another actor")
+	}
+}
+
 func TestMatchesUserKind(t *testing.T) {
 	testCases := []struct {
 		name     string

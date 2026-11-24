@@ -221,33 +221,23 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 	var errs []error
 	var requeue time.Duration
 	governedPDBs := make(map[string]bool, len(governed))
-
-	podsForPerPodPDB := governed
-	if utils.IsGroupDisruptionUnit(wc) {
-		var ungrouped []*corev1.Pod
-		groups := make(map[string][]*corev1.Pod)
-		for _, pod := range governed {
-			if groupID, ok := utils.PodGroupID(pod, wc.Spec.DisruptionPolicy.GroupLabelKey); ok {
-				groups[groupID] = append(groups[groupID], pod)
-			} else {
-				ungrouped = append(ungrouped, pod)
-			}
-		}
-		groupIDs := slices.Sorted(maps.Keys(groups))
-		now := time.Now().UTC()
-		for _, groupID := range groupIDs {
-			gangPods := groups[groupID]
-			pdbName := utils.GroupPDBName(wc.Name, groupID)
-			governedPDBs[pdbName] = true
-			if err := r.reconcileGroupPDB(ctx, wc, groupID, gangPods, now); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		podsForPerPodPDB = ungrouped
+	ownedByName := make(map[string]*policyv1.PodDisruptionBudget, len(owned))
+	for i := range owned {
+		ownedByName[owned[i].Name] = &owned[i]
 	}
+	deleted := map[string]bool{}
+
+	podsForPerPodPDB, groups := partitionPodsByGroup(wc, governed, governedPDBs)
+
+	groupRequeue, groupErr := r.reconcileGroupModePDBs(ctx, wc, owned, ownedByName, groups, governedPDBs, deleted, leases)
+	errs = append(errs, groupErr)
+	requeue = minPositiveDuration(requeue, groupRequeue)
 
 	for _, pod := range podsForPerPodPDB {
-		governedPDBs[utils.PDBName(pod.Name)] = true
+		if err := r.clearPodGroupLabel(ctx, pod); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		remaining, err := r.reconcilePodPDB(ctx, wc, pod, leases)
 		if err != nil {
 			if lease, ok := leases[pod.Name]; ok && lease.PodUID == pod.UID {
@@ -260,11 +250,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 
 	for i := range owned {
 		pdb := &owned[i]
-		if governedPDBs[pdb.Name] {
-			continue
-		}
-		if pdb.Labels[utils.PodGroupLabel] != "" {
-			errs = append(errs, r.deletePDB(ctx, wc, pdb))
+		if governedPDBs[pdb.Name] || deleted[pdb.Name] || utils.IsGroupPDB(pdb) {
 			continue
 		}
 
@@ -385,8 +371,8 @@ func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloa
 	var errs []error
 	for i := range owned {
 		pdb := &owned[i]
-		if groupID := pdb.Labels[utils.PodGroupLabel]; groupID != "" {
-			errs = append(errs, r.syncGroupPDB(ctx, wc, groupID, false, true))
+		if utils.IsGroupPDB(pdb) {
+			errs = append(errs, r.openOrDeleteGroupPDB(ctx, wc, pdb, userPDBs))
 			continue
 		}
 		pod, err := r.getPodForPDB(ctx, wc.Namespace, pdb)
@@ -403,41 +389,243 @@ func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloa
 	return errors.Join(errs...)
 }
 
-// reconcileGroupPDB labels every Pod in a gang with workloads.gke.io/pod-group and reconciles
-// a single Group PDB protecting the gang atomically.
-func (r *WorkloadClassReconciler) reconcileGroupPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, groupID string, gangPods []*corev1.Pod, now time.Time) error {
+func partitionPodsByGroup(wc *workloadsv1.WorkloadClass, governed []*corev1.Pod, governedPDBs map[string]bool) ([]*corev1.Pod, map[string][]*corev1.Pod) {
+	groups := make(map[string][]*corev1.Pod)
+	podsForPerPod := governed
+	if utils.IsGroupDisruptionUnit(wc) {
+		var ungrouped []*corev1.Pod
+		for _, pod := range governed {
+			if groupID, ok := utils.PodGroupID(pod, wc.Name, wc.Spec.DisruptionPolicy.GroupLabelKey); ok {
+				groups[groupID] = append(groups[groupID], pod)
+				governedPDBs[utils.GroupPDBName(wc.Name, groupID)] = true
+			} else {
+				ungrouped = append(ungrouped, pod)
+			}
+		}
+		podsForPerPod = ungrouped
+	}
+	for _, pod := range podsForPerPod {
+		governedPDBs[utils.PDBName(pod.Name)] = true
+	}
+	return podsForPerPod, groups
+}
+
+func (r *WorkloadClassReconciler) reconcileGroupModePDBs(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	owned []policyv1.PodDisruptionBudget,
+	ownedByName map[string]*policyv1.PodDisruptionBudget,
+	groups map[string][]*corev1.Pod,
+	governedPDBs map[string]bool,
+	deleted map[string]bool,
+	leases map[string]utils.PendingLease,
+) (time.Duration, error) {
 	var errs []error
-	for _, pod := range gangPods {
-		if err := r.ensurePodGroupLabel(ctx, pod, groupID); err != nil {
-			errs = append(errs, err)
+	// Delete stale Group PDBs BEFORE creating Per-Pod PDBs (Group -> Pod transition).
+	for i := range owned {
+		pdb := &owned[i]
+		if utils.IsGroupPDB(pdb) && !governedPDBs[pdb.Name] {
+			if err := r.deleteGroupPDBAndUnlabel(ctx, wc, pdb); err != nil {
+				errs = append(errs, err)
+			} else {
+				deleted[pdb.Name] = true
+			}
 		}
 	}
-	gangReady := gangReadyForDisruption(wc, gangPods, now)
-	if err := r.syncGroupPDB(ctx, wc, groupID, true, gangReady); err != nil {
-		errs = append(errs, err)
+	if len(groups) == 0 {
+		return 0, errors.Join(errs...)
+	}
+	var requeue time.Duration
+	now := time.Now().UTC()
+	for _, groupID := range slices.Sorted(maps.Keys(groups)) {
+		gangPods := groups[groupID]
+		// Delete owned Per-Pod PDBs BEFORE creating/labeling the Group PDB (Pod -> Group transition).
+		readyPods, transitionErr := r.deletePerPodPDBsForGang(ctx, wc, gangPods, ownedByName, deleted)
+		errs = append(errs, transitionErr)
+		if len(readyPods) == 0 {
+			continue
+		}
+		rem, err := r.reconcileGroupPDB(ctx, wc, groupID, readyPods, ownedByName[utils.GroupPDBName(wc.Name, groupID)], leases, now)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		requeue = minPositiveDuration(requeue, rem)
+	}
+	return requeue, errors.Join(errs...)
+}
+
+// openOrDeleteGroupPDB opens an owned Group PDB for an invalid WorkloadClass if any active,
+// non-user-PDB-shadowed Pod still carries its group label; otherwise deletes the orphaned Group PDB.
+func (r *WorkloadClassReconciler) openOrDeleteGroupPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget, userPDBs []policyv1.PodDisruptionBudget) error {
+	groupID := pdb.Labels[utils.PodGroupLabel]
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabels{utils.PodGroupLabel: groupID}); err != nil {
+		return fmt.Errorf("failed to list Pods for Group PDB %s: %w", pdb.Name, err)
+	}
+	var errs []error
+	hasActiveUncovered := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !utils.IsPodActive(pod) {
+			continue
+		}
+		if utils.IsPodCoveredByUserPDB(pod, userPDBs) {
+			errs = append(errs, r.clearPodGroupLabel(ctx, pod))
+			continue
+		}
+		hasActiveUncovered = true
+	}
+	if !hasActiveUncovered {
+		errs = append(errs, r.deletePDB(ctx, wc, pdb))
+		return errors.Join(errs...)
+	}
+	errs = append(errs, r.syncGroupPDB(ctx, wc, groupID, false, true))
+	return errors.Join(errs...)
+}
+
+func (r *WorkloadClassReconciler) deleteGroupPDBAndUnlabel(ctx context.Context, wc *workloadsv1.WorkloadClass, pdb *policyv1.PodDisruptionBudget) error {
+	groupID := pdb.Labels[utils.PodGroupLabel]
+	if err := r.deletePDB(ctx, wc, pdb); err != nil {
+		return err
+	}
+	if groupID == "" {
+		return nil
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabels{utils.PodGroupLabel: groupID}); err != nil {
+		return fmt.Errorf("failed to list Pods for stale group %s: %w", groupID, err)
+	}
+	var errs []error
+	for i := range pods.Items {
+		errs = append(errs, r.clearPodGroupLabel(ctx, &pods.Items[i]))
 	}
 	return errors.Join(errs...)
 }
 
-// gangReadyForDisruption reports whether an entire gang is ready for disruption.
-// A gang is ready when the WorkloadClass is Ready/Overdue (or EmergencyOverride is active)
-// and every active worker Pod in the gang satisfies MinInitialRunDurationDays.
-func gangReadyForDisruption(wc *workloadsv1.WorkloadClass, gangPods []*corev1.Pod, now time.Time) bool {
-	if wc.Spec.DisruptionPolicy.EmergencyOverride || wc.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
-		return true
+func (r *WorkloadClassReconciler) deletePerPodPDBsForGang(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	gangPods []*corev1.Pod,
+	ownedByName map[string]*policyv1.PodDisruptionBudget,
+	deleted map[string]bool,
+) ([]*corev1.Pod, error) {
+	var errs []error
+	ready := make([]*corev1.Pod, 0, len(gangPods))
+	for _, pod := range gangPods {
+		perPodName := utils.PDBName(pod.Name)
+		if existing, ok := ownedByName[perPodName]; ok && !deleted[perPodName] {
+			if err := r.deletePDB(ctx, wc, existing); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			deleted[perPodName] = true
+		}
+		ready = append(ready, pod)
 	}
-	if wc.Status.MaintenanceReadiness != workloadsv1.ReadinessReady {
-		return false
+	return ready, errors.Join(errs...)
+}
+
+// reconcileGroupPDB labels every Pod in a gang with workloads.gke.io/pod-group, removes stale labels
+// from Pods that left the gang (e.g., shadowed by a user PDB or moved to another WorkloadClass),
+// applies any pending or active bypass lease, and reconciles the single Group PDB. Note: Group mode
+// flips PDBs between 0 and "100%" atomically per gang (the open/closed protection decision).
+func (r *WorkloadClassReconciler) reconcileGroupPDB(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	groupID string,
+	gangPods []*corev1.Pod,
+	existing *policyv1.PodDisruptionBudget,
+	leases map[string]utils.PendingLease,
+	now time.Time,
+) (time.Duration, error) {
+	var errs []error
+	memberUIDs := make(map[string]bool, len(gangPods))
+	for _, pod := range gangPods {
+		memberUIDs[string(pod.UID)] = true
+		if err := r.ensurePodGroupLabel(ctx, pod, groupID); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
-		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
-		for _, pod := range gangPods {
-			if utils.IsPodActive(pod) && now.Sub(pod.CreationTimestamp.Time) < minRunDuration {
-				return false
+
+	// Clear stale PodGroupLabel from any Pod still labeled with groupID that is no longer governed here.
+	labeled := &corev1.PodList{}
+	if err := r.List(ctx, labeled, client.InNamespace(wc.Namespace), client.MatchingLabels{utils.PodGroupLabel: groupID}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to list Pods for group %s: %w", groupID, err))
+	} else {
+		for i := range labeled.Items {
+			p := &labeled.Items[i]
+			if !memberUIDs[string(p.UID)] {
+				errs = append(errs, r.clearPodGroupLabel(ctx, p))
 			}
 		}
 	}
-	return true
+
+	// Respect an active bypass lease on the Group PDB until it expires.
+	if existing != nil && existing.Labels[utils.PodGroupLabel] == groupID && existing.Annotations[utils.BypassOwner] != "" {
+		if rem := utils.LeaseTimeRemaining(existing); rem > 0 {
+			return rem, errors.Join(errs...)
+		}
+	}
+
+	// Apply any pending lease requested by the disruption webhook for a Pod in this gang.
+	for _, pod := range gangPods {
+		if lease, ok := leases[pod.Name]; ok && lease.PodUID == pod.UID {
+			leaseDur := utils.LeaseDurationForPod(pod)
+			if err := r.leaseGroupPDB(ctx, wc, groupID, lease.Subject, leaseDur); err != nil {
+				r.reenqueueLeases(wc, lease)
+				errs = append(errs, err)
+				return 0, errors.Join(errs...)
+			}
+			return leaseDur, errors.Join(errs...)
+		}
+	}
+
+	gangReady, gangRequeue := gangReadyForDisruption(wc, gangPods, now)
+	if err := r.syncGroupPDB(ctx, wc, groupID, true, gangReady); err != nil {
+		errs = append(errs, err)
+	}
+	return gangRequeue, errors.Join(errs...)
+}
+
+// gangReadyForDisruption evaluates whether an entire gang meets the WorkloadClass's
+// MinInitialRunDurationDays requirement and returns how long until the youngest active
+// Pod in the gang becomes eligible (0 if already ready or not gated by pod age).
+func gangReadyForDisruption(wc *workloadsv1.WorkloadClass, gangPods []*corev1.Pod, now time.Time) (bool, time.Duration) {
+	if wc.Spec.DisruptionPolicy.EmergencyOverride || wc.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
+		return true, 0
+	}
+	if wc.Status.MaintenanceReadiness != workloadsv1.ReadinessReady {
+		return false, 0
+	}
+	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
+		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
+		var maxRemaining time.Duration
+		for _, pod := range gangPods {
+			if !utils.IsPodActive(pod) {
+				continue
+			}
+			if rem := minRunDuration - now.Sub(pod.CreationTimestamp.Time); rem > 0 {
+				maxRemaining = max(maxRemaining, rem)
+			}
+		}
+		if maxRemaining > 0 {
+			return false, maxRemaining
+		}
+	}
+	return true, 0
+}
+
+// clearPodGroupLabel removes workloads.gke.io/pod-group from pod when it is no longer governed in Group mode.
+func (r *WorkloadClassReconciler) clearPodGroupLabel(ctx context.Context, pod *corev1.Pod) error {
+	if pod == nil || pod.Labels[utils.PodGroupLabel] == "" {
+		return nil
+	}
+	patch := client.MergeFrom(pod.DeepCopy())
+	delete(pod.Labels, utils.PodGroupLabel)
+	if err := r.Patch(ctx, pod, patch); err != nil {
+		return fmt.Errorf("failed to remove gang group label from Pod %s: %w", pod.Name, err)
+	}
+	return nil
 }
 
 // ensurePodGroupLabel labels the Pod with workloads.gke.io/pod-group so its Group PDB can select it.
@@ -452,6 +640,20 @@ func (r *WorkloadClassReconciler) ensurePodGroupLabel(ctx context.Context, pod *
 	pod.Labels[utils.PodGroupLabel] = groupID
 	if err := r.Patch(ctx, pod, patch); err != nil {
 		return fmt.Errorf("failed to label Pod %s with gang group: %w", pod.Name, err)
+	}
+	return nil
+}
+
+// leaseGroupPDB opens the gang's Group PDB with a temporary bypass lease for subject.
+func (r *WorkloadClassReconciler) leaseGroupPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, groupID string, subject workloadsv1.Subject, leaseDuration time.Duration) error {
+	pdb := utils.GroupPDBBase(wc, groupID)
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		if err := r.claimPDB(wc, pdb); err != nil {
+			return err
+		}
+		return utils.GroupPDBWithLease(wc, groupID, pdb, subject, leaseDuration)
+	}); err != nil {
+		return fmt.Errorf("failed to lease Group PDB %s: %w", pdb.Name, err)
 	}
 	return nil
 }
@@ -664,8 +866,9 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 		matchedPods = append(matchedPods, pod)
 	}
 
-	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDurationSeconds)
-	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
+	// 4. Check Pod Ages (Min Initial Run). In Group mode, pod-age gating is evaluated per gang inside
+	// reconcileGroupPDB so a young worker in one gang does not block disruption of older independent gangs.
+	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 && !utils.IsGroupDisruptionUnit(wc) {
 		minRunDuration := time.Duration(wc.Spec.DisruptionPolicy.MinInitialRunDurationDays) * 24 * time.Hour
 		for _, pod := range matchedPods {
 			if !utils.IsPodActive(&pod) {

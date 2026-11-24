@@ -27,12 +27,14 @@ import (
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -2361,123 +2363,237 @@ func TestValidateCapacityStrategy(t *testing.T) {
 	}
 }
 
+func assertNoPodMatchedByMultiplePDBs(t *testing.T, cl client.Reader) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := cl.List(t.Context(), pods, client.InNamespace("default")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	pdbs := &policyv1.PodDisruptionBudgetList{}
+	if err := cl.List(t.Context(), pdbs, client.InNamespace("default")); err != nil {
+		t.Fatalf("list pdbs: %v", err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !utils.IsPodActive(pod) {
+			continue
+		}
+		var matches []string
+		for j := range pdbs.Items {
+			pdb := &pdbs.Items[j]
+			if pdb.Spec.Selector == nil {
+				continue
+			}
+			sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+			if err == nil && sel.Matches(labels.Set(pod.Labels)) {
+				matches = append(matches, pdb.Name)
+			}
+		}
+		if len(matches) > 1 {
+			t.Fatalf("Pod %s matched by multiple PDBs: %v", pod.Name, matches)
+		}
+	}
+}
+
+func makeTestGangPod(name, jobset string, created metav1.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "default", UID: types.UID("uid-" + name), CreationTimestamp: created,
+			Labels: map[string]string{"role": "training", "jobset.sigs.k8s.io/jobset-name": jobset},
+		},
+	}
+}
+
 func TestReconcileGroupPDBs(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := time.Now().UTC()
 	oldTime := metav1.Time{Time: now.Add(-72 * time.Hour)}
 	youngTime := metav1.Time{Time: now.Add(-2 * time.Hour)}
-
-	wc := &workloadsv1.WorkloadClass{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "train-wc",
-			Namespace: "default",
-			UID:       types.UID("wc-uid-1"),
+	guardrail := &workloadsv1.WorkloadClassGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: "g-1"},
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 30}},
 		},
+	}
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "train-wc", Namespace: "default", UID: "wc-uid-1", CreationTimestamp: oldTime},
 		Spec: workloadsv1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "training"}},
 			DisruptionPolicy: workloadsv1.DisruptionPolicy{
-				DisruptionUnit:            workloadsv1.DisruptionUnitGroup,
-				MinInitialRunDurationDays: 1,
+				DisruptionUnit:               workloadsv1.DisruptionUnitGroup,
+				MinInitialRunDurationDays:    1,
+				MaxNonDisruptionDurationDays: 14,
 			},
 		},
-		Status: workloadsv1.WorkloadClassStatus{
-			MaintenanceReadiness: workloadsv1.ReadinessReady,
-		},
+	}
+	p1a := makeTestGangPod("gang1-w0", "job-1", oldTime)
+	p1b := makeTestGangPod("gang1-w1", "job-1", youngTime)
+	p2a := makeTestGangPod("gang2-w0", "job-2", oldTime)
+	p2b := makeTestGangPod("gang2-w1", "job-2", oldTime)
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).
+		WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}, guardrail, wc, p1a, p1b, p2a, p2b).Build()
+	tracker := utils.NewPendingLeaseTracker(10)
+	r := &WorkloadClassReconciler{Client: c, Scheme: scheme, LeaseTracker: tracker, Recorder: events.NewFakeRecorder(10)}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "train-wc", Namespace: "default"}}
+
+	// Full Reconcile() evaluates minInitialRunDurationDays per gang and requeues for gang1.
+	res, err := r.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if res.RequeueAfter <= 20*time.Hour || res.RequeueAfter > 24*time.Hour {
+		t.Errorf("RequeueAfter = %v, want ~22h remaining for gang1-w1", res.RequeueAfter)
+	}
+	g1, _ := utils.PodGroupID(p1a, wc.Name, "")
+	g2, _ := utils.PodGroupID(p2a, wc.Name, "")
+	pdb1, pdb2 := &policyv1.PodDisruptionBudget{}, &policyv1.PodDisruptionBudget{}
+	_ = c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1)
+	_ = c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g2), Namespace: "default"}, pdb2)
+	if utils.IsPDBOpen(pdb1) || *pdb1.Spec.UnhealthyPodEvictionPolicy != policyv1.IfHealthyBudget {
+		t.Errorf("gang1 PDB should be closed + IfHealthyBudget")
+	}
+	if !utils.IsPDBOpen(pdb2) || *pdb2.Spec.UnhealthyPodEvictionPolicy != policyv1.AlwaysAllow {
+		t.Errorf("gang2 PDB should be open + AlwaysAllow")
+	}
+	assertNoPodMatchedByMultiplePDBs(t, c)
+
+	// Pending lease on gang1-w1 opens gang1's Group PDB with bypass-owner annotation.
+	tracker.Enqueue(wc, p1b, workloadsv1.Subject{Kind: "User", Name: "system:cluster-autoscaler"})
+	resLease, err := r.Reconcile(t.Context(), req)
+	if err != nil || resLease.RequeueAfter <= 0 || resLease.RequeueAfter > utils.DefaultLeaseDuration {
+		t.Fatalf("leased Reconcile() = (%v, %v)", resLease, err)
+	}
+	_ = c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1)
+	if !utils.IsPDBOpen(pdb1) || pdb1.Annotations[utils.BypassOwner] != "user:system:cluster-autoscaler" {
+		t.Errorf("gang1 PDB after lease not open/owned: %v", pdb1.Annotations)
 	}
 
-	makeGangPod := func(name, jobset string, created metav1.Time) *corev1.Pod {
-		return &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:              name,
-				Namespace:         "default",
-				UID:               types.UID("uid-" + name),
-				CreationTimestamp: created,
-				Labels: map[string]string{
-					"role":                           "training",
-					"jobset.sigs.k8s.io/jobset-name": jobset,
-				},
-			},
-		}
+	// User PDB shadowing strips stale PodGroupLabel from shadowed gang Pod.
+	userPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-gang1-w0", Namespace: "default"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"custom": "yes"}}},
 	}
+	_ = c.Get(t.Context(), client.ObjectKeyFromObject(p1a), p1a)
+	p1a.Labels["custom"] = "yes"
+	_ = c.Update(t.Context(), p1a)
+	_ = c.Create(t.Context(), userPDB)
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("Reconcile(userPDB shadow) err = %v", err)
+	}
+	gotP1a := &corev1.Pod{}
+	_ = c.Get(t.Context(), client.ObjectKeyFromObject(p1a), gotP1a)
+	if gotP1a.Labels[utils.PodGroupLabel] != "" {
+		t.Errorf("expected stale %s label removed, got %q", utils.PodGroupLabel, gotP1a.Labels[utils.PodGroupLabel])
+	}
+	assertNoPodMatchedByMultiplePDBs(t, c)
 
-	// Gang 1 has an old worker + a young worker -> protected (closed) atomically.
-	// Gang 2 has two old workers -> ready (open 100%) for all-or-nothing eviction.
-	p1a := makeGangPod("gang1-w0", "job-1", oldTime)
-	p1b := makeGangPod("gang1-w1", "job-1", youngTime)
-	p2a := makeGangPod("gang2-w0", "job-2", oldTime)
-	p2b := makeGangPod("gang2-w1", "job-2", oldTime)
-
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
-		wc, p1a, p1b, p2a, p2b,
-	).Build()
-	r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
-	validCond := metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonValidationPassed}
-
-	if _, err := r.reconcilePDBs(t.Context(), wc, validCond, true, nil); err != nil {
-		t.Fatalf("reconcilePDBs() error = %v", err)
-	}
-
-	g1, _ := utils.PodGroupID(p1a, "")
-	g2, _ := utils.PodGroupID(p2a, "")
-
-	// Both gangs get exactly 1 Group PDB each (total 2 PDBs, not 4 per-pod PDBs).
-	pdbList := &policyv1.PodDisruptionBudgetList{}
-	if err := c.List(t.Context(), pdbList, client.InNamespace("default")); err != nil {
-		t.Fatalf("List(PDB) error = %v", err)
-	}
-	if len(pdbList.Items) != 2 {
-		t.Fatalf("got %d PDBs, want 2 Group PDBs", len(pdbList.Items))
-	}
-
-	pdb1 := &policyv1.PodDisruptionBudget{}
-	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1); err != nil {
-		t.Fatalf("Get(gang1 PDB) error = %v", err)
-	}
-	if utils.IsPDBOpen(pdb1) {
-		t.Errorf("gang1 PDB should be closed because gang1-w1 is younger than MinInitialRunDurationDays")
-	}
-
-	pdb2 := &policyv1.PodDisruptionBudget{}
-	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g2), Namespace: "default"}, pdb2); err != nil {
-		t.Fatalf("Get(gang2 PDB) error = %v", err)
-	}
-	if !utils.IsPDBOpen(pdb2) {
-		t.Errorf("gang2 PDB should be open because all workers satisfy MinInitialRunDurationDays")
-	}
-
-	// Verify both gang1 pods were labeled with workloads.gke.io/pod-group.
-	gotPod := &corev1.Pod{}
-	if err := c.Get(t.Context(), client.ObjectKeyFromObject(p1a), gotPod); err != nil {
-		t.Fatalf("Get(p1a) error = %v", err)
-	}
-	if gotPod.Labels[utils.PodGroupLabel] != g1 {
-		t.Errorf("p1a label %s = %q, want %q", utils.PodGroupLabel, gotPod.Labels[utils.PodGroupLabel], g1)
-	}
-
-	// Invalid WorkloadClass opens gang1's Group PDB instead of deleting it.
-	invalidCond := metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed}
-	if _, err := r.reconcilePDBs(t.Context(), wc, invalidCond, true, nil); err != nil {
-		t.Fatalf("reconcilePDBs(invalid) error = %v", err)
-	}
-	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1); err != nil {
-		t.Fatalf("Get(gang1 PDB after invalid) error = %v", err)
-	}
-	if !utils.IsPDBOpen(pdb1) {
-		t.Errorf("gang1 PDB should be open when WorkloadClass fails validation")
-	}
-
-	// Deleting all pods of gang2 removes gang2's Group PDB on next valid reconcile.
-	if err := c.Delete(t.Context(), p2a); err != nil {
-		t.Fatalf("Delete(p2a) error = %v", err)
-	}
-	if err := c.Delete(t.Context(), p2b); err != nil {
-		t.Fatalf("Delete(p2b) error = %v", err)
-	}
-	if _, err := r.reconcilePDBs(t.Context(), wc, validCond, true, nil); err != nil {
-		t.Fatalf("reconcilePDBs(after gang2 delete) error = %v", err)
+	// Invalid WorkloadClass deletes orphaned gang2 Group PDB and opens active gang1 PDB.
+	_ = c.Delete(t.Context(), p2a)
+	_ = c.Delete(t.Context(), p2b)
+	_ = c.Get(t.Context(), req.NamespacedName, wc)
+	wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 99
+	_ = c.Update(t.Context(), wc)
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("Reconcile(invalid) err = %v", err)
 	}
 	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g2), Namespace: "default"}, &policyv1.PodDisruptionBudget{}); !errors.IsNotFound(err) {
-		t.Errorf("expected gang2 Group PDB to be deleted, got err = %v", err)
+		t.Errorf("expected orphaned gang2 Group PDB deleted when invalid, got err=%v", err)
 	}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: utils.GroupPDBName(wc.Name, g1), Namespace: "default"}, pdb1); err != nil || !utils.IsPDBOpen(pdb1) {
+		t.Errorf("expected active gang1 Group PDB open when invalid, err=%v", err)
+	}
+}
+
+func TestReconcileGroupPDBTransitionsAndSplit(t *testing.T) {
+	scheme := newTestScheme(t)
+	oldTime := metav1.Time{Time: time.Now().UTC().Add(-72 * time.Hour)}
+	guardrail := &workloadsv1.WorkloadClassGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: "g-1"},
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 30}},
+		},
+	}
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "train-wc", Namespace: "default", UID: "wc-uid-1", CreationTimestamp: oldTime},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": "training"}},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				DisruptionUnit: workloadsv1.DisruptionUnitGroup, MaxNonDisruptionDurationDays: 14,
+			},
+		},
+	}
+	p := makeTestGangPod("g1-w0", "job-1", oldTime)
+	g1, _ := utils.PodGroupID(p, wc.Name, "")
+	g1PDBName := utils.GroupPDBName(wc.Name, g1)
+
+	var ops []string
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).
+		WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}, guardrail, wc, p).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if pdb, ok := obj.(*policyv1.PodDisruptionBudget); ok {
+					ops = append(ops, "create:"+pdb.Name)
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if pdb, ok := obj.(*policyv1.PodDisruptionBudget); ok {
+					ops = append(ops, "delete:"+pdb.Name)
+				}
+				return cl.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &WorkloadClassReconciler{Client: c, Scheme: scheme, LeaseTracker: utils.NewPendingLeaseTracker(10)}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "train-wc", Namespace: "default"}}
+
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("initial Reconcile err = %v", err)
+	}
+	// Group -> Pod deletes Group PDB before creating Per-Pod PDB.
+	_ = c.Get(t.Context(), req.NamespacedName, wc)
+	wc.Spec.DisruptionPolicy.DisruptionUnit = workloadsv1.DisruptionUnitPod
+	_ = c.Update(t.Context(), wc)
+	ops = nil
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("Group->Pod Reconcile err = %v", err)
+	}
+	assertNoPodMatchedByMultiplePDBs(t, c)
+	if len(ops) < 2 || ops[0] != "delete:"+g1PDBName || ops[1] != "create:workload-g1-w0" {
+		t.Errorf("Group->Pod order = %v, want delete Group PDB before create Per-Pod PDB", ops)
+	}
+	// Pod -> Group deletes Per-Pod PDB before creating Group PDB.
+	_ = c.Get(t.Context(), req.NamespacedName, wc)
+	wc.Spec.DisruptionPolicy.DisruptionUnit = workloadsv1.DisruptionUnitGroup
+	_ = c.Update(t.Context(), wc)
+	ops = nil
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("Pod->Group Reconcile err = %v", err)
+	}
+	assertNoPodMatchedByMultiplePDBs(t, c)
+	if len(ops) < 2 || ops[0] != "delete:workload-g1-w0" || ops[1] != "create:"+g1PDBName {
+		t.Errorf("Pod->Group order = %v, want delete Per-Pod PDB before create Group PDB", ops)
+	}
+
+	// Same JobSet split across two WorkloadClasses gets distinct non-overlapping Group PDBs.
+	for _, spec := range []struct{ wcName, role, podName string }{
+		{"split-leader", "leader", "sp-l"},
+		{"split-worker", "worker", "sp-w"},
+	} {
+		_ = c.Create(t.Context(), &workloadsv1.WorkloadClass{
+			ObjectMeta: metav1.ObjectMeta{Name: spec.wcName, Namespace: "default", UID: types.UID("uid-" + spec.wcName)},
+			Spec: workloadsv1.WorkloadClassSpec{
+				PodSelector:      &metav1.LabelSelector{MatchLabels: map[string]string{"split": spec.role}},
+				DisruptionPolicy: workloadsv1.DisruptionPolicy{DisruptionUnit: workloadsv1.DisruptionUnitGroup, MaxNonDisruptionDurationDays: 14},
+			},
+		})
+		_ = c.Create(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: spec.podName, Namespace: "default", UID: types.UID(spec.podName), CreationTimestamp: oldTime,
+			Labels: map[string]string{"split": spec.role, "jobset.sigs.k8s.io/jobset-name": "shared-js"},
+		}})
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: spec.wcName, Namespace: "default"}}); err != nil {
+			t.Fatalf("Reconcile(%s) err = %v", spec.wcName, err)
+		}
+	}
+	assertNoPodMatchedByMultiplePDBs(t, c)
 }
