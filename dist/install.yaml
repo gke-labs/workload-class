@@ -1316,25 +1316,6 @@ webhooks:
     service:
       name: workload-class-webhook-service
       namespace: workload-class-system
-      path: /validate-disruption
-  failurePolicy: Fail
-  name: vpoddisruption.gke.io
-  rules:
-  - apiGroups:
-    - ""
-    apiVersions:
-    - v1
-    operations:
-    - CREATE
-    resources:
-    - pods/eviction
-  sideEffects: None
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    service:
-      name: workload-class-webhook-service
-      namespace: workload-class-system
       path: /validate-policy-v1-poddisruptionbudget
   failurePolicy: Ignore
   name: vpoddisruptionbudget-v1.kb.io
@@ -1356,6 +1337,25 @@ webhooks:
     - UPDATE
     resources:
     - poddisruptionbudgets
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: workload-class-webhook-service
+      namespace: workload-class-system
+      path: /validate-disruption
+  failurePolicy: Fail
+  name: vpoddisruption.gke.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods/eviction
   sideEffects: None
 - admissionReviewVersions:
   - v1
