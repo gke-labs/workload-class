@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -29,108 +30,86 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+func guardrailWithPolicy(p *workloadsv1.UserPDBPolicy) workloadsv1.WorkloadClassGuardrail {
+	return workloadsv1.WorkloadClassGuardrail{
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1.Constraints{
+				Disruption: workloadsv1.Disruption{UserPDBPolicy: p},
+			},
+		},
+	}
+}
+
 func TestEffectiveUserPDBPolicy(t *testing.T) {
 	tests := []struct {
-		name        string
-		guardrails  []workloadsv1.WorkloadClassGuardrail
-		wantMode    workloadsv1.UserPDBEnforcementMode
-		wantZero    bool
-		wantOverlap bool
+		name       string
+		guardrails []workloadsv1.WorkloadClassGuardrail
+		want       UserPDBPolicyDecision
 	}{
 		{
-			name:        "no_guardrails_defaults_to_allow",
-			wantMode:    workloadsv1.UserPDBModeAllow,
-			wantZero:    false,
-			wantOverlap: false,
+			name: "no_guardrails_defaults_to_allow",
+			want: UserPDBPolicyDecision{
+				ZeroDisruptionMode: workloadsv1.UserPDBModeAllow,
+				OverlappingMode:    workloadsv1.UserPDBModeAllow,
+			},
 		},
 		{
 			name: "warn_with_default_booleans",
 			guardrails: []workloadsv1.WorkloadClassGuardrail{
-				{
-					Spec: workloadsv1.WorkloadClassGuardrailSpec{
-						Constraints: workloadsv1.Constraints{
-							Disruption: workloadsv1.Disruption{
-								UserPDBPolicy: &workloadsv1.UserPDBPolicy{Mode: workloadsv1.UserPDBModeWarn},
-							},
-						},
-					},
-				},
+				guardrailWithPolicy(&workloadsv1.UserPDBPolicy{Mode: workloadsv1.UserPDBModeWarn}),
 			},
-			wantMode:    workloadsv1.UserPDBModeWarn,
-			wantZero:    true,
-			wantOverlap: true,
+			want: UserPDBPolicyDecision{
+				ZeroDisruptionMode: workloadsv1.UserPDBModeWarn,
+				OverlappingMode:    workloadsv1.UserPDBModeWarn,
+			},
 		},
 		{
-			name: "enforce_beats_warn_and_unions_checks",
+			name: "per_check_strictest_mode_mixed_guardrails",
 			guardrails: []workloadsv1.WorkloadClassGuardrail{
-				{
-					Spec: workloadsv1.WorkloadClassGuardrailSpec{
-						Constraints: workloadsv1.Constraints{
-							Disruption: workloadsv1.Disruption{
-								UserPDBPolicy: &workloadsv1.UserPDBPolicy{
-									Mode:                workloadsv1.UserPDBModeWarn,
-									BlockZeroDisruption: boolPtr(true),
-									BlockOverlapping:    boolPtr(false),
-								},
-							},
-						},
-					},
-				},
-				{
-					Spec: workloadsv1.WorkloadClassGuardrailSpec{
-						Constraints: workloadsv1.Constraints{
-							Disruption: workloadsv1.Disruption{
-								UserPDBPolicy: &workloadsv1.UserPDBPolicy{
-									Mode:                workloadsv1.UserPDBModeEnforce,
-									BlockZeroDisruption: boolPtr(false),
-									BlockOverlapping:    boolPtr(true),
-								},
-							},
-						},
-					},
-				},
+				guardrailWithPolicy(&workloadsv1.UserPDBPolicy{
+					Mode:                workloadsv1.UserPDBModeWarn,
+					BlockZeroDisruption: boolPtr(true),
+					BlockOverlapping:    boolPtr(false),
+				}),
+				guardrailWithPolicy(&workloadsv1.UserPDBPolicy{
+					Mode:                workloadsv1.UserPDBModeEnforce,
+					BlockZeroDisruption: boolPtr(false),
+					BlockOverlapping:    boolPtr(true),
+				}),
 			},
-			wantMode:    workloadsv1.UserPDBModeEnforce,
-			wantZero:    true,
-			wantOverlap: true,
+			want: UserPDBPolicyDecision{
+				ZeroDisruptionMode: workloadsv1.UserPDBModeWarn,
+				OverlappingMode:    workloadsv1.UserPDBModeEnforce,
+			},
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mode, zero, overlap := EffectiveUserPDBPolicy(tt.guardrails)
-			if mode != tt.wantMode || zero != tt.wantZero || overlap != tt.wantOverlap {
-				t.Errorf("EffectiveUserPDBPolicy() = (%v, %v, %v), want (%v, %v, %v)",
-					mode, zero, overlap, tt.wantMode, tt.wantZero, tt.wantOverlap)
+			if got := EffectiveUserPDBPolicy(tt.guardrails); got != tt.want {
+				t.Errorf("EffectiveUserPDBPolicy() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
 }
 
 func TestIsZeroDisruptionPDB(t *testing.T) {
-	zeroInt := intstr.FromInt32(0)
-	oneInt := intstr.FromInt32(1)
-	zeroPct := intstr.FromString("0%")
-	hundredPct := intstr.FromString("100%")
-	fiftyPct := intstr.FromString("50%")
-
+	zeroInt, oneInt := intstr.FromInt32(0), intstr.FromInt32(1)
+	zeroPct, hundredPct, fiftyPct := intstr.FromString("0%"), intstr.FromString("100%"), intstr.FromString("50%")
 	tests := []struct {
 		name string
 		pdb  *policyv1.PodDisruptionBudget
 		want bool
 	}{
-		{name: "nil", pdb: nil, want: false},
-		{name: "maxUnavailable_0_int", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &zeroInt}}, want: true},
-		{name: "maxUnavailable_0_pct", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &zeroPct}}, want: true},
-		{name: "minAvailable_100_pct", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: &hundredPct}}, want: true},
-		{name: "maxUnavailable_1", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt}}, want: false},
-		{name: "minAvailable_50_pct", pdb: &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: &fiftyPct}}, want: false},
+		{"nil", nil, false},
+		{"maxUnavailable_0_int", &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &zeroInt}}, true},
+		{"maxUnavailable_0_pct", &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &zeroPct}}, true},
+		{"minAvailable_100_pct", &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: &hundredPct}}, true},
+		{"maxUnavailable_1", &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt}}, false},
+		{"minAvailable_50_pct", &policyv1.PodDisruptionBudget{Spec: policyv1.PodDisruptionBudgetSpec{MinAvailable: &fiftyPct}}, false},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, _ := IsZeroDisruptionPDB(tt.pdb)
-			if got != tt.want {
+			if got, _ := IsZeroDisruptionPDB(tt.pdb); got != tt.want {
 				t.Errorf("IsZeroDisruptionPDB() = %v, want %v", got, tt.want)
 			}
 		})
@@ -138,38 +117,32 @@ func TestIsZeroDisruptionPDB(t *testing.T) {
 }
 
 func TestValidateUserPDB(t *testing.T) {
-	zeroInt := intstr.FromInt32(0)
-	oneInt := intstr.FromInt32(1)
+	zeroInt, oneInt := intstr.FromInt32(0), intstr.FromInt32(1)
 	isController := true
-	enforceGuardrail := []workloadsv1.WorkloadClassGuardrail{
-		{
-			Spec: workloadsv1.WorkloadClassGuardrailSpec{
-				Constraints: workloadsv1.Constraints{
-					Disruption: workloadsv1.Disruption{
-						UserPDBPolicy: &workloadsv1.UserPDBPolicy{Mode: workloadsv1.UserPDBModeEnforce},
-					},
-				},
-			},
-		},
+	enforceAll := []workloadsv1.WorkloadClassGuardrail{
+		guardrailWithPolicy(&workloadsv1.UserPDBPolicy{Mode: workloadsv1.UserPDBModeEnforce}),
 	}
-
 	wcOwnedPDB := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "workload-pod-1",
-			Namespace: "default",
-			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: "workloads.gke.io/v1", Kind: "WorkloadClass", Name: "wc", Controller: &isController},
-			},
+			Name: "workload-pod-1", Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "workloads.gke.io/v1", Kind: "WorkloadClass", Name: "wc", Controller: &isController,
+			}},
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MaxUnavailable: &zeroInt,
 			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
 		},
 	}
-	if mode, violations := ValidateUserPDB(wcOwnedPDB, nil, enforceGuardrail); mode != workloadsv1.UserPDBModeAllow || len(violations) != 0 {
-		t.Fatalf("WorkloadClass-managed PDB should be skipped, got (%v, %v)", mode, violations)
+	if w, r := ValidateUserPDB(wcOwnedPDB, nil, nil, enforceAll); len(w) != 0 || len(r) != 0 {
+		t.Fatalf("WorkloadClass-managed PDB should be skipped, got warn=%v reject=%v", w, r)
 	}
 
+	pods := []corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "web-0", Namespace: "default", Labels: map[string]string{"app": "web", "tier": "fe"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "pay-0", Namespace: "default", Labels: map[string]string{"team": "payments"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "done-0", Namespace: "default", Labels: map[string]string{"app": "web", "old": "yes"}}, Status: corev1.PodStatus{Phase: corev1.PodSucceeded}},
+	}
 	candidate := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-pdb", Namespace: "default"},
 		Spec: policyv1.PodDisruptionBudgetSpec{
@@ -178,42 +151,47 @@ func TestValidateUserPDB(t *testing.T) {
 		},
 	}
 	existing := []policyv1.PodDisruptionBudget{
-		*candidate, // self (update) should be ignored
-		*wcOwnedPDB,
-		{
-			ObjectMeta: metav1.ObjectMeta{Name: "z-pdb", Namespace: "default"},
-			Spec: policyv1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &oneInt,
-				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web", "tier": "fe"}},
-			},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{Name: "a-pdb", Namespace: "default"},
-			Spec: policyv1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &oneInt,
-				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
-			},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{Name: "other-ns-pdb", Namespace: "other"},
-			Spec: policyv1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &oneInt,
-				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
-			},
-		},
+		*candidate, *wcOwnedPDB,
+		{ObjectMeta: metav1.ObjectMeta{Name: "z-pdb", Namespace: "default"}, Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web", "tier": "fe"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "a-pdb", Namespace: "default"}, Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "disjoint-keys-pdb", Namespace: "default"}, Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": "payments"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "succeeded-only-pdb", Namespace: "default"}, Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"old": "yes"}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "other-ns-pdb", Namespace: "other"}, Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}}},
 	}
 
-	mode, violations := ValidateUserPDB(candidate, existing, enforceGuardrail)
-	if mode != workloadsv1.UserPDBModeEnforce {
-		t.Fatalf("ValidateUserPDB() mode = %v, want Enforce", mode)
+	warns, rejects := ValidateUserPDB(candidate, existing, pods, enforceAll)
+	if len(warns) != 0 || len(rejects) != 2 {
+		t.Fatalf("ValidateUserPDB(enforceAll) = (warn=%v, reject=%v), want 0 warns and 2 rejects", warns, rejects)
 	}
-	if len(violations) != 2 {
-		t.Fatalf("ValidateUserPDB() got %d violations (%v), want 2", len(violations), violations)
+	if !strings.Contains(rejects[0], "zero voluntary evictions") {
+		t.Errorf("rejects[0] = %q, want zero-eviction message", rejects[0])
 	}
-	if !strings.Contains(violations[0], "zero voluntary evictions") {
-		t.Errorf("violation[0] = %q, want zero-eviction message", violations[0])
+	if !strings.Contains(rejects[1], "'a-pdb', 'z-pdb'") || strings.Contains(rejects[1], "disjoint-keys-pdb") || strings.Contains(rejects[1], "succeeded-only-pdb") {
+		t.Errorf("rejects[1] = %q, want only sorted co-selected 'a-pdb', 'z-pdb'", rejects[1])
 	}
-	if !strings.Contains(violations[1], "'a-pdb', 'z-pdb'") {
-		t.Errorf("violation[1] = %q, want sorted overlap names 'a-pdb', 'z-pdb'", violations[1])
+
+	// Mixed guardrails: Warn zero-disruption, Enforce overlap (no cross-contamination to Enforce zero-disruption).
+	mixed := []workloadsv1.WorkloadClassGuardrail{
+		guardrailWithPolicy(&workloadsv1.UserPDBPolicy{Mode: workloadsv1.UserPDBModeWarn, BlockZeroDisruption: boolPtr(true), BlockOverlapping: boolPtr(false)}),
+		guardrailWithPolicy(&workloadsv1.UserPDBPolicy{Mode: workloadsv1.UserPDBModeEnforce, BlockZeroDisruption: boolPtr(false), BlockOverlapping: boolPtr(true)}),
+	}
+	warns, rejects = ValidateUserPDB(candidate, existing, pods, mixed)
+	if len(warns) != 1 || !strings.Contains(warns[0], "zero voluntary evictions") {
+		t.Errorf("mixed warns = %v, want 1 zero-disruption warning", warns)
+	}
+	if len(rejects) != 1 || !strings.Contains(rejects[0], "'a-pdb', 'z-pdb'") {
+		t.Errorf("mixed rejects = %v, want 1 overlap rejection", rejects)
+	}
+
+	// Disjoint-key selectors with no co-selected active Pod do not false-positive even in Enforce mode.
+	noOverlap := []policyv1.PodDisruptionBudget{
+		{ObjectMeta: metav1.ObjectMeta{Name: "payments-pdb", Namespace: "default"}, Spec: policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": "payments"}}}},
+	}
+	validWeb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "web-pdb", Namespace: "default"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{MaxUnavailable: &oneInt, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+	}
+	if w, r := ValidateUserPDB(validWeb, noOverlap, pods, enforceAll); len(w) != 0 || len(r) != 0 {
+		t.Errorf("disjoint-key selectors with separate live Pods should be allowed, got warn=%v reject=%v", w, r)
 	}
 }

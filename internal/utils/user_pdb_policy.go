@@ -20,33 +20,60 @@ import (
 	"fmt"
 	"slices"
 
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
 
-// EffectiveUserPDBPolicy aggregates UserPDBPolicy settings across all cluster WorkloadClassGuardrails
-// using strictest-wins precedence: Enforce > Warn > Allow. Boolean check flags default to true when
-// omitted on an active (Warn or Enforce) guardrail policy.
-func EffectiveUserPDBPolicy(guardrails []workloadsv1.WorkloadClassGuardrail) (mode workloadsv1.UserPDBEnforcementMode, blockZeroDisruption, blockOverlapping bool) {
-	mode = workloadsv1.UserPDBModeAllow
+// UserPDBPolicyDecision holds the strictest active enforcement mode per check across all
+// cluster WorkloadClassGuardrails (Enforce > Warn > Allow).
+type UserPDBPolicyDecision struct {
+	ZeroDisruptionMode workloadsv1.UserPDBEnforcementMode
+	OverlappingMode    workloadsv1.UserPDBEnforcementMode
+}
+
+// IsActive reports whether at least one user-PDB check is set to Warn or Enforce.
+func (d UserPDBPolicyDecision) IsActive() bool {
+	return d.ZeroDisruptionMode != workloadsv1.UserPDBModeAllow ||
+		d.OverlappingMode != workloadsv1.UserPDBModeAllow
+}
+
+func stricterUserPDBMode(current, candidate workloadsv1.UserPDBEnforcementMode) workloadsv1.UserPDBEnforcementMode {
+	switch {
+	case current == workloadsv1.UserPDBModeEnforce || candidate == workloadsv1.UserPDBModeEnforce:
+		return workloadsv1.UserPDBModeEnforce
+	case current == workloadsv1.UserPDBModeWarn || candidate == workloadsv1.UserPDBModeWarn:
+		return workloadsv1.UserPDBModeWarn
+	default:
+		return workloadsv1.UserPDBModeAllow
+	}
+}
+
+// EffectiveUserPDBPolicy computes the strictest enforcement mode per check across all cluster
+// WorkloadClassGuardrails using only the guardrails that enable each check. Boolean check flags
+// default to true when omitted on a Warn or Enforce guardrail policy.
+func EffectiveUserPDBPolicy(guardrails []workloadsv1.WorkloadClassGuardrail) UserPDBPolicyDecision {
+	decision := UserPDBPolicyDecision{
+		ZeroDisruptionMode: workloadsv1.UserPDBModeAllow,
+		OverlappingMode:    workloadsv1.UserPDBModeAllow,
+	}
 	for i := range guardrails {
 		p := guardrails[i].Spec.Constraints.Disruption.UserPDBPolicy
 		if p == nil || p.Mode == "" || p.Mode == workloadsv1.UserPDBModeAllow {
 			continue
 		}
-		if p.Mode == workloadsv1.UserPDBModeEnforce || mode == workloadsv1.UserPDBModeAllow {
-			mode = p.Mode
-		}
 		if p.BlockZeroDisruption == nil || *p.BlockZeroDisruption {
-			blockZeroDisruption = true
+			decision.ZeroDisruptionMode = stricterUserPDBMode(decision.ZeroDisruptionMode, p.Mode)
 		}
 		if p.BlockOverlapping == nil || *p.BlockOverlapping {
-			blockOverlapping = true
+			decision.OverlappingMode = stricterUserPDBMode(decision.OverlappingMode, p.Mode)
 		}
 	}
-	return mode, blockZeroDisruption, blockOverlapping
+	return decision
 }
 
 // IsZeroDisruptionPDB reports whether a PodDisruptionBudget statically allows zero voluntary evictions
@@ -69,53 +96,101 @@ func IsZeroDisruptionPDB(pdb *policyv1.PodDisruptionBudget) (bool, string) {
 	return false, ""
 }
 
-// ValidateUserPDB checks a user-authored PodDisruptionBudget against the effective UserPDBPolicy
-// across cluster WorkloadClassGuardrails. WorkloadClass-managed PDBs are always skipped.
+// OverlappingUserPDBNames returns the sorted names of existing user-authored PDBs in the same
+// namespace that co-select at least one active Pod matched by pdb. Checking actual live Pod labels
+// avoids false positives on disjoint-key selectors (e.g. {app: web} vs {team: payments}).
+func OverlappingUserPDBNames(
+	pdb *policyv1.PodDisruptionBudget,
+	existingPDBs []policyv1.PodDisruptionBudget,
+	namespacePods []corev1.Pod,
+) []string {
+	if pdb == nil || pdb.Spec.Selector == nil {
+		return nil
+	}
+	sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+	if err != nil {
+		return nil
+	}
+
+	var matchedPods []*corev1.Pod
+	for i := range namespacePods {
+		pod := &namespacePods[i]
+		if pod.Namespace != pdb.Namespace || !IsPodActive(pod) {
+			continue
+		}
+		if sel.Matches(labels.Set(pod.Labels)) {
+			matchedPods = append(matchedPods, pod)
+		}
+	}
+	if len(matchedPods) == 0 {
+		return nil
+	}
+
+	var overlapping []string
+	for i := range existingPDBs {
+		other := &existingPDBs[i]
+		if other.Namespace != pdb.Namespace || other.Name == pdb.Name || !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if IsWorkloadClassManagedPDB(other) || other.Spec.Selector == nil {
+			continue
+		}
+		otherSel, err := metav1.LabelSelectorAsSelector(other.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		for _, pod := range matchedPods {
+			if otherSel.Matches(labels.Set(pod.Labels)) {
+				overlapping = append(overlapping, other.Name)
+				break
+			}
+		}
+	}
+	slices.Sort(overlapping)
+	return overlapping
+}
+
+// ValidateUserPDB checks a user-authored PodDisruptionBudget against the effective per-check
+// UserPDBPolicy across cluster WorkloadClassGuardrails, returning warning messages and blocking
+// rejection messages separately. WorkloadClass-managed PDBs are always skipped.
 func ValidateUserPDB(
 	pdb *policyv1.PodDisruptionBudget,
 	existingPDBs []policyv1.PodDisruptionBudget,
+	namespacePods []corev1.Pod,
 	guardrails []workloadsv1.WorkloadClassGuardrail,
-) (workloadsv1.UserPDBEnforcementMode, []string) {
+) (warnings, rejections []string) {
 	if pdb == nil || IsWorkloadClassManagedPDB(pdb) {
-		return workloadsv1.UserPDBModeAllow, nil
+		return nil, nil
 	}
 
-	mode, blockZero, blockOverlapping := EffectiveUserPDBPolicy(guardrails)
-	if mode == workloadsv1.UserPDBModeAllow {
-		return mode, nil
+	decision := EffectiveUserPDBPolicy(guardrails)
+	if !decision.IsActive() {
+		return nil, nil
 	}
 
-	var violations []string
-	if blockZero {
+	record := func(mode workloadsv1.UserPDBEnforcementMode, msg string) {
+		switch mode {
+		case workloadsv1.UserPDBModeEnforce:
+			rejections = append(rejections, msg)
+		case workloadsv1.UserPDBModeWarn:
+			warnings = append(warnings, msg)
+		}
+	}
+
+	if decision.ZeroDisruptionMode != workloadsv1.UserPDBModeAllow {
 		if zero, reason := IsZeroDisruptionPDB(pdb); zero {
-			violations = append(violations, reason)
+			record(decision.ZeroDisruptionMode, reason)
 		}
 	}
 
-	if blockOverlapping && pdb.Spec.Selector != nil {
-		var overlapping []string
-		for i := range existingPDBs {
-			other := &existingPDBs[i]
-			if other.Namespace != pdb.Namespace || other.Name == pdb.Name || !other.DeletionTimestamp.IsZero() {
-				continue
-			}
-			if IsWorkloadClassManagedPDB(other) || other.Spec.Selector == nil {
-				continue
-			}
-			overlap, err := SelectorsOverlap(pdb.Spec.Selector, other.Spec.Selector)
-			if err != nil || !overlap {
-				continue
-			}
-			overlapping = append(overlapping, other.Name)
-		}
-		if len(overlapping) > 0 {
-			slices.Sort(overlapping)
-			violations = append(violations, fmt.Sprintf(
-				"selector overlaps with existing user PodDisruptionBudget(s) %s; Pods matched by multiple PDBs cannot be evicted",
+	if decision.OverlappingMode != workloadsv1.UserPDBModeAllow {
+		if overlapping := OverlappingUserPDBNames(pdb, existingPDBs, namespacePods); len(overlapping) > 0 {
+			record(decision.OverlappingMode, fmt.Sprintf(
+				"matches active Pod(s) already covered by user PodDisruptionBudget(s) %s; Pods matched by multiple PDBs cannot be evicted",
 				QuotedList(overlapping),
 			))
 		}
 	}
 
-	return mode, violations
+	return warnings, rejections
 }

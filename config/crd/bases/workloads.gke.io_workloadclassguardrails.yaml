@@ -86,7 +86,7 @@ spec:
                           blockOverlapping:
                             default: true
                             description: |-
-                              BlockOverlapping flags user PDBs whose selector overlaps with another user PDB in the same namespace.
+                              BlockOverlapping flags user PDBs that co-select at least one active Pod alongside another user PDB in the same namespace.
                               Defaults to true when mode is Warn or Enforce.
                             type: boolean
                           blockZeroDisruption:

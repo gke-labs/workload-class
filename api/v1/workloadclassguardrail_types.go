@@ -50,7 +50,7 @@ type UserPDBPolicy struct {
 	// +kubebuilder:default=true
 	BlockZeroDisruption *bool `json:"blockZeroDisruption,omitempty"`
 
-	// BlockOverlapping flags user PDBs whose selector overlaps with another user PDB in the same namespace.
+	// BlockOverlapping flags user PDBs that co-select at least one active Pod alongside another user PDB in the same namespace.
 	// Defaults to true when mode is Warn or Enforce.
 	// +optional
 	// +kubebuilder:default=true
