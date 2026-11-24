@@ -9,13 +9,11 @@ spec:
       app: spot-batch
   disruptionPolicy:
     allowedDisruptionWindows:
-      - name: "nightly-maintenance"
+      # Matches the Saturday/Sunday window constraint in config/samples/workloads_v1_workloadclassguardrail.yaml.
+      - name: "weekend-maintenance"
         daysOfWeek:
-          - Monday
-          - Tuesday
-          - Wednesday
-          - Thursday
-          - Friday
+          - Saturday
+          - Sunday
         startTime: "02:00"
         endTime: "06:00"
         timeZone: "UTC"

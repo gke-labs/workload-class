@@ -20,8 +20,13 @@ spec:
     maxNonDisruptionDurationDays: 14
     graceTerminationDurationSeconds: 60
     allowedDisruptionsOutsideOfWindow:
+      # Managed GKE Cluster Autoscaler authenticates as User "system:cluster-autoscaler".
       - kind: User
         name: system:cluster-autoscaler
+      # Self-hosted Cluster Autoscaler typically uses ServiceAccount kube-system/cluster-autoscaler.
+      - kind: ServiceAccount
+        name: cluster-autoscaler
+        namespace: kube-system
 ---
 apiVersion: apps/v1
 kind: Deployment

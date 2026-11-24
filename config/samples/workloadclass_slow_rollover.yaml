@@ -9,7 +9,11 @@ spec:
       app: slow-rollover-demo
   disruptionPolicy:
     allowedDisruptionWindows:
-      - name: "daily-window"
+      # Matches the Saturday/Sunday window constraint in config/samples/workloads_v1_workloadclassguardrail.yaml.
+      - name: "weekend-window"
+        daysOfWeek:
+          - Saturday
+          - Sunday
         startTime: "00:00"
         endTime: "23:59"
         timeZone: "UTC"
