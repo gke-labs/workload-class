@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,7 +36,16 @@ import (
 // WorkloadClassGuardrailReconciler reconciles a WorkloadClassGuardrail object
 type WorkloadClassGuardrailReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader bypasses the informer cache for conflict-retry reads (e.g. mgr.GetAPIReader()).
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+}
+
+func (r *WorkloadClassGuardrailReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch;create;update;patch;delete
@@ -53,18 +64,33 @@ func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	validationCondition := r.validate(ctx, g)
+	staleGeneration := false
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &workloadsv1.WorkloadClassGuardrail{}
-		if getErr := r.Get(ctx, req.NamespacedName, latest); getErr != nil {
+		if getErr := r.apiReader().Get(ctx, req.NamespacedName, latest); getErr != nil {
 			return client.IgnoreNotFound(getErr)
+		}
+		if latest.Generation != g.Generation {
+			staleGeneration = true
+			return nil
 		}
 		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCondition) {
 			return nil
 		}
 		return r.Status().Update(ctx, latest)
 	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if staleGeneration {
+		return ctrl.Result{}, apierrors.NewConflict(
+			workloadsv1.GroupVersion.WithResource("workloadclassguardrails").GroupResource(),
+			g.Name,
+			fmt.Errorf("spec generation changed concurrently from %d", g.Generation),
+		)
+	}
 
-	return ctrl.Result{}, err
+	return ctrl.Result{}, nil
 }
 
 func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) metav1.Condition {

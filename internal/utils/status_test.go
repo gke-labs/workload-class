@@ -67,7 +67,14 @@ func TestUpdateWorkloadClassStatus(t *testing.T) {
 			}).Build()
 
 		callerWC := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default"}}
-		err := UpdateWorkloadClassStatus(t.Context(), fc, callerWC, func(latest *workloadsv1.WorkloadClass) bool {
+		readerGets := 0
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				readerGets++
+				return fc.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+		err := UpdateWorkloadClassStatus(t.Context(), fc, reader, callerWC, func(latest *workloadsv1.WorkloadClass) bool {
 			latest.Status.MaintenanceReadiness = workloadsv1.ReadinessReady
 			return true
 		})
@@ -76,6 +83,9 @@ func TestUpdateWorkloadClassStatus(t *testing.T) {
 		}
 		if attempts != 2 {
 			t.Errorf("attempts = %d, want 2", attempts)
+		}
+		if readerGets != 2 {
+			t.Errorf("readerGets = %d, want 2 (expected uncached reader to serve retries)", readerGets)
 		}
 		if callerWC.Status.MaintenanceReadiness != workloadsv1.ReadinessReady {
 			t.Errorf("callerWC readiness = %q, want %q", callerWC.Status.MaintenanceReadiness, workloadsv1.ReadinessReady)
@@ -99,7 +109,7 @@ func TestUpdateWorkloadClassStatus(t *testing.T) {
 				},
 			}).Build()
 
-		if err := UpdateWorkloadClassStatus(t.Context(), fc, wc.DeepCopy(), func(*workloadsv1.WorkloadClass) bool { return false }); err != nil {
+		if err := UpdateWorkloadClassStatus(t.Context(), fc, nil, wc.DeepCopy(), func(*workloadsv1.WorkloadClass) bool { return false }); err != nil {
 			t.Fatalf("UpdateWorkloadClassStatus() error = %v", err)
 		}
 		if called {

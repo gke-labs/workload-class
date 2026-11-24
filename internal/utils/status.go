@@ -27,20 +27,25 @@ import (
 
 // UpdateWorkloadClassStatus updates a WorkloadClass's status subresource inside a retry.RetryOnConflict loop.
 //
-// On each attempt, it fetches the latest WorkloadClass from c, invokes mutate(latest), and performs a
-// Status().Update only when mutate returns true. When the update succeeds (or mutate returns false),
+// On each attempt, it fetches the latest WorkloadClass using reader (falling back to c when reader is nil)
+// so callers can pass an uncached API reader (mgr.GetAPIReader()) and avoid re-reading stale resourceVersions
+// from the informer cache after a 409 Conflict. When the update succeeds (or mutate returns false),
 // latest is copied back into wc so callers observe the updated status and ResourceVersion without
 // clobbering concurrent condition updates from other controllers.
 func UpdateWorkloadClassStatus(
 	ctx context.Context,
 	c client.Client,
+	reader client.Reader,
 	wc *workloadsv1.WorkloadClass,
 	mutate func(latest *workloadsv1.WorkloadClass) bool,
 ) error {
+	if reader == nil {
+		reader = c
+	}
 	key := client.ObjectKeyFromObject(wc)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &workloadsv1.WorkloadClass{}
-		if err := c.Get(ctx, key, latest); err != nil {
+		if err := reader.Get(ctx, key, latest); err != nil {
 			return err
 		}
 		if !mutate(latest) {
@@ -53,4 +58,22 @@ func UpdateWorkloadClassStatus(
 		latest.DeepCopyInto(wc)
 		return nil
 	})
+}
+
+type apiReaderClient struct {
+	client.Client
+	reader client.Reader
+}
+
+func (c apiReaderClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
+// ClientWithReader returns a client.Client whose Get calls go through reader (e.g. mgr.GetAPIReader())
+// while all other operations delegate to c. If reader is nil, c is returned unchanged.
+func ClientWithReader(c client.Client, reader client.Reader) client.Client {
+	if reader == nil {
+		return c
+	}
+	return apiReaderClient{Client: c, reader: reader}
 }

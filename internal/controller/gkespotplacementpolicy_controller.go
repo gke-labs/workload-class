@@ -41,7 +41,16 @@ import (
 // GKESpotPlacementPolicyReconciler reconciles a GKESpotPlacementPolicy object
 type GKESpotPlacementPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader bypasses the informer cache for conflict-retry reads (e.g. mgr.GetAPIReader()).
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+}
+
+func (r *GKESpotPlacementPolicyReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -75,10 +84,15 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
+	staleGeneration := false
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &workloadsv1.GKESpotPlacementPolicy{}
-		if getErr := r.Get(ctx, req.NamespacedName, latest); getErr != nil {
+		if getErr := r.apiReader().Get(ctx, req.NamespacedName, latest); getErr != nil {
 			return client.IgnoreNotFound(getErr)
+		}
+		if latest.Generation != spotPolicy.Generation {
+			staleGeneration = true
+			return nil
 		}
 		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCond) {
 			return nil
@@ -86,6 +100,13 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 		return r.Status().Update(ctx, latest)
 	}); err != nil {
 		return ctrl.Result{}, err
+	}
+	if staleGeneration {
+		return ctrl.Result{}, apierrors.NewConflict(
+			workloadsv1.GroupVersion.WithResource("gkespotplacementpolicies").GroupResource(),
+			spotPolicy.Name,
+			fmt.Errorf("spec generation changed concurrently from %d", spotPolicy.Generation),
+		)
 	}
 
 	wcStatusOpts := statusOptions{
@@ -231,10 +252,17 @@ func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx 
 
 func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context.Context, wc *workloadsv1.WorkloadClass, options statusOptions) error {
 	key := client.ObjectKeyFromObject(wc)
+	policyName := ""
+	if wc.Spec.InfrastructureProfileRef != nil {
+		policyName = wc.Spec.InfrastructureProfileRef.Name
+	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &workloadsv1.WorkloadClass{}
-		if err := r.Get(ctx, key, latest); err != nil {
+		if err := r.apiReader().Get(ctx, key, latest); err != nil {
 			return client.IgnoreNotFound(err)
+		}
+		if policyName != "" && (!utils.ReferencesGKESpotPlacementPolicy(latest.Spec.InfrastructureProfileRef) || latest.Spec.InfrastructureProfileRef.Name != policyName) {
+			return nil
 		}
 		cond := metav1.Condition{
 			Type:               workloadsv1.ConditionTypePlacementPluginAttached,
