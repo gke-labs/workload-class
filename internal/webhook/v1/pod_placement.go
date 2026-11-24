@@ -189,15 +189,16 @@ func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string)
 }
 
 // mutateForOnDemand pins the Pod to On-Demand (non-Spot) nodes.
-// When the Pod selects a GKE Custom Compute Class (either pre-existing or from spotPolicy), it uses
+// On-Demand paths never inherit a policy's CustomComputeClass (which may only contain Spot priorities).
+// If the Pod itself already selects a GKE Custom Compute Class, it uses
 // cloud.google.com/gke-provisioning NotIn [spot] instead of cloud.google.com/gke-spot DoesNotExist
 // to comply with GKE Warden's ComputeClass selector restrictions, and ensures the matching
 // cloud.google.com/compute-class toleration is present.
-func mutateForOnDemand(pod *corev1.Pod, spotPolicy *workloadsv1.GKESpotPlacementPolicy) {
+func mutateForOnDemand(pod *corev1.Pod) {
 	delete(pod.Spec.NodeSelector, SpotLabelKey)
 	removeSpotToleration(pod)
 
-	if ccc := ensureComputeClass(pod, spotPolicy); ccc != "" {
+	if ccc := ensureComputeClass(pod, nil); ccc != "" {
 		requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
 			{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotNotIn()}},
 		})

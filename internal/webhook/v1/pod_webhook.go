@@ -172,9 +172,7 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 		csType = workloadsv1.SpotPlacementTypeSpot
 	}
 	if csType == workloadsv1.SpotPlacementTypeOnDemand {
-		// Explicit OnDemand opt-out does not inherit spotPolicy.Spec.CustomComputeClass,
-		// while still staying Warden-safe if the Pod itself already selects a compute class.
-		mutateForOnDemand(pod, nil)
+		mutateForOnDemand(pod)
 		return nil
 	}
 
@@ -183,7 +181,7 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 		return err
 	}
 	if spotRatio == 0 {
-		mutateForOnDemand(pod, spotPolicy)
+		mutateForOnDemand(pod)
 		return nil
 	}
 
@@ -229,7 +227,7 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 			}
 		}
 		if inFallback {
-			mutateForOnDemand(pod, spotPolicy)
+			mutateForOnDemand(pod)
 			return nil
 		}
 	}
@@ -240,7 +238,7 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 			podlog.Error(err, "Failed to list Pods to compute Spot ratio", "workloadClass", wlc.Name, "namespace", pod.Namespace)
 		}
 		if !utils.ShouldUseSpot(c.effectiveSpot, c.total, spotRatio) {
-			mutateForOnDemand(pod, spotPolicy)
+			mutateForOnDemand(pod)
 			return nil
 		}
 	}

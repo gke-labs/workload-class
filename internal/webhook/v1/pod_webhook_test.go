@@ -240,6 +240,28 @@ var _ = Describe("Pod Webhook", func() {
 			expectOnDemand(pod)
 			Expect(pod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
 		})
+
+		It("does not inherit policy CustomComputeClass on spotRatio=0 or Reversion=None fallback stickiness", func() {
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})
+
+			ratioZeroPod := newIncomingPod()
+			ratioZeroWC := newWorkloadClass(&workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeSpot, SpotRatio: "0%"}, readyConditions())
+			Expect(newDefaulter(ratioZeroWC, policy).Default(testCtx, ratioZeroPod)).To(Succeed())
+			expectOnDemand(ratioZeroPod)
+			Expect(ratioZeroPod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
+
+			inFallback := append(readyConditions(), metav1.Condition{
+				Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonFallbackActive,
+			})
+			stickyPod := newIncomingPod()
+			stickyWC := newWorkloadClass(&workloadsv1.CapacityStrategy{
+				Type:           workloadsv1.SpotPlacementTypeSpot,
+				FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand,
+			}, inFallback)
+			Expect(newDefaulter(stickyWC, policy).Default(testCtx, stickyPod)).To(Succeed())
+			expectOnDemand(stickyPod)
+			Expect(stickyPod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
+		})
 	})
 
 	Context("When the WorkloadClass has no InfrastructureProfileRef", func() {

@@ -127,7 +127,7 @@ var _ = Describe("Pod placement helpers", func() {
 			pod.Spec.Tolerations = []corev1.Toleration{other}
 			ensureSpotToleration(pod)
 
-			mutateForOnDemand(pod, nil)
+			mutateForOnDemand(pod)
 
 			expectOnDemand(pod)
 			Expect(pod.Spec.Tolerations).To(Equal([]corev1.Toleration{other}))
@@ -144,7 +144,7 @@ var _ = Describe("Pod placement helpers", func() {
 				}},
 			}}
 
-			mutateForOnDemand(pod, nil)
+			mutateForOnDemand(pod)
 
 			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
 				{MatchExpressions: []corev1.NodeSelectorRequirement{zoneA, spotDoesNotExist()}},
@@ -152,29 +152,11 @@ var _ = Describe("Pod placement helpers", func() {
 			}))
 		})
 
-		It("uses gke-provisioning NotIn [spot] and injects ComputeClass toleration when CustomComputeClass is active", func() {
-			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})
-			pod := newIncomingPod()
-			setNodeSelector(pod, SpotLabelKey, SpotLabelValue)
-			ensureSpotToleration(pod)
-
-			mutateForOnDemand(pod, policy)
-
-			Expect(utils.IsPodTargetedForSpot(pod)).To(BeFalse())
-			Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "spot-first"}))
-			Expect(pod.Spec.Tolerations).To(Equal([]corev1.Toleration{{
-				Key: ComputeClassLabelKey, Operator: corev1.TolerationOpEqual, Value: "spot-first", Effect: corev1.TaintEffectNoSchedule,
-			}}))
-			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
-				{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotNotIn()}},
-			}))
-		})
-
 		It("preserves pre-existing Pod ComputeClass and avoids gke-spot affinity", func() {
 			pod := newIncomingPod()
 			setNodeSelector(pod, ComputeClassLabelKey, "user-ccc")
 
-			mutateForOnDemand(pod, nil)
+			mutateForOnDemand(pod)
 
 			Expect(pod.Spec.NodeSelector).To(Equal(map[string]string{ComputeClassLabelKey: "user-ccc"}))
 			Expect(pod.Spec.Tolerations).To(ContainElement(corev1.Toleration{
