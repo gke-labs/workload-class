@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,13 +43,6 @@ type GKESpotPlacementPolicyReconciler struct {
 	// APIReader bypasses the informer cache for conflict-retry reads (e.g. mgr.GetAPIReader()).
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
-}
-
-func (r *GKESpotPlacementPolicyReconciler) apiReader() client.Reader {
-	if r.APIReader != nil {
-		return r.APIReader
-	}
-	return r.Client
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -85,9 +77,9 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	staleGeneration := false
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	if err := utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
 		latest := &workloadsv1.GKESpotPlacementPolicy{}
-		if getErr := r.apiReader().Get(ctx, req.NamespacedName, latest); getErr != nil {
+		if getErr := rc.Get(ctx, req.NamespacedName, latest); getErr != nil {
 			return client.IgnoreNotFound(getErr)
 		}
 		if latest.Generation != spotPolicy.Generation {
@@ -97,16 +89,13 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCond) {
 			return nil
 		}
-		return r.Status().Update(ctx, latest)
+		return rc.Status().Update(ctx, latest)
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
 	if staleGeneration {
-		return ctrl.Result{}, apierrors.NewConflict(
-			workloadsv1.GroupVersion.WithResource("gkespotplacementpolicies").GroupResource(),
-			spotPolicy.Name,
-			fmt.Errorf("spec generation changed concurrently from %d", spotPolicy.Generation),
-		)
+		log.V(1).Info("GKESpotPlacementPolicy spec generation changed concurrently, skipping stale status update", "generation", spotPolicy.Generation)
+		return ctrl.Result{}, nil
 	}
 
 	wcStatusOpts := statusOptions{
@@ -256,9 +245,9 @@ func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context
 	if wc.Spec.InfrastructureProfileRef != nil {
 		policyName = wc.Spec.InfrastructureProfileRef.Name
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
 		latest := &workloadsv1.WorkloadClass{}
-		if err := r.apiReader().Get(ctx, key, latest); err != nil {
+		if err := rc.Get(ctx, key, latest); err != nil {
 			return client.IgnoreNotFound(err)
 		}
 		if policyName != "" && (!utils.ReferencesGKESpotPlacementPolicy(latest.Spec.InfrastructureProfileRef) || latest.Spec.InfrastructureProfileRef.Name != policyName) {
@@ -273,7 +262,7 @@ func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context
 			LastTransitionTime: metav1.Now(),
 		}
 		if meta.SetStatusCondition(&latest.Status.Conditions, cond) {
-			return r.Status().Update(ctx, latest)
+			return rc.Status().Update(ctx, latest)
 		}
 		return nil
 	})

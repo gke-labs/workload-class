@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/events"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -65,13 +64,6 @@ type WorkloadClassReconciler struct {
 	// event channel and applies the pending leases of a WorkloadClass when reconciling it. If nil, no leases
 	// are applied.
 	LeaseTracker *utils.PendingLeaseTracker
-}
-
-func (r *WorkloadClassReconciler) apiReader() client.Reader {
-	if r.APIReader != nil {
-		return r.APIReader
-	}
-	return r.Client
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -122,12 +114,11 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 3. Update Status with RetryOnConflict so concurrent condition updates from plugin controllers
 	// (e.g., PlacementPluginAttached, InFallback) are preserved rather than clobbered or failing with 409.
-	// If the spec generation changed concurrently, abort with a Conflict so controller-runtime requeues
-	// and recomputes validation/readiness against the new spec.
+	// If the spec generation changed concurrently, skip writing stale status and let the spec-change event requeue.
 	validationCond := baseValidationCond
 	staleGeneration := false
 	expectedGeneration := wc.Generation
-	if err := utils.UpdateWorkloadClassStatus(ctx, r.Client, r.apiReader(), wc, func(latest *workloadsv1.WorkloadClass) bool {
+	if err := utils.UpdateWorkloadClassStatus(ctx, r.Client, r.APIReader, wc, func(latest *workloadsv1.WorkloadClass) bool {
 		if latest.Generation != expectedGeneration {
 			staleGeneration = true
 			return false
@@ -152,11 +143,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	if staleGeneration {
-		return ctrl.Result{}, apierrors.NewConflict(
-			workloadsv1.GroupVersion.WithResource("workloadclasses").GroupResource(),
-			wc.Name,
-			fmt.Errorf("spec generation changed concurrently from %d", expectedGeneration),
-		)
+		log.V(1).Info("WorkloadClass spec generation changed concurrently, skipping stale status update", "generation", expectedGeneration)
+		return ctrl.Result{}, nil
 	}
 
 	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
@@ -419,11 +407,10 @@ func (r *WorkloadClassReconciler) syncPodPDB(ctx context.Context, wc *workloadsv
 		pdb *policyv1.PodDisruptionBudget
 		op  controllerutil.OperationResult
 	)
-	pdbClient := utils.ClientWithReader(r.Client, r.apiReader())
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	if err := utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
 		pdb = utils.PDBBase(pod)
 		var err error
-		op, err = controllerutil.CreateOrUpdate(ctx, pdbClient, pdb, func() error {
+		op, err = controllerutil.CreateOrUpdate(ctx, rc, pdb, func() error {
 			if err := r.claimPDB(wc, pdb); err != nil {
 				return err
 			}
@@ -439,10 +426,9 @@ func (r *WorkloadClassReconciler) syncPodPDB(ctx context.Context, wc *workloadsv
 
 // leasePodPDB creates or updates the Pod's PDB with a lease for the subject.
 func (r *WorkloadClassReconciler) leasePodPDB(ctx context.Context, wc *workloadsv1.WorkloadClass, pod *corev1.Pod, subject workloadsv1.Subject) error {
-	pdbClient := utils.ClientWithReader(r.Client, r.apiReader())
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	if err := utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
 		pdb := utils.PDBBase(pod)
-		_, err := controllerutil.CreateOrUpdate(ctx, pdbClient, pdb, func() error {
+		_, err := controllerutil.CreateOrUpdate(ctx, rc, pdb, func() error {
 			if err := r.claimPDB(wc, pdb); err != nil {
 				return err
 			}

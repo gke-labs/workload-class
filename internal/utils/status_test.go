@@ -33,47 +33,42 @@ import (
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
 
+type countingReader struct {
+	client.Reader
+	gets int
+}
+
+func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	r.gets++
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
 func TestUpdateWorkloadClassStatus(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := workloadsv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add scheme: %v", err)
 	}
+	wcGR := schema.GroupResource{Group: "workloads.gke.io", Resource: "workloadclasses"}
 
 	t.Run("retries_on_conflict_and_preserves_concurrent_conditions", func(t *testing.T) {
 		wc := &workloadsv1.WorkloadClass{
 			ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default"},
-			Status: workloadsv1.WorkloadClassStatus{
-				Conditions: []metav1.Condition{{
-					Type:   workloadsv1.ConditionTypeInFallback,
-					Status: metav1.ConditionTrue,
-					Reason: workloadsv1.ReasonFallbackActive,
-				}},
-			},
+			Status: workloadsv1.WorkloadClassStatus{Conditions: []metav1.Condition{{
+				Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonFallbackActive,
+			}}},
 		}
-
 		attempts := 0
-		fc := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithStatusSubresource(&workloadsv1.WorkloadClass{}).
-			WithObjects(wc).
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(wc).
 			WithInterceptorFuncs(interceptor.Funcs{
-				SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-					attempts++
-					if attempts == 1 {
-						return apierrors.NewConflict(schema.GroupResource{Group: "workloads.gke.io", Resource: "workloadclasses"}, obj.GetName(), errors.New("stale"))
+				SubResourceUpdate: func(ctx context.Context, c client.Client, _ string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if attempts++; attempts == 1 {
+						return apierrors.NewConflict(wcGR, obj.GetName(), errors.New("stale"))
 					}
 					return c.Status().Update(ctx, obj, opts...)
 				},
 			}).Build()
-
 		callerWC := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default"}}
-		readerGets := 0
-		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				readerGets++
-				return fc.Get(ctx, key, obj, opts...)
-			},
-		}).Build()
+		reader := &countingReader{Reader: fc}
 		err := UpdateWorkloadClassStatus(t.Context(), fc, reader, callerWC, func(latest *workloadsv1.WorkloadClass) bool {
 			latest.Status.MaintenanceReadiness = workloadsv1.ReadinessReady
 			return true
@@ -81,39 +76,49 @@ func TestUpdateWorkloadClassStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UpdateWorkloadClassStatus() error = %v", err)
 		}
-		if attempts != 2 {
-			t.Errorf("attempts = %d, want 2", attempts)
+		if attempts != 2 || reader.gets != 1 {
+			t.Errorf("got (attempts=%d, readerGets=%d), want (2, 1)", attempts, reader.gets)
 		}
-		if readerGets != 2 {
-			t.Errorf("readerGets = %d, want 2 (expected uncached reader to serve retries)", readerGets)
-		}
-		if callerWC.Status.MaintenanceReadiness != workloadsv1.ReadinessReady {
-			t.Errorf("callerWC readiness = %q, want %q", callerWC.Status.MaintenanceReadiness, workloadsv1.ReadinessReady)
-		}
-		if !meta.IsStatusConditionTrue(callerWC.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
-			t.Error("expected concurrent InFallback condition to be preserved")
+		if callerWC.Status.MaintenanceReadiness != workloadsv1.ReadinessReady || !meta.IsStatusConditionTrue(callerWC.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
+			t.Errorf("unexpected callerWC status: %+v", callerWC.Status)
 		}
 	})
 
-	t.Run("skips_update_when_mutate_returns_false", func(t *testing.T) {
+	t.Run("skips_update_and_avoids_uncached_reader_in_steady_state", func(t *testing.T) {
 		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default"}}
 		called := false
-		fc := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithStatusSubresource(&workloadsv1.WorkloadClass{}).
-			WithObjects(wc).
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(wc).
 			WithInterceptorFuncs(interceptor.Funcs{
 				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
 					called = true
 					return nil
 				},
 			}).Build()
-
-		if err := UpdateWorkloadClassStatus(t.Context(), fc, nil, wc.DeepCopy(), func(*workloadsv1.WorkloadClass) bool { return false }); err != nil {
+		reader := &countingReader{Reader: fc}
+		if err := UpdateWorkloadClassStatus(t.Context(), fc, reader, wc.DeepCopy(), func(*workloadsv1.WorkloadClass) bool { return false }); err != nil {
 			t.Fatalf("UpdateWorkloadClassStatus() error = %v", err)
 		}
-		if called {
-			t.Error("expected Status().Update not to be called when mutate returns false")
+		if called || reader.gets != 0 {
+			t.Errorf("got (updateCalled=%v, readerGets=%d), want (false, 0)", called, reader.gets)
+		}
+	})
+
+	t.Run("retry_with_nil_reader_falls_back_to_client", func(t *testing.T) {
+		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default"}}
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).Build()
+		attempts := 0
+		err := RetryOnConflictWithReader(fc, nil, func(rc client.Client) error {
+			attempts++
+			if getErr := rc.Get(t.Context(), client.ObjectKeyFromObject(wc), &workloadsv1.WorkloadClass{}); getErr != nil {
+				return getErr
+			}
+			if attempts == 1 {
+				return apierrors.NewConflict(wcGR, wc.Name, errors.New("stale"))
+			}
+			return nil
+		})
+		if err != nil || attempts != 2 {
+			t.Fatalf("RetryOnConflictWithReader() = (err=%v, attempts=%d), want (nil, 2)", err, attempts)
 		}
 	})
 }

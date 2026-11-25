@@ -25,6 +25,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -227,6 +228,27 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 				}
 				return false
 			}, "10s", "1s").Should(BeTrue())
+		})
+
+		It("should skip stale status update when spec generation changes concurrently", func() {
+			stale := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stale)).To(Succeed())
+			live := stale.DeepCopy()
+			live.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays = 5
+			Expect(k8sClient.Update(ctx, live)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassGuardrailReconciler{
+				Client:    &staleCacheClient{Client: k8sClient, stale: []client.Object{stale}},
+				APIReader: liveReader, Scheme: k8sClient.Scheme(),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(1))
+
+			updated := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Conditions).To(BeEmpty())
 		})
 	})
 })
