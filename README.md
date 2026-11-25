@@ -234,7 +234,9 @@ NAME                                        MIN AVAILABLE   MAX UNAVAILABLE   AL
 workload-test-deployment-5f8c7d9b6c-x2k4p   N/A             0                 0                     2m
 ```
 
-> **NOTE:** The controller only creates PDBs for a `WorkloadClass` that passed validation against at least one `WorkloadClassGuardrail`.
+> **NOTE:** The controller only creates PDBs for a `WorkloadClass` that passed validation against at least one `WorkloadClassGuardrail`. When a `WorkloadClass` fails guardrail validation or an authorized-subject lease is active, managed Per-Pod PDBs always force `unhealthyPodEvictionPolicy: AlwaysAllow` regardless of `spec.disruptionPolicy.unhealthyPodEvictionPolicy`.
+>
+> **Upgrade note:** On the first reconcile after upgrading to a version that includes `unhealthyPodEvictionPolicy` (#126), existing open Per-Pod PDBs (`maxUnavailable: 100%`) switch from `IfHealthyBudget` to `AlwaysAllow`, allowing unhealthy Running pods to be evicted during open windows without waiting for budget. Set `spec.disruptionPolicy.unhealthyPodEvictionPolicy: IfHealthyBudget` explicitly if you want open windows to retain the prior behavior.
 
 ### Ownership and Cleanup
 
