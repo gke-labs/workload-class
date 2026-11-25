@@ -217,7 +217,7 @@ A pod is governed by its best-match `WorkloadClass`, using the same precedence a
 
 ### PDB Spec
 
-Each PDB is named `workload-<pod name>`. The controller labels the pod with `workloads.gke.io/pod-uid: <pod UID>`, and the PDB selects only that label, so it covers exactly one pod and never a later pod that reuses the same name. The PDB uses `unhealthyPodEvictionPolicy: IfHealthyBudget`, and its `maxUnavailable` follows the `WorkloadClass`:
+Each PDB is named `workload-<pod name>`. The controller labels the pod with `workloads.gke.io/pod-uid: <pod UID>`, and the PDB selects only that label, so it covers exactly one pod and never a later pod that reuses the same name. The PDB uses `unhealthyPodEvictionPolicy: IfHealthyBudget` when closed (`maxUnavailable: 0`) and defaults to `AlwaysAllow` when open (`maxUnavailable: 100%`, configurable via `spec.disruptionPolicy.unhealthyPodEvictionPolicy`), and its `maxUnavailable` follows the `WorkloadClass`:
 
 | `WorkloadClass` state | `maxUnavailable` |
 | --- | --- |
