@@ -630,8 +630,43 @@ var _ = Describe("WorkloadClass Controller", func() {
 
 			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(map[string]string{utils.PodUIDLabel: string(pod.UID)}))
 			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
-			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.AlwaysAllow))
 			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(workloadClassName))
+		})
+
+		It("should enforce IfHealthyBudget when NotReady and honor configured UnhealthyPodEvictionPolicy when Ready", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			alwaysAllow := policyv1.AlwaysAllow
+			ifHealthy := policyv1.IfHealthyBudget
+
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy = &alwaysAllow
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = nil
+			wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy = &ifHealthy
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			Eventually(func() (policyv1.UnhealthyPodEvictionPolicyType, error) {
+				if err := k8sClient.Get(ctx, podPDBKey, pdb); err != nil {
+					return "", err
+				}
+				return *pdb.Spec.UnhealthyPodEvictionPolicy, nil
+			}, "10s", "1s").Should(Equal(policyv1.IfHealthyBudget))
+			Expect(pdb.Spec.MaxUnavailable.StrVal).To(Equal("100%"))
 		})
 
 		It("should open the PDBs instead of deleting them if validation fails", func() {
