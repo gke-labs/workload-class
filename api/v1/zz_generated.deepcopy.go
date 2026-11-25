@@ -21,6 +21,7 @@ limitations under the License.
 package v1
 
 import (
+	policyv1 "k8s.io/api/policy/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
@@ -92,6 +93,11 @@ func (in *DisruptionPolicy) DeepCopyInto(out *DisruptionPolicy) {
 		in, out := &in.AllowedDisruptionsOutsideOfWindow, &out.AllowedDisruptionsOutsideOfWindow
 		*out = make([]Subject, len(*in))
 		copy(*out, *in)
+	}
+	if in.UnhealthyPodEvictionPolicy != nil {
+		in, out := &in.UnhealthyPodEvictionPolicy, &out.UnhealthyPodEvictionPolicy
+		*out = new(policyv1.UnhealthyPodEvictionPolicyType)
+		**out = **in
 	}
 }
 
