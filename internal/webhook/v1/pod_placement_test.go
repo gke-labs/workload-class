@@ -261,6 +261,50 @@ var _ = Describe("Pod placement helpers", func() {
 			}))
 		})
 
+		It("targets a specific GKE reservation without project when project is omitted", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Affinity: workloadsv1.ReservationAffinitySpecific,
+					Name:     "ml-a3-res",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
+				{MatchExpressions: []corev1.NodeSelectorRequirement{
+					spotDoesNotExist(),
+					{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
+					{Key: ReservationNameLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"ml-a3-res"}},
+				}},
+			}))
+		})
+
+		It("combines customComputeClass with fallbackReservation on fallback", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				CustomComputeClass: "spot-gpu-class",
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Affinity: workloadsv1.ReservationAffinitySpecific,
+					Name:     "ml-a3-res",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(ComputeClassLabelKey, "spot-gpu-class"))
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
+				{MatchExpressions: []corev1.NodeSelectorRequirement{
+					spotDoesNotExist(),
+					{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
+					{Key: ReservationNameLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"ml-a3-res"}},
+				}},
+			}))
+		})
+
 		It("ignores FallbackReservation when fallback action is Fail", func() {
 			pod := newIncomingPod()
 			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{

@@ -252,6 +252,52 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 			Expect(wcCond.Reason).To(Equal(workloadsv1.ReasonPluginResolutionFailed))
 			Expect(wcCond.Message).To(ContainSubstring("GKESpotPlacementPolicy 'test-spot-policy' is invalid"))
 		})
+
+		It("should enforce CEL validation rules on fallbackReservation", func() {
+			specificNoName := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "cel-specific-no-name"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+						Affinity: workloadsv1.ReservationAffinitySpecific,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, specificNoName)).To(MatchError(ContainSubstring("name is required when affinity is Specific")))
+
+			anyWithName := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "cel-any-with-name"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+						Affinity: workloadsv1.ReservationAffinityAny,
+						Name:     "res-1",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, anyWithName)).To(MatchError(ContainSubstring("name can only be set when affinity is Specific")))
+
+			anyWithProject := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "cel-any-with-project"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+						Affinity: workloadsv1.ReservationAffinityAny,
+						Project:  "shared-host",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, anyWithProject)).To(MatchError(ContainSubstring("project can only be set when affinity is Specific")))
+
+			validSpecific := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "cel-valid-specific"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+						Affinity: workloadsv1.ReservationAffinitySpecific,
+						Name:     "res-1",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, validSpecific)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validSpecific) })
+		})
 	})
 })
 

@@ -115,6 +115,9 @@ spec:
                 - message: name can only be set when affinity is Specific
                   rule: self.affinity == 'Specific' || !has(self.name) || size(self.name)
                     == 0
+                - message: project can only be set when affinity is Specific
+                  rule: self.affinity == 'Specific' || !has(self.project) || size(self.project)
+                    == 0
               reversion:
                 default: {}
                 description: |-

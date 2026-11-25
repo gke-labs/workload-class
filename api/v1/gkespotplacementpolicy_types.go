@@ -82,6 +82,7 @@ const (
 // FallbackReservationPolicy directs Spot-fallback Pods onto GKE reservation capacity during Spot stockouts.
 // +kubebuilder:validation:XValidation:rule="self.affinity != 'Specific' || (has(self.name) && size(self.name) > 0)",message="name is required when affinity is Specific"
 // +kubebuilder:validation:XValidation:rule="self.affinity == 'Specific' || !has(self.name) || size(self.name) == 0",message="name can only be set when affinity is Specific"
+// +kubebuilder:validation:XValidation:rule="self.affinity == 'Specific' || !has(self.project) || size(self.project) == 0",message="project can only be set when affinity is Specific"
 type FallbackReservationPolicy struct {
 	// Affinity selects whether fallback targets any matching reservation ("Any") or a specific named reservation ("Specific").
 	// +kubebuilder:validation:Required
