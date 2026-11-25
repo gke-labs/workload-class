@@ -1,8 +1,14 @@
+# Dedicated namespace without workloads.gke.io/enforced-class so podSelector governs matching Pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multi-replica-sample
+---
 apiVersion: workloads.gke.io/v1
 kind: WorkloadClass
 metadata:
   name: multi-replica-service
-  namespace: sample
+  namespace: multi-replica-sample
 spec:
   podSelector:
     matchLabels:
@@ -32,7 +38,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: multi-replica-demo
-  namespace: sample
+  namespace: multi-replica-sample
 spec:
   replicas: 3
   selector:

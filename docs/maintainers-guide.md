@@ -41,7 +41,7 @@ The manager (`cmd/main.go`) runs four controllers and three admission webhooks i
 
 ### 4. GKE Subject Identity Note
 
-On managed GKE clusters, the control-plane Cluster Autoscaler runs off-cluster and authenticates using client cert / RBAC identity `User: system:cluster-autoscaler` (verify on your cluster via `kubectl get clusterrolebinding -o yaml | grep cluster-autoscaler` or eviction webhook audit logs), whereas self-hosted Cluster Autoscaler deployments authenticate as `ServiceAccount: kube-system/cluster-autoscaler`. Include both entries (or the one matching your cluster) in `allowedDisruptionsOutsideOfWindow`.
+On managed GKE clusters, the control-plane Cluster Autoscaler runs off-cluster and authenticates as `User: system:cluster-autoscaler` (see the GKE Cluster Autoscaler RBAC manifests in [`GoogleCloudPlatform/cluster-autoscaler`](https://github.com/GoogleCloudPlatform/cluster-autoscaler/blob/main/deploy/beta_provisioningrequest_rbac.yaml), which bind `kind: User` / `name: system:cluster-autoscaler`; you can also verify on your cluster via `kubectl get clusterrolebinding -o yaml | grep cluster-autoscaler` or eviction webhook audit logs), whereas self-hosted Cluster Autoscaler deployments authenticate as `ServiceAccount: kube-system/cluster-autoscaler`. Include both entries (or the one matching your cluster) in `allowedDisruptionsOutsideOfWindow`.
 
 ## Adding New CRD Fields Checklist
 

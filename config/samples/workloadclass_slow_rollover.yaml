@@ -1,8 +1,14 @@
+# Dedicated namespace without workloads.gke.io/enforced-class so podSelector governs matching Pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slow-rollover-sample
+---
 apiVersion: workloads.gke.io/v1
 kind: WorkloadClass
 metadata:
   name: slow-rollover-service
-  namespace: sample
+  namespace: slow-rollover-sample
 spec:
   podSelector:
     matchLabels:
@@ -24,7 +30,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: slow-rollover-demo
-  namespace: sample
+  namespace: slow-rollover-sample
 spec:
   replicas: 3
   selector:
