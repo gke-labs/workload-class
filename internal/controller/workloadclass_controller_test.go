@@ -969,6 +969,77 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(validatedCond.Message).To(Equal("WorkloadClass adheres to all Guardrail constraints"))
 		})
 
+		It("should use cache in steady state and retry real envtest 409 conflicts on status and PDB via APIReader", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassReconciler{
+				Client: k8sClient, APIReader: liveReader, Scheme: k8sClient.Scheme(), Recorder: events.NewFakeRecorder(10),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(BeZero())
+
+			staleWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, staleWC)).To(Succeed())
+			staleWC.Spec.DisruptionPolicy.MinInitialRunDurationDays = 1
+			Expect(k8sClient.Update(ctx, staleWC)).To(Succeed())
+			stalePDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, stalePDB)).To(Succeed())
+
+			liveWC := staleWC.DeepCopy()
+			meta.SetStatusCondition(&liveWC.Status.Conditions, metav1.Condition{
+				Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonFallbackActive, Message: "concurrent update",
+				ObservedGeneration: liveWC.Generation, LastTransitionTime: metav1.Now(),
+			})
+			Expect(k8sClient.Status().Update(ctx, liveWC)).To(Succeed())
+			livePDB := stalePDB.DeepCopy()
+			livePDB.Annotations = map[string]string{"test/concurrent": "1"}
+			Expect(k8sClient.Update(ctx, livePDB)).To(Succeed())
+
+			r.Client = &staleCacheClient{Client: k8sClient, stale: []client.Object{staleWC, stalePDB}}
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(2))
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(updatedWC.Status.Conditions, workloadsv1.ConditionTypeInFallback)).To(BeTrue())
+			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessNotReady))
+
+			updatedPDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, updatedPDB)).To(Succeed())
+			Expect(updatedPDB.Annotations).To(HaveKeyWithValue("test/concurrent", "1"))
+			Expect(updatedPDB.Spec.MaxUnavailable.IntVal).To(BeZero())
+		})
+
+		It("should skip stale status update when spec generation changes concurrently", func() {
+			stale := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stale)).To(Succeed())
+			live := stale.DeepCopy()
+			live.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 2
+			Expect(k8sClient.Update(ctx, live)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassReconciler{
+				Client:    &staleCacheClient{Client: k8sClient, stale: []client.Object{stale}},
+				APIReader: liveReader, Scheme: k8sClient.Scheme(), Recorder: events.NewFakeRecorder(10),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(1))
+
+			updated := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(meta.FindStatusCondition(updated.Status.Conditions, workloadsv1.ConditionTypeValidated)).To(BeNil())
+		})
+
 		It("should reject a WorkloadClass that specifies both maxUnavailable and minAvailable", func() {
 			one := intstr.FromInt32(1)
 			two := intstr.FromInt32(2)
@@ -1016,6 +1087,31 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 	})
 })
+
+type staleCacheClient struct {
+	client.Client
+	stale []client.Object
+}
+
+func (c *staleCacheClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	for _, s := range c.stale {
+		if reflect.TypeOf(s) == reflect.TypeOf(obj) && client.ObjectKeyFromObject(s) == key {
+			reflect.ValueOf(obj).Elem().Set(reflect.ValueOf(s.DeepCopyObject()).Elem())
+			return nil
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+type countingReader struct {
+	client.Reader
+	gets int
+}
+
+func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	r.gets++
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
 
 func TestOverdue(t *testing.T) {
 	now := time.Now().UTC()

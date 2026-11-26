@@ -1,0 +1,58 @@
+# Dedicated namespace without workloads.gke.io/enforced-class so podSelector governs matching Pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multi-replica-sample
+---
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: multi-replica-service
+  namespace: multi-replica-sample
+spec:
+  podSelector:
+    matchLabels:
+      app: multi-replica-demo
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+        startTime: "00:00"
+        endTime: "06:00"
+        timeZone: "UTC"
+    minInitialRunDurationDays: 1
+    maxNonDisruptionDurationDays: 14
+    graceTerminationDurationSeconds: 60
+    allowedDisruptionsOutsideOfWindow:
+      # Managed GKE Cluster Autoscaler authenticates as User "system:cluster-autoscaler".
+      - kind: User
+        name: system:cluster-autoscaler
+      # Self-hosted Cluster Autoscaler typically uses ServiceAccount kube-system/cluster-autoscaler.
+      - kind: ServiceAccount
+        name: cluster-autoscaler
+        namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-replica-demo
+  namespace: multi-replica-sample
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: multi-replica-demo
+  template:
+    metadata:
+      labels:
+        app: multi-replica-demo
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
