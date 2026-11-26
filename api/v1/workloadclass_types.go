@@ -90,8 +90,9 @@ type DisruptionPolicy struct {
 	// Supported values are "AlwaysAllow" (default when open) and "IfHealthyBudget".
 	// When MaintenanceReadiness is NotReady (maxUnavailable: 0), Per-Pod PDBs always enforce
 	// "IfHealthyBudget" so unhealthy pods cannot bypass closed disruption windows.
-	// When the WorkloadClass fails guardrail validation or an authorized-subject lease is active,
-	// managed Per-Pod PDBs always force "AlwaysAllow" regardless of this setting.
+	// When the WorkloadClass is not protecting pods (its PDBs are opened due to guardrail violations,
+	// an invalid spec, no guardrails, or selector overlap without guardrails) or an authorized-subject
+	// lease is active, managed Per-Pod PDBs always force "AlwaysAllow" regardless of this setting.
 	// +optional
 	// +kubebuilder:validation:Enum=IfHealthyBudget;AlwaysAllow
 	UnhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType `json:"unhealthyPodEvictionPolicy,omitempty"`
