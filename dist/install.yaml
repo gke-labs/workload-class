@@ -702,6 +702,33 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
+                      userPDBPolicy:
+                        description: |-
+                          UserPDBPolicy defines optional controls over user-authored PodDisruptionBudgets to detect or block
+                          misconfigurations such as zero-disruption budgets and overlapping selectors.
+                        properties:
+                          blockOverlapping:
+                            default: true
+                            description: |-
+                              BlockOverlapping flags user PDBs that co-select at least one active Pod alongside another user PDB in the same namespace.
+                              Defaults to true when mode is Warn or Enforce.
+                            type: boolean
+                          blockZeroDisruption:
+                            default: true
+                            description: |-
+                              BlockZeroDisruption flags user PDBs that statically allow zero evictions (maxUnavailable: 0 / 0% or minAvailable: 100%).
+                              Defaults to true when mode is Warn or Enforce.
+                            type: boolean
+                          mode:
+                            default: Allow
+                            description: 'Mode controls enforcement: Allow (default),
+                              Warn (emit admission warnings), or Enforce (reject).'
+                            enum:
+                            - Allow
+                            - Warn
+                            - Enforce
+                            type: string
+                        type: object
                     required:
                     - maxNonDisruptionDurationDays
                     type: object
