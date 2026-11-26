@@ -108,6 +108,11 @@ spec:
                   rule: '!has(self.minDurationOnFallback) || duration(self.minDurationOnFallback)
                     == duration(''0s'') || self.action == ''Active'''
             type: object
+            x-kubernetes-validations:
+            - message: fallbackAllowedMachineFamilies cannot be used with customComputeClass
+              rule: '!has(self.customComputeClass) || size(self.customComputeClass)
+                == 0 || !has(self.fallbackAllowedMachineFamilies) || size(self.fallbackAllowedMachineFamilies)
+                == 0'
           status:
             description: status defines the observed state of GKESpotPlacementPolicy.
             properties:
