@@ -98,30 +98,35 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 		return nil
 	}
 
-	// Only mutate once the controllers have confirmed the WorkloadClass is valid against guardrails and,
-	// when a GKESpotPlacementPolicy is referenced, that it has attached. The WorkloadClass controller
-	// removes PlacementPluginAttached when there is no InfrastructureProfileRef, so it is only required
-	// when a profile is referenced. A WorkloadClass that is only flagged for an overlapping PodSelector
-	// (SelectorOverlap) is still valid against guardrails, because each Pod resolves to a single best match.
-	// Missing or Unknown conditions are treated as not ready, as are conditions
-	// observed for an older generation: after a spec edit they describe the previous spec until the controllers
-	// reconcile, so mutating on them could apply an unvalidated CapacityStrategy.
-	requiredConds := []string{workloadsv1.ConditionTypeValidated}
-	if usesSpotPolicy {
-		requiredConds = append(requiredConds, workloadsv1.ConditionTypePlacementPluginAttached)
+	// Only mutate once the controllers have confirmed the WorkloadClass placement configuration is valid
+	// against guardrails (using PlacementValidated, falling back to Validated) and, when a
+	// GKESpotPlacementPolicy is referenced, that it has attached. A WorkloadClass that is only flagged for
+	// an overlapping PodSelector (SelectorOverlap) is still valid against guardrails, because each Pod
+	// resolves to a single best match. Missing, Unknown, or stale-generation conditions are treated as not ready.
+	placementCond := utils.PlacementValidatedCondition(bestWLC)
+	switch {
+	case placementCond == nil:
+		log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementValidated)
+		return nil
+	case !utils.IsValidated(placementCond):
+		log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", placementCond.Type, "reason", placementCond.Reason, "message", placementCond.Message)
+		return nil
+	case bestWLC.Generation > 0 && placementCond.ObservedGeneration != bestWLC.Generation:
+		log.Info("WorkloadClass condition is stale; Pod will not be mutated", "condition", placementCond.Type,
+			"observedGeneration", placementCond.ObservedGeneration, "generation", bestWLC.Generation)
+		return nil
 	}
-	for _, cType := range requiredConds {
-		c := meta.FindStatusCondition(bestWLC.Status.Conditions, cType)
+	if usesSpotPolicy {
+		c := meta.FindStatusCondition(bestWLC.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
 		switch {
 		case c == nil:
-			log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", cType)
+			log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementPluginAttached)
 			return nil
-		case cType == workloadsv1.ConditionTypeValidated && !utils.IsValidated(c),
-			cType != workloadsv1.ConditionTypeValidated && c.Status != metav1.ConditionTrue:
-			log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", cType, "reason", c.Reason, "message", c.Message)
+		case c.Status != metav1.ConditionTrue:
+			log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementPluginAttached, "reason", c.Reason, "message", c.Message)
 			return nil
 		case bestWLC.Generation > 0 && c.ObservedGeneration != bestWLC.Generation:
-			log.Info("WorkloadClass condition is stale; Pod will not be mutated", "condition", cType,
+			log.Info("WorkloadClass condition is stale; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementPluginAttached,
 				"observedGeneration", c.ObservedGeneration, "generation", bestWLC.Generation)
 			return nil
 		}

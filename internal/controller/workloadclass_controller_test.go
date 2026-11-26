@@ -790,6 +790,70 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
+		It("should keep disruption protection active when placement validation fails or plugin is pending", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
+				Group: "workloads.gke.io",
+				Kind:  "GKESpotPlacementPolicy",
+				Name:  "missing-spot-profile",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			disruptionCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated)
+			Expect(disruptionCond).NotTo(BeNil())
+			Expect(disruptionCond.Status).To(Equal(metav1.ConditionTrue))
+
+			placementCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementValidated)
+			Expect(placementCond).NotTo(BeNil())
+			Expect(placementCond.Status).To(Equal(metav1.ConditionFalse))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+
+			By("Verifying the Per-Pod PDB is still created and closed despite PlacementValidated=False")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+		})
+
+		It("should keep PlacementValidated=True when only disruption guardrail validation fails", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Exceeds guardrail limit
+			wc.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeSpot}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			disruptionCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated)
+			Expect(disruptionCond).NotTo(BeNil())
+			Expect(disruptionCond.Status).To(Equal(metav1.ConditionFalse))
+
+			placementCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementValidated)
+			Expect(placementCond).NotTo(BeNil())
+			Expect(placementCond.Status).To(Equal(metav1.ConditionTrue))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+		})
+
 		It("should preserve PlacementPluginAttached=True, mark Validated=True, and create PDB when plugin has attached for current generation", func() {
 			By("Updating WorkloadClass with an InfrastructureProfileRef and a PodSelector matching the Pod")
 			wc := &workloadsv1.WorkloadClass{}
