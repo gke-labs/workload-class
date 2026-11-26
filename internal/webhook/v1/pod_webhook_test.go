@@ -115,6 +115,19 @@ var _ = Describe("Pod Webhook", func() {
 			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
 		})
 
+		It("mutates when PlacementValidated is True even if overall Validated is False due to disruption failure", func() {
+			conds := []metav1.Condition{
+				{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+				{Type: workloadsv1.ConditionTypeDisruptionValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+				{Type: workloadsv1.ConditionTypePlacementValidated, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonValidationPassed},
+				{Type: workloadsv1.ConditionTypePlacementPluginAttached, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonProfileResolved},
+			}
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, conds)
+			pod := newIncomingPod()
+			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{})).Default(testCtx, pod)).To(Succeed())
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
+		})
+
 		It("fails open when the GKESpotPlacementPolicy does not exist", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, readyConditions())
 			pod := newIncomingPod()
@@ -230,14 +243,37 @@ var _ = Describe("Pod Webhook", func() {
 	})
 
 	Context("When the WorkloadClass targets OnDemand", func() {
-		It("pins the Pod to On-Demand and strips Spot targeting", func() {
+		It("pins the Pod to On-Demand and strips Spot targeting without inheriting policy CustomComputeClass", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeOnDemand}, readyConditions())
 			pod := newIncomingPod()
 			setNodeSelector(pod, SpotLabelKey, SpotLabelValue)
 			ensureSpotToleration(pod)
-			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{})).Default(testCtx, pod)).To(Succeed())
+			Expect(newDefaulter(wlc, newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})).Default(testCtx, pod)).To(Succeed())
 
 			expectOnDemand(pod)
+			Expect(pod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
+		})
+
+		It("does not inherit policy CustomComputeClass on spotRatio=0 or Reversion=None fallback stickiness", func() {
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "spot-first"})
+
+			ratioZeroPod := newIncomingPod()
+			ratioZeroWC := newWorkloadClass(&workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeSpot, SpotRatio: "0%"}, readyConditions())
+			Expect(newDefaulter(ratioZeroWC, policy).Default(testCtx, ratioZeroPod)).To(Succeed())
+			expectOnDemand(ratioZeroPod)
+			Expect(ratioZeroPod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
+
+			inFallback := append(readyConditions(), metav1.Condition{
+				Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonFallbackActive,
+			})
+			stickyPod := newIncomingPod()
+			stickyWC := newWorkloadClass(&workloadsv1.CapacityStrategy{
+				Type:           workloadsv1.SpotPlacementTypeSpot,
+				FallbackAction: workloadsv1.FallbackActionFallbackToOnDemand,
+			}, inFallback)
+			Expect(newDefaulter(stickyWC, policy).Default(testCtx, stickyPod)).To(Succeed())
+			expectOnDemand(stickyPod)
+			Expect(stickyPod.Spec.NodeSelector).NotTo(HaveKey(ComputeClassLabelKey))
 		})
 	})
 

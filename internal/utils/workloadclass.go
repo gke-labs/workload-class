@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/events"
@@ -246,4 +247,35 @@ func HasGuardrailEmergencyOverride(guardrails []workloadsv1.WorkloadClassGuardra
 		}
 	}
 	return false
+}
+
+// DisruptionValidatedCondition returns the WorkloadClass's DisruptionValidated condition, falling back
+// to the overall Validated condition when DisruptionValidated has not been populated yet.
+func DisruptionValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	if wc == nil {
+		return nil
+	}
+	if cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated); cond != nil {
+		return cond
+	}
+	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
+}
+
+// PlacementValidatedCondition returns the WorkloadClass's PlacementValidated condition.
+// For backwards compatibility with WorkloadClasses reconciled by an older controller that predates
+// per-pillar conditions, it falls back to the overall Validated condition only when DisruptionValidated
+// is also absent. When DisruptionValidated is present and PlacementValidated was intentionally cleared
+// (no capacityStrategy or infrastructureProfileRef), it returns nil so placement checks stay decoupled
+// from disruption guardrail violations.
+func PlacementValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	if wc == nil {
+		return nil
+	}
+	if cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypePlacementValidated); cond != nil {
+		return cond
+	}
+	if meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated) != nil {
+		return nil
+	}
+	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
 }

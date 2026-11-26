@@ -101,6 +101,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	validationCond := validatedCondition(ctx, wc, guardrails, overlapping)
+	disruptionCond := disruptionValidatedCondition(wc, guardrails, overlapping)
 
 	// 1.2 Check for plugin placement attachment conditions
 	changed, removed := false, false
@@ -112,7 +113,17 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		removed = meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
 	}
 
-	// 1.3 If the plugin has not attached, mark the WorkloadClass as not yet validated
+	// 1.3 Compute per-pillar validation conditions and overall Validated rollup.
+	// Disruption and placement pillars are validated independently so a placement failure (or transient
+	// PluginPending) never drops disruption protection, and a disruption guardrail violation does not
+	// disable valid placement configuration.
+	changed = meta.SetStatusCondition(&wc.Status.Conditions, disruptionCond) || changed
+	if placementCond := placementValidatedCondition(ctx, wc, guardrails, pluginPlacementCondition, overlapping); placementCond != nil {
+		changed = meta.SetStatusCondition(&wc.Status.Conditions, *placementCond) || changed
+	} else {
+		removed = meta.RemoveStatusCondition(&wc.Status.Conditions, workloadsv1.ConditionTypePlacementValidated) || removed
+	}
+
 	reconcileConditions(&validationCond, pluginPlacementCondition)
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
@@ -142,8 +153,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
 	// Leases are drained only now, so earlier failures (e.g., status update conflicts) do not discard them.
+	// Per-Pod PDB protection is gated on DisruptionValidated so placement/plugin errors never drop it.
 	pendingLeases := r.LeaseTracker.Drain(req.NamespacedName)
-	leaseRequeue, err := r.reconcilePDBs(ctx, wc, validationCond, hasGuardrails, pendingLeases)
+	leaseRequeue, err := r.reconcilePDBs(ctx, wc, disruptionCond, hasGuardrails, pendingLeases)
 	if err != nil {
 		r.Recorder.Eventf(
 			wc,
@@ -498,7 +510,7 @@ func (r *WorkloadClassReconciler) getPodForPDB(ctx context.Context, namespace st
 // passedValidation returns true if the WorkloadClass' status shows that it protects the Pods it governs (see
 // protectsPods).
 func passedValidation(wc *workloadsv1.WorkloadClass, hasGuardrails bool) bool {
-	cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
+	cond := utils.DisruptionValidatedCondition(wc)
 	return cond != nil && protectsPods(cond.Reason, hasGuardrails)
 }
 
@@ -657,6 +669,9 @@ func addPlacementViolation(validation, placement *metav1.Condition) {
 }
 
 func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
+	if wc == nil {
+		return false
+	}
 	if wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > 0 {
 		maxDuration := time.Duration(wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays) * 24 * time.Hour
 		if wc.Status.LastDisruptionTime != nil {
@@ -664,7 +679,9 @@ func overdue(wc *workloadsv1.WorkloadClass, now time.Time) bool {
 		}
 		return now.Sub(wc.CreationTimestamp.Time) > maxDuration
 	}
-	return true
+	// An unset (0) MaxNonDisruptionDurationDays places no upper bound on how long the workload may remain
+	// undisrupted, so it is never overdue and defers to AllowedDisruptionWindows and lifecycle checks.
+	return false
 }
 
 func evaluatePodGracePeriod(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.Time, gracePeriodsPassed bool, maxDuration time.Duration) (bool, time.Duration) {
@@ -711,20 +728,61 @@ func validatedCondition(
 	guardrails *workloadsv1.WorkloadClassGuardrailList,
 	overlapping []workloadsv1.WorkloadClass,
 ) metav1.Condition {
+	violations := validateSpec(wc)
+	violations = append(violations, validateAgainstGuardrails(wc, guardrails.Items)...)
+	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+	return buildValidationCondition(workloadsv1.ConditionTypeValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+}
+
+func disruptionValidatedCondition(
+	wc *workloadsv1.WorkloadClass,
+	guardrails *workloadsv1.WorkloadClassGuardrailList,
+	overlapping []workloadsv1.WorkloadClass,
+) metav1.Condition {
+	violations := validateSpec(wc)
+	violations = append(violations, validateAgainstGuardrails(wc, guardrails.Items)...)
+	return buildValidationCondition(workloadsv1.ConditionTypeDisruptionValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+}
+
+func placementValidatedCondition(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	guardrails *workloadsv1.WorkloadClassGuardrailList,
+	pluginCond *metav1.Condition,
+	overlapping []workloadsv1.WorkloadClass,
+) *metav1.Condition {
+	if wc.Spec.CapacityStrategy == nil && wc.Spec.InfrastructureProfileRef == nil {
+		return nil
+	}
+	var violations []string
+	if wc.Spec.PodSelector != nil {
+		if _, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
+			violations = append(violations, fmt.Sprintf("`podSelector` must be a valid label selector: %v", err))
+		}
+	}
+	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+	cond := buildValidationCondition(workloadsv1.ConditionTypePlacementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+	reconcileConditions(&cond, pluginCond)
+	return &cond
+}
+
+func buildValidationCondition(
+	condType string,
+	generation int64,
+	violations []string,
+	overlapping []workloadsv1.WorkloadClass,
+	hasGuardrails bool,
+) metav1.Condition {
 	cond := metav1.Condition{
-		Type:               workloadsv1.ConditionTypeValidated,
+		Type:               condType,
 		Status:             metav1.ConditionTrue,
 		Reason:             workloadsv1.ReasonValidationPassed,
 		Message:            validationPassedMsg,
 		LastTransitionTime: metav1.Now(),
-		ObservedGeneration: wc.Generation,
+		ObservedGeneration: generation,
 	}
 
-	violations := validateSpec(wc)
-	violations = append(violations, validateAgainstGuardrails(wc, guardrails.Items)...)
-	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
 	overlapMsg := selectorOverlapMessage(overlapping)
-
 	switch {
 	case len(violations) > 0:
 		if overlapMsg != "" {
@@ -737,7 +795,7 @@ func validatedCondition(
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = workloadsv1.ReasonSelectorOverlap
 		cond.Message = truncateMessage(overlapMsg, maxConditionMessageLen)
-	case len(guardrails.Items) == 0:
+	case !hasGuardrails:
 		cond.Reason = workloadsv1.ReasonNoGuardrails
 		cond.Message = noGuardrailsMsg
 	}
