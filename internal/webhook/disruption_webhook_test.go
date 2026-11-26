@@ -124,6 +124,22 @@ func TestHandle(t *testing.T) {
 		},
 	}
 
+	// wcPlacementFailedOnly failed placement validation (Validated=False), but DisruptionValidated=True so
+	// disruption constraints must remain enforced.
+	wcPlacementFailedOnly := wcOutOfWindow.DeepCopy()
+	wcPlacementFailedOnly.Status.Conditions = []metav1.Condition{
+		{
+			Type:   workloadsv1.ConditionTypeValidated,
+			Status: metav1.ConditionFalse,
+			Reason: workloadsv1.ReasonValidationFailed,
+		},
+		{
+			Type:   workloadsv1.ConditionTypeDisruptionValidated,
+			Status: metav1.ConditionTrue,
+			Reason: workloadsv1.ReasonValidationPassed,
+		},
+	}
+
 	nsNoAnnotation := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "namespace-no-wc",
@@ -275,6 +291,15 @@ func TestHandle(t *testing.T) {
 			getWCResp:       wcSelectorOverlap,
 			readiness:       workloadsv1.ReadinessNotReady,
 			want:            admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcSelectorOverlap.Name)),
+		},
+		{
+			name:            "placementFailedDisruptionStillEnforced",
+			desc:            "Validated=False due to placement, DisruptionValidated=True, not in window, admission Denied",
+			req:             evictionRequestNonMatchingUser,
+			podCreationTime: podNowCreationTime,
+			getWCResp:       wcPlacementFailedOnly,
+			readiness:       workloadsv1.ReadinessNotReady,
+			want:            admission.Denied(fmt.Sprintf("Eviction blocked: currently outside of allowed disruption windows for WorkloadClass %s", wcPlacementFailedOnly.Name)),
 		},
 		{
 			name:            "podIsTooNew",
