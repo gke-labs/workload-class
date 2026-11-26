@@ -1,0 +1,11 @@
+apiVersion: workloads.gke.io/v1
+kind: GKESpotPlacementPolicy
+metadata:
+  name: gke-spot-balanced
+spec:
+  fallbackAllowedMachineFamilies:
+    - e2
+    - n2d
+  reversion:
+    action: Active
+    minDurationOnFallback: 15m
