@@ -153,11 +153,18 @@ func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *wor
 	subject := subjects[0]
 	log := logf.FromContext(ctx).WithValues("pod", pod.Name, "namespace", pod.Namespace, "workloadClass", wc.Name, "subject", subject)
 
+	groupID, useGroupPDB := "", false
+	if utils.IsGroupDisruptionUnit(wc) {
+		groupID, useGroupPDB = utils.PodGroupID(pod, wc.Name, wc.Spec.DisruptionPolicy.GroupLabelKey)
+	}
 	pdbName := utils.PDBName(pod.Name)
+	if useGroupPDB {
+		pdbName = utils.GroupPDBName(wc.Name, groupID)
+	}
 	pdb := &policyv1.PodDisruptionBudget{}
 	if err := v.Client.Get(ctx, client.ObjectKey{Name: pdbName, Namespace: pod.Namespace}, pdb); err != nil {
 		if !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to get Per-Pod PDB, allowing eviction without a lease", "pdb", pdbName)
+			log.Error(err, "Failed to get managed PDB, allowing eviction without a lease", "pdb", pdbName)
 		}
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
@@ -167,22 +174,37 @@ func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *wor
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
 
-	for _, s := range subjects {
-		if utils.SubjectAlreadyLeasing(pdb, pod, s) {
-			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s, PDB %s already leased for this Pod", s, pdbName))
+	if useGroupPDB {
+		for _, s := range subjects {
+			if utils.GroupSubjectAlreadyLeasing(pdb, groupID, s) {
+				return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s, PDB %s already leased for this gang", s, pdbName))
+			}
 		}
-	}
+		if !utils.AllowGroupLease(pdb, groupID) {
+			return admission.Denied(fmt.Sprintf("Eviction blocked: PDB %s has an ongoing lease held by %s that expires at %s",
+				pdbName, pdb.Annotations[utils.BypassOwner], pdb.Annotations[utils.BypassExpiration]))
+		}
+		if utils.IsPDBOpen(pdb) && pdb.Labels[utils.PodGroupLabel] == groupID {
+			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
+		}
+	} else {
+		for _, s := range subjects {
+			if utils.SubjectAlreadyLeasing(pdb, pod, s) {
+				return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s, PDB %s already leased for this Pod", s, pdbName))
+			}
+		}
 
-	if !utils.AllowLease(pdb, pod) {
-		return admission.Denied(fmt.Sprintf("Eviction blocked: PDB %s has an ongoing lease held by %s that expires at %s",
-			pdbName, pdb.Annotations[utils.BypassOwner], pdb.Annotations[utils.BypassExpiration]))
-	}
+		if !utils.AllowLease(pdb, pod) {
+			return admission.Denied(fmt.Sprintf("Eviction blocked: PDB %s has an ongoing lease held by %s that expires at %s",
+				pdbName, pdb.Annotations[utils.BypassOwner], pdb.Annotations[utils.BypassExpiration]))
+		}
 
-	if utils.IsPDBOpen(pdb) && pdb.Labels[utils.PodUIDLabel] == string(pod.UID) {
-		// The PDB for this Pod instance does not block evictions, so no lease is needed. A stale PDB left behind
-		// by a previous Pod with the same name is still leased, since the controller will soon re-sync it for
-		// this Pod and may close it.
-		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
+		if utils.IsPDBOpen(pdb) && pdb.Labels[utils.PodUIDLabel] == string(pod.UID) {
+			// The PDB for this Pod instance does not block evictions, so no lease is needed. A stale PDB left behind
+			// by a previous Pod with the same name is still leased, since the controller will soon re-sync it for
+			// this Pod and may close it.
+			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
+		}
 	}
 
 	if v.LeaseTracker == nil {
