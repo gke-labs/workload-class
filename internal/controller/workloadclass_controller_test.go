@@ -407,6 +407,67 @@ var _ = Describe("WorkloadClass Controller", func() {
 				}
 				return updatedWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue
 			}, "10s", "1s").Should(BeTrue())
+
+			By("Verifying an OverdueForMaintenance Warning event was recorded")
+			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring("OverdueForMaintenance")))
+		})
+
+		It("should requeue at the overdue deadline when it arrives before the next window", func() {
+			notToday := time.Now().AddDate(0, 0, 3).Weekday().String()
+
+			By("Configuring a window 3 days away and a 1-day maxNonDisruptionDurationDays nearly elapsed")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "later", DaysOfWeek: []string{notToday}, StartTime: "10:00", EndTime: "12:00"},
+			}
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 1
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			// 23h55m ago => ~5m until 24h overdue deadline, well before the window 3 days away.
+			wc.Status.LastDisruptionTime = &metav1.Time{Time: time.Now().Add(-23*time.Hour - 55*time.Minute)}
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			By("Reconciling")
+			res, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(res.RequeueAfter).To(BeNumerically("<=", 10*time.Minute))
+		})
+
+		It("should not be overdue and should not emit an event when maxNonDisruptionDurationDays is unset outside a window", func() {
+			notToday := time.Now().UTC().AddDate(0, 0, 3).Weekday().String()
+
+			By("configuring a future disruption window and leaving maxNonDisruptionDurationDays unset (0)")
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "later", DaysOfWeek: []string{notToday}, StartTime: "10:00", EndTime: "12:00"},
+			}
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 0
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Status.LastDisruptionTime = &metav1.Time{Time: time.Now().UTC().AddDate(-1, 0, 0)}
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			// Drain any prior events before reconciling.
+			for len(fakeRecorder.Events) > 0 {
+				<-fakeRecorder.Events
+			}
+
+			By("Reconciling")
+			res, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessNotReady))
+
+			By("Verifying no OverdueForMaintenance event was emitted")
+			Consistently(fakeRecorder.Events, "200ms", "50ms").ShouldNot(Receive(ContainSubstring("OverdueForMaintenance")))
 		})
 
 		It("should not be ready if not within allowed disruption window", func() {
@@ -1021,6 +1082,54 @@ func TestCalculateReadiness_UnsetMaxNonDisruptionDurationRespectsWindow(t *testi
 	}
 	if readiness != workloadsv1.ReadinessNotReady {
 		t.Errorf("calculateReadiness() = %v, want %v when maxNonDisruptionDurationDays is unset outside window", readiness, workloadsv1.ReadinessNotReady)
+	}
+}
+
+func TestTimeUntilOverdue(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	if isOverdue, rem := timeUntilOverdue(nil, now); isOverdue || rem != 0 {
+		t.Errorf("timeUntilOverdue(nil) = (%v, %v), want (false, 0)", isOverdue, rem)
+	}
+
+	wcUnset := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(-1, 0, 0)}},
+		Status: workloadsv1.WorkloadClassStatus{
+			LastDisruptionTime: &metav1.Time{Time: now.AddDate(-1, 0, 0)},
+		},
+	}
+	if isOverdue, rem := timeUntilOverdue(wcUnset, now); isOverdue || rem != 0 {
+		t.Errorf("timeUntilOverdue(unset) = (%v, %v), want (false, 0)", isOverdue, rem)
+	}
+
+	wcWithin := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-48 * time.Hour)}},
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 3},
+		},
+	}
+	if isOverdue, rem := timeUntilOverdue(wcWithin, now); isOverdue || rem != 24*time.Hour {
+		t.Errorf("timeUntilOverdue(within) = (%v, %v), want (false, 24h)", isOverdue, rem)
+	}
+
+	wcPast := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-48 * time.Hour)}},
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+		},
+	}
+	if isOverdue, rem := timeUntilOverdue(wcPast, now); !isOverdue || rem != 0 {
+		t.Errorf("timeUntilOverdue(past) = (%v, %v), want (true, 0)", isOverdue, rem)
+	}
+
+	wcBoundary := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-24 * time.Hour)}},
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 1},
+		},
+	}
+	if isOverdue, rem := timeUntilOverdue(wcBoundary, now); !isOverdue || rem != 0 {
+		t.Errorf("timeUntilOverdue(boundary) = (%v, %v), want (true, 0)", isOverdue, rem)
 	}
 }
 
