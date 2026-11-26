@@ -280,6 +280,37 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 			Expect(k8sClient.Create(ctx, validWithProject)).To(Succeed())
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validWithProject) })
 		})
+
+		It("should reject a GKESpotPlacementPolicy that combines customComputeClass and fallbackAllowedMachineFamilies", func() {
+			policy := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "invalid-ccc-and-families",
+				},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					CustomComputeClass:             "spot-first",
+					FallbackAllowedMachineFamilies: []string{"e2"},
+				},
+			}
+			err := k8sClient.Create(ctx, policy)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("fallbackAllowedMachineFamilies cannot be used with customComputeClass"))
+		})
+
+		It("should surface Validated=False for a legacy stored GKESpotPlacementPolicy combining customComputeClass and fallbackAllowedMachineFamilies", func() {
+			legacy := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "legacy-both", Generation: 1},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					CustomComputeClass:             "spot-first",
+					FallbackAllowedMachineFamilies: []string{"e2"},
+				},
+			}
+			r := &GKESpotPlacementPolicyReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			cond, err := r.validateAgainstGuardrails(ctx, legacy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(workloadsv1.ReasonValidationFailed))
+			Expect(cond.Message).To(ContainSubstring("fallbackAllowedMachineFamilies cannot be used with customComputeClass"))
+		})
 	})
 })
 

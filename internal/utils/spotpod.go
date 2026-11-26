@@ -29,6 +29,10 @@ const (
 	SpotLabelKey = "cloud.google.com/gke-spot"
 	// SpotLabelValue is the value for SpotLabelKey on Spot VM nodes.
 	SpotLabelValue = "true"
+	// ProvisioningLabelKey is the GKE node label indicating provisioning model ("spot" or "standard").
+	ProvisioningLabelKey = "cloud.google.com/gke-provisioning"
+	// ProvisioningSpotValue is the value for ProvisioningLabelKey on Spot VM nodes.
+	ProvisioningSpotValue = "spot"
 	// ReservationAffinityLabelKey is the GKE node label selecting specific reservation consumption.
 	ReservationAffinityLabelKey = "cloud.google.com/reservation-affinity"
 	// ReservationAffinitySpecificValue is the GKE node label value for specific reservations.
@@ -77,14 +81,28 @@ func IsMatchingReservationNode(node *corev1.Node, res *workloadsv1.FallbackReser
 }
 
 // IsPodTargetedForSpot reports whether the Pod has been directed at Spot capacity (by the Pod placement
-// webhook), either via the Spot nodeSelector or the Spot toleration. Pods placed on On-Demand on purpose
-// carry neither.
+// webhook), via the Spot nodeSelector, the Spot toleration, or a required nodeAffinity on
+// cloud.google.com/gke-provisioning In [spot]. Pods placed on On-Demand on purpose carry none of these.
 func IsPodTargetedForSpot(pod *corev1.Pod) bool {
 	if pod == nil {
 		return false
 	}
-	return pod.Spec.NodeSelector[SpotLabelKey] == SpotLabelValue ||
-		slices.ContainsFunc(pod.Spec.Tolerations, IsSpotToleration)
+	if pod.Spec.NodeSelector[SpotLabelKey] == SpotLabelValue ||
+		slices.ContainsFunc(pod.Spec.Tolerations, IsSpotToleration) {
+		return true
+	}
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil ||
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return false
+	}
+	for _, term := range pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == ProvisioningLabelKey && expr.Operator == corev1.NodeSelectorOpIn && slices.Contains(expr.Values, ProvisioningSpotValue) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // IsSpotToleration reports whether t tolerates the GKE Spot NoSchedule taint (gke-spot=true).

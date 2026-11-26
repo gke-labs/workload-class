@@ -210,10 +210,16 @@ var _ = Describe("WorkloadClass Maintenance Readiness", Ordered, func() {
 		})
 
 		It("should evaluate MaintenanceReadiness to Overdue when maxNonDisruptionDurationDays is exceeded", func() {
-			By("Updating the WorkloadClass to trigger an overdue state")
-			patch := `{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "maxNonDisruptionDurationDays": 0}}}`
+			By("Updating the WorkloadClass with a positive maxNonDisruptionDurationDays and an old lastDisruptionTime")
+			patch := `{"spec": {"disruptionPolicy": {"minInitialRunDurationDays": 0, "maxNonDisruptionDurationDays": 1}}}`
 			cmd := exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--type", "merge", "-p", patch)
 			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			oldDisruption := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339)
+			statusPatch := fmt.Sprintf(`{"status": {"lastDisruptionTime": "%s"}}`, oldDisruption)
+			cmd = exec.Command("kubectl", "patch", "workloadclass", "critical-batch", "-n", "sample", "--subresource=status", "--type", "merge", "-p", statusPatch)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Verifying the Guardrail controller reconciles the WorkloadClass and updates its status")
