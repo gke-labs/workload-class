@@ -207,6 +207,11 @@ type WorkloadClassSpec struct {
 	// (such as GKESpotPlacementPolicy) managed by Platform/SRE.
 	// +optional
 	InfrastructureProfileRef *InfrastructureProfileReference `json:"infrastructureProfileRef,omitempty"`
+
+	// ResourceManagement defines how governed workloads start (initial resources), scale horizontally
+	// (autoscaling), and are sized vertically (rightsizing).
+	// +optional
+	ResourceManagement *ResourceManagement `json:"resourceManagement,omitempty"`
 }
 
 // CapacityStrategy defines cloud-agnostic Spot/Preemptible capacity preferences.
@@ -274,6 +279,11 @@ const (
 	// to associate each PDB with a single Pod instance by UID.
 	PodUIDLabel = "workloads.gke.io/pod-uid"
 
+	// InitialResourcesAnnotation is the annotation set on a governed Pod when initial resources are
+	// applied to it at admission. Its value lists what was filled in (for example
+	// "cpu-request,memory-request,memory-limit"), or why the Pod was skipped.
+	InitialResourcesAnnotation = "workloads.gke.io/initial-resources"
+
 	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails across all pillars.
 	ConditionTypeValidated = "Validated"
 
@@ -285,6 +295,11 @@ const (
 	// (capacityStrategy and infrastructureProfileRef) passed guardrail validation and plugin attachment
 	// independently of disruption validation.
 	ConditionTypePlacementValidated = "PlacementValidated"
+
+	// ConditionTypeResourceManagementValidated indicates whether the WorkloadClass resource management
+	// configuration (initialResources, autoscaling and rightsizing) passed spec and guardrail validation
+	// independently of disruption and placement validation.
+	ConditionTypeResourceManagementValidated = "ResourceManagementValidated"
 
 	// ReasonValidationPassed indicates that the WorkloadClass passed all Guardrail checks.
 	ReasonValidationPassed = "ValidationPassed"
@@ -342,6 +357,7 @@ type WorkloadClassStatus struct {
 // +kubebuilder:printcolumn:name="Capacity",type="string",JSONPath=".spec.capacityStrategy.type"
 // +kubebuilder:printcolumn:name="SpotRatio",type="string",JSONPath=".spec.capacityStrategy.spotRatio"
 // +kubebuilder:printcolumn:name="Profile",type="string",JSONPath=".spec.infrastructureProfileRef.name"
+// +kubebuilder:printcolumn:name="Autoscaling",type="string",JSONPath=".status.conditions[?(@.type=='ResourceManagementValidated')].status"
 // +kubebuilder:printcolumn:name="Validated",type="string",JSONPath=".status.conditions[?(@.type=='Validated')].status"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 

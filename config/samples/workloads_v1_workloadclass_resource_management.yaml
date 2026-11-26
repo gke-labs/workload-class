@@ -1,0 +1,67 @@
+# A WorkloadClass that sets all three parts of resource management: initial resources, autoscaling
+# and rightsizing. Rightsizing needs the VerticalPodAutoscaler CRD and components on the cluster.
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: web-services
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      tier: web
+      managed: full
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+    maxNonDisruptionDurationDays: 30
+  resourceManagement:
+    # Initial resources: applied when a governed Pod is created.
+    initialResources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limitPolicy: MemoryEqualsRequest
+      excludeContainers:
+        - istio-proxy
+    # Horizontal scaling: one HPA per governed workload.
+    autoscaling:
+      replicas:
+        min: 2
+        max: 20
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+      profile: Balanced
+    # Rightsizing: one VPA per governed workload.
+    rightsizing:
+      # Off: no rightsizing.
+      # Recommend (default): recommendations only.
+      # OnCreate: apply sizes only when Pods are created.
+      # Auto: also apply sizes to running Pods.
+      mode: Auto
+      # Resources to rightsize. Default is both.
+      resources:
+        - cpu
+        - memory
+      # How Auto applies a new size to a running Pod:
+      # InPlacePreferred (default): resize in place when possible, otherwise recreate the Pod.
+      # Recreate: always recreate the Pod.
+      updateStrategy: InPlacePreferred
+      # Containers that rightsizing leaves alone, such as sidecars.
+      excludeContainers:
+        - istio-proxy
+      # Per-container floor and ceiling.
+      bounds:
+        min:
+          cpu: 100m
+          memory: 128Mi
+        max:
+          cpu: "4"
+          memory: 8Gi

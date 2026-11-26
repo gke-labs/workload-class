@@ -1,0 +1,34 @@
+# A WorkloadClass that only sets autoscaling: one HorizontalPodAutoscaler is created for each
+# governed Deployment or StatefulSet.
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: api-autoscaling
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      tier: api
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+    maxNonDisruptionDurationDays: 30
+  resourceManagement:
+    autoscaling:
+      # Replica bounds for every governed workload.
+      replicas:
+        min: 2
+        max: 20
+      # What to scale on: the upstream autoscaling/v2 metric list, copied into each HPA as written.
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+      # How quickly to scale up and down: Responsive, Balanced (default) or Conservative.
+      profile: Balanced

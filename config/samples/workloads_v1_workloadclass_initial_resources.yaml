@@ -1,0 +1,32 @@
+# A WorkloadClass that only sets initial resources: containers of governed Pods that do not set
+# requests or limits get them filled in when the Pod is created. Values a container already sets
+# are never changed.
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: web-initial-resources
+  namespace: sample
+spec:
+  podSelector:
+    matchLabels:
+      tier: web
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+    maxNonDisruptionDurationDays: 30
+  resourceManagement:
+    initialResources:
+      # Requests for containers that do not set them. Each resource is filled in separately.
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      # MemoryEqualsRequest (default): memory limit = memory request, no CPU limit.
+      # EqualsRequest: CPU and memory limits = requests.
+      # None: leave limits unset.
+      limitPolicy: MemoryEqualsRequest
+      # Containers that initial resources leave alone.
+      excludeContainers:
+        - istio-proxy

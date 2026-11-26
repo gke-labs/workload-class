@@ -61,6 +61,11 @@ type UserPDBPolicy struct {
 type Constraints struct {
 	// Disruption defines the constraints within which WorkloadClasses can set disruption policies.
 	Disruption Disruption `json:"disruption"`
+
+	// ResourceManagement defines the constraints within which WorkloadClasses can set initial resources,
+	// autoscaling and rightsizing.
+	// +optional
+	ResourceManagement *ResourceManagementConstraints `json:"resourceManagement,omitempty"`
 }
 
 // Disruption defines the constraints within which WorkloadClasses can set disruption policies.
