@@ -893,3 +893,34 @@ func TestIsValidated(t *testing.T) {
 		})
 	}
 }
+
+func TestPerPillarValidatedConditionHelpers(t *testing.T) {
+	disruptionTrue := metav1.Condition{Type: workloadsv1.ConditionTypeDisruptionValidated, Status: metav1.ConditionTrue}
+	placementFalse := metav1.Condition{Type: workloadsv1.ConditionTypePlacementValidated, Status: metav1.ConditionFalse}
+	rollupFalse := metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse}
+
+	if DisruptionValidatedCondition(nil) != nil || PlacementValidatedCondition(nil) != nil {
+		t.Fatal("nil WorkloadClass should return nil conditions")
+	}
+
+	wcBoth := &workloadsv1.WorkloadClass{Status: workloadsv1.WorkloadClassStatus{Conditions: []metav1.Condition{rollupFalse, disruptionTrue, placementFalse}}}
+	if got := DisruptionValidatedCondition(wcBoth); got == nil || got.Type != workloadsv1.ConditionTypeDisruptionValidated || got.Status != metav1.ConditionTrue {
+		t.Errorf("DisruptionValidatedCondition() = %+v, want DisruptionValidated=True", got)
+	}
+	if got := PlacementValidatedCondition(wcBoth); got == nil || got.Type != workloadsv1.ConditionTypePlacementValidated || got.Status != metav1.ConditionFalse {
+		t.Errorf("PlacementValidatedCondition() = %+v, want PlacementValidated=False", got)
+	}
+
+	wcLegacy := &workloadsv1.WorkloadClass{Status: workloadsv1.WorkloadClassStatus{Conditions: []metav1.Condition{rollupFalse}}}
+	if got := DisruptionValidatedCondition(wcLegacy); got == nil || got.Type != workloadsv1.ConditionTypeValidated {
+		t.Errorf("DisruptionValidatedCondition(legacy) = %+v, want fallback to Validated", got)
+	}
+	if got := PlacementValidatedCondition(wcLegacy); got == nil || got.Type != workloadsv1.ConditionTypeValidated {
+		t.Errorf("PlacementValidatedCondition(legacy) = %+v, want fallback to Validated", got)
+	}
+
+	wcDisruptionOnly := &workloadsv1.WorkloadClass{Status: workloadsv1.WorkloadClassStatus{Conditions: []metav1.Condition{rollupFalse, disruptionTrue}}}
+	if got := PlacementValidatedCondition(wcDisruptionOnly); got != nil {
+		t.Errorf("PlacementValidatedCondition(disruption-only) = %+v, want nil (no fallback when DisruptionValidated is present)", got)
+	}
+}
