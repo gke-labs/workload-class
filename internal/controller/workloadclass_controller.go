@@ -61,10 +61,6 @@ type WorkloadClassReconciler struct {
 	// event channel and applies the pending leases of a WorkloadClass when reconciling it. If nil, no leases
 	// are applied.
 	LeaseTracker *utils.PendingLeaseTracker
-
-	// DisruptionTracker holds observed disruption timestamps from the disruption webhook. The reconciler watches
-	// its event channel and persists Status.LastDisruptionTime when reconciling the WorkloadClass.
-	DisruptionTracker *utils.DisruptionTracker
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -84,9 +80,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	wc := &workloadsv1.WorkloadClass{}
 	if err := r.Get(ctx, req.NamespacedName, wc); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Discard any pending tracker entries for a deleted WorkloadClass.
+			// Discard any lease requests for a deleted WorkloadClass.
 			r.LeaseTracker.Drain(req.NamespacedName)
-			r.DisruptionTracker.Drain(req.NamespacedName)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -132,33 +127,34 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	reconcileConditions(&validationCond, pluginPlacementCondition)
 	changed = meta.SetStatusCondition(&wc.Status.Conditions, validationCond) || changed
 
-	// 2. Apply any recorded disruption timestamp before calculating readiness so an Overdue WorkloadClass
-	// resets immediately once a disruption occurs. Re-record on error so transient conflicts do not lose it.
-	disruptionUpdated := false
-	lastDisruption, hasDisruption := r.DisruptionTracker.Drain(req.NamespacedName)
-	if hasDisruption && (wc.Status.LastDisruptionTime == nil || lastDisruption.After(wc.Status.LastDisruptionTime.Time)) {
-		wc.Status.LastDisruptionTime = &metav1.Time{Time: lastDisruption}
-		disruptionUpdated = true
+	// 1.4 Advance status.lastDisruptionTime monotonically from the oldest active governed Pod's
+	// CreationTimestamp before calculating readiness. Requiring every active governed Pod to be
+	// newer than the current baseline prevents a single-Pod eviction during an Overdue drain or
+	// upgrade from resetting Overdue and closing the remaining Pods' Per-Pod PDBs.
+	if wc.DeletionTimestamp.IsZero() && utils.IsValidated(&disruptionCond) {
+		matchedPods, err := r.matchedWorkloadPods(ctx, wc)
+		if err != nil {
+			log.Error(err, "Failed to list governed Pods for LastDisruptionTime calculation")
+			return ctrl.Result{}, err
+		}
+		if next, ok := deriveLastDisruptionTime(wc, matchedPods); ok {
+			wc.Status.LastDisruptionTime = next
+			changed = true
+		}
 	}
 
-	// 3. Calculate Readiness
+	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
 	if err != nil {
-		if hasDisruption {
-			r.DisruptionTracker.Record(wc, lastDisruption)
-		}
 		log.Error(err, "Failed to calculate readiness")
 		return ctrl.Result{}, err
 	}
 
-	// 4. Update Status
-	if wc.Status.MaintenanceReadiness != readiness || changed || removed || disruptionUpdated {
+	// 3. Update Status
+	if wc.Status.MaintenanceReadiness != readiness || changed || removed {
 		wc.Status.MaintenanceReadiness = readiness
 		log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
 		if err := r.Status().Update(ctx, wc); err != nil {
-			if hasDisruption {
-				r.DisruptionTracker.Record(wc, lastDisruption)
-			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -559,32 +555,9 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	// Get pods for the next two checks
-	pods := &corev1.PodList{}
-	selector, err := utils.WorkloadClassPodSelector(ctx, r.Client, wc)
+	matchedPods, err := r.matchedWorkloadPods(ctx, wc)
 	if err != nil {
 		return workloadsv1.ReadinessNotReady, 0, err
-	}
-	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return workloadsv1.ReadinessNotReady, 0, err
-	}
-	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
-	if err != nil {
-		return workloadsv1.ReadinessNotReady, 0, err
-	}
-	wcs := &workloadsv1.WorkloadClassList{}
-	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
-		return workloadsv1.ReadinessNotReady, 0, err
-	}
-
-	var matchedPods []corev1.Pod
-	for _, pod := range pods.Items {
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		if bestMatch := utils.BestMatchWorkloadClassForPod(&pod, enforcedWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
-			continue
-		}
-		matchedPods = append(matchedPods, pod)
 	}
 
 	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDurationSeconds)
@@ -617,6 +590,88 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	return workloadsv1.ReadinessReady, nextWindow, nil
+}
+
+// matchedWorkloadPods returns all non-terminal Pods in wc's namespace whose best-match
+// WorkloadClass is wc.
+func (r *WorkloadClassReconciler) matchedWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass) ([]corev1.Pod, error) {
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	if enforcedWC != nil && enforcedWC.Name != wc.Name {
+		return nil, nil
+	}
+
+	selector := labels.Everything()
+	if enforcedWC == nil {
+		if wc.Spec.PodSelector == nil {
+			return nil, nil
+		}
+		s, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid podSelector: %w", err)
+		}
+		selector = s
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, err
+	}
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+		return nil, err
+	}
+
+	var matched []corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
+			continue
+		}
+		matched = append(matched, *pod)
+	}
+	return matched, nil
+}
+
+// deriveLastDisruptionTime derives a monotonic update for wc.Status.LastDisruptionTime from the
+// oldest active governed Pod's CreationTimestamp.
+//
+// It returns (next, true) only when at least one active Pod has a non-zero CreationTimestamp and
+// the oldest such timestamp (truncated to whole seconds to match RFC3339 status serialization) is
+// strictly after the current baseline (wc.Status.LastDisruptionTime if set, otherwise
+// wc.CreationTimestamp). It never moves LastDisruptionTime backwards when adopting older Pods.
+func deriveLastDisruptionTime(wc *workloadsv1.WorkloadClass, pods []corev1.Pod) (*metav1.Time, bool) {
+	if wc == nil {
+		return nil, false
+	}
+	var oldest metav1.Time
+	for i := range pods {
+		pod := &pods[i]
+		if !utils.IsPodActive(pod) || pod.CreationTimestamp.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || pod.CreationTimestamp.Before(&oldest) {
+			oldest = pod.CreationTimestamp
+		}
+	}
+	if oldest.IsZero() {
+		return nil, false
+	}
+
+	baseline := wc.CreationTimestamp
+	if wc.Status.LastDisruptionTime != nil {
+		baseline = *wc.Status.LastDisruptionTime
+	}
+	truncated := metav1.NewTime(oldest.Truncate(time.Second))
+	if !baseline.IsZero() && !truncated.After(baseline.Truncate(time.Second)) {
+		return nil, false
+	}
+	return &truncated, true
 }
 
 // placementPluginCondition returns a PlacementPluginAttached metav1.Condition from the WorkloadClass status if it matches
@@ -1196,10 +1251,6 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.LeaseTracker != nil {
 		// Apply lease requests from the disruption webhook.
 		b = b.WatchesRawSource(source.Channel(r.LeaseTracker.Events(), &handler.EnqueueRequestForObject{}))
-	}
-	if r.DisruptionTracker != nil {
-		// Persist Status.LastDisruptionTime for disruptions observed by the disruption webhook.
-		b = b.WatchesRawSource(source.Channel(r.DisruptionTracker.Events(), &handler.EnqueueRequestForObject{}))
 	}
 
 	return b.Named("workloadclass").Complete(r)

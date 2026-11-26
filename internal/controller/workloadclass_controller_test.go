@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	stderrors "errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -34,7 +33,6 @@ import (
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -2523,88 +2521,191 @@ func TestValidateCapacityStrategy(t *testing.T) {
 	}
 }
 
-func TestReconcile_DisruptionTracker(t *testing.T) {
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, policyv1.AddToScheme, workloadsv1.AddToScheme} {
-		if err := add(scheme); err != nil {
-			t.Fatalf("add scheme: %v", err)
+func TestDeriveLastDisruptionTime(t *testing.T) {
+	base := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	delTime := metav1.NewTime(base.Add(48 * time.Hour))
+
+	makePod := func(name string, created time.Time, phase corev1.PodPhase, terminating bool) corev1.Pod {
+		p := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", CreationTimestamp: metav1.NewTime(created)},
+			Status:     corev1.PodStatus{Phase: phase},
 		}
+		if terminating {
+			p.DeletionTimestamp = &delTime
+		}
+		return p
 	}
 
-	outOfWindowDay := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
-	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-wc"}}
-	newWC := func(lastDisruption *metav1.Time) *workloadsv1.WorkloadClass {
-		return &workloadsv1.WorkloadClass{
-			ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
-			Spec: workloadsv1.WorkloadClassSpec{
-				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "demo"}},
-				DisruptionPolicy: workloadsv1.DisruptionPolicy{
-					MaxNonDisruptionDurationDays: 2,
-					AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
-						{Name: "other-day", DaysOfWeek: []string{outOfWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"},
-					},
-				},
-			},
-			Status: workloadsv1.WorkloadClassStatus{LastDisruptionTime: lastDisruption, MaintenanceReadiness: workloadsv1.ReadinessOverdue},
+	wcWith := func(created time.Time, last *time.Time) *workloadsv1.WorkloadClass {
+		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default", CreationTimestamp: metav1.NewTime(created)}}
+		if last != nil {
+			t := metav1.NewTime(*last)
+			wc.Status.LastDisruptionTime = &t
 		}
+		return wc
 	}
+
+	day2 := base.Add(48 * time.Hour)
+	day3 := base.Add(72 * time.Hour)
+	day4 := base.Add(96 * time.Hour)
+
+	tests := []struct {
+		name     string
+		wc       *workloadsv1.WorkloadClass
+		pods     []corev1.Pod
+		wantOK   bool
+		wantTime time.Time
+	}{
+		{name: "nil_wc", wc: nil, wantOK: false},
+		{name: "no_pods", wc: wcWith(base, nil), wantOK: false},
+		{
+			name:   "only_terminating_and_terminal_pods",
+			wc:     wcWith(base, nil),
+			pods:   []corev1.Pod{makePod("term", day2, corev1.PodRunning, true), makePod("done", day2, corev1.PodSucceeded, false), makePod("fail", day2, corev1.PodFailed, false)},
+			wantOK: false,
+		},
+		{
+			name:   "partial_replacement_keeps_baseline_when_one_old_pod_remains",
+			wc:     wcWith(base, nil),
+			pods:   []corev1.Pod{makePod("old", base, corev1.PodRunning, false), makePod("new", day3, corev1.PodRunning, false)},
+			wantOK: false,
+		},
+		{
+			name:     "all_active_pods_newer_advances_to_oldest_active_pod",
+			wc:       wcWith(base, nil),
+			pods:     []corev1.Pod{makePod("old-terminating", base, corev1.PodRunning, true), makePod("new-1", day3.Add(500*time.Millisecond), corev1.PodRunning, false), makePod("new-2", day4, corev1.PodRunning, false)},
+			wantOK:   true,
+			wantTime: day3,
+		},
+		{
+			name:   "subsecond_difference_does_not_churn",
+			wc:     wcWith(base, &day3),
+			pods:   []corev1.Pod{makePod("same-sec", day3.Add(900*time.Millisecond), corev1.PodRunning, false)},
+			wantOK: false,
+		},
+		{
+			name:   "adopting_older_existing_pods_never_moves_backwards",
+			wc:     wcWith(day3, nil),
+			pods:   []corev1.Pod{makePod("preexisting", base, corev1.PodRunning, false)},
+			wantOK: false,
+		},
+		{
+			name:     "advances_beyond_prior_last_disruption_time",
+			wc:       wcWith(base, &day2),
+			pods:     []corev1.Pod{makePod("rolled-1", day3, corev1.PodRunning, false), makePod("rolled-2", day4, corev1.PodRunning, false)},
+			wantOK:   true,
+			wantTime: day3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := deriveLastDisruptionTime(tc.wc, tc.pods)
+			if ok != tc.wantOK {
+				t.Fatalf("deriveLastDisruptionTime() ok = %v, want %v (got=%v)", ok, tc.wantOK, got)
+			}
+			if ok && !got.Time.Equal(tc.wantTime) {
+				t.Errorf("deriveLastDisruptionTime() = %v, want %v", got.Time, tc.wantTime)
+			}
+		})
+	}
+}
+
+func TestReconcile_OverdueResetsOnlyAfterAllGovernedPodsReplaced(t *testing.T) {
+	sc := newTestScheme(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	tenDaysAgo := now.AddDate(0, 0, -10)
+	notToday := now.AddDate(0, 0, 2).Weekday().String()
+	appLabels := map[string]string{"app": "drain-demo"}
+
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	guardrail := &workloadsv1.WorkloadClassGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{MaxAllowedWindows: 2, MaxNonDisruptionDurationDays: 30}},
+		},
+	}
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: "default", UID: types.UID("wc-uid"), CreationTimestamp: metav1.NewTime(tenDaysAgo)},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: appLabels},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				MaxNonDisruptionDurationDays: 7,
+				AllowedDisruptionWindows:     []workloadsv1.DisruptionWindow{{Name: "other-day", DaysOfWeek: []string{notToday}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"}},
+			},
+		},
+	}
+	pod := func(name string, created time.Time) *corev1.Pod {
+		p := newTestPod(name, appLabels)
+		p.CreationTimestamp = metav1.NewTime(created)
+		p.Status.Phase = corev1.PodRunning
+		return p
+	}
+	p1, p2 := pod("p1", tenDaysAgo), pod("p2", tenDaysAgo)
+	fc := fake.NewClientBuilder().WithScheme(sc).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(ns, guardrail, wc, p1, p2).Build()
+	r := &WorkloadClassReconciler{Client: fc, Scheme: sc, Recorder: events.NewFakeRecorder(10)}
+	wcKey := types.NamespacedName{Namespace: "default", Name: "wc"}
 
-	t.Run("persists_last_disruption_time_and_resets_overdue", func(t *testing.T) {
-		oldTime := metav1.NewTime(time.Now().UTC().AddDate(0, 0, -5))
-		wc := newWC(&oldTime)
-		fc := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(ns, wc).Build()
-		tracker := utils.NewDisruptionTracker(4)
-		disruptionTime := time.Now().UTC().Truncate(time.Second)
-		tracker.Record(wc, disruptionTime)
-
-		r := &WorkloadClassReconciler{Client: fc, Scheme: scheme, Recorder: events.NewFakeRecorder(10), DisruptionTracker: tracker}
-		if _, err := r.Reconcile(t.Context(), req); err != nil {
+	reconcileOnce := func() *workloadsv1.WorkloadClass {
+		t.Helper()
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: wcKey}); err != nil {
 			t.Fatalf("Reconcile() error = %v", err)
 		}
-		updated := &workloadsv1.WorkloadClass{}
-		if err := fc.Get(t.Context(), req.NamespacedName, updated); err != nil {
-			t.Fatalf("Get() error = %v", err)
+		got := &workloadsv1.WorkloadClass{}
+		if err := fc.Get(t.Context(), wcKey, got); err != nil {
+			t.Fatalf("Get(wc) error = %v", err)
 		}
-		if updated.Status.LastDisruptionTime == nil || !updated.Status.LastDisruptionTime.Time.Equal(disruptionTime) {
-			t.Errorf("Status.LastDisruptionTime = %v, want %v", updated.Status.LastDisruptionTime, disruptionTime)
+		return got
+	}
+	assertPDB := func(podName, wantMaxUnavailable string) {
+		t.Helper()
+		pdb := &policyv1.PodDisruptionBudget{}
+		if err := fc.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: utils.PDBName(podName)}, pdb); err != nil {
+			t.Fatalf("Get(pdb %s) error = %v", podName, err)
 		}
-		if updated.Status.MaintenanceReadiness != workloadsv1.ReadinessNotReady {
-			t.Errorf("Status.MaintenanceReadiness = %q, want %q", updated.Status.MaintenanceReadiness, workloadsv1.ReadinessNotReady)
+		if got := pdb.Spec.MaxUnavailable.String(); got != wantMaxUnavailable {
+			t.Errorf("PDB for %s maxUnavailable = %q, want %q", podName, got, wantMaxUnavailable)
 		}
-	})
+	}
 
-	t.Run("re_records_timestamp_when_status_update_fails", func(t *testing.T) {
-		wc := newWC(nil)
-		statusUpdateErr := stderrors.New("simulated conflict")
-		fc := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).WithObjects(ns, wc).
-			WithInterceptorFuncs(interceptor.Funcs{
-				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
-					return statusUpdateErr
-				},
-			}).Build()
-		tracker := utils.NewDisruptionTracker(4)
-		disruptionTime := time.Now().UTC().Truncate(time.Second)
-		tracker.Record(wc, disruptionTime)
+	// 1. Both pods are 10d old (> 7d limit): class is Overdue and both PDBs are open (100%).
+	got := reconcileOnce()
+	if got.Status.MaintenanceReadiness != workloadsv1.ReadinessOverdue || got.Status.LastDisruptionTime != nil {
+		t.Fatalf("step 1: readiness=%q lastDisruption=%v, want Overdue and nil", got.Status.MaintenanceReadiness, got.Status.LastDisruptionTime)
+	}
+	assertPDB("p1", "100%")
+	assertPDB("p2", "100%")
 
-		r := &WorkloadClassReconciler{Client: fc, Scheme: scheme, Recorder: events.NewFakeRecorder(10), DisruptionTracker: tracker}
-		if _, err := r.Reconcile(t.Context(), req); !stderrors.Is(err, statusUpdateErr) {
-			t.Fatalf("Reconcile() error = %v, want %v", err, statusUpdateErr)
-		}
-		if gotTime, ok := tracker.Drain(req.NamespacedName); !ok || !gotTime.Equal(disruptionTime) {
-			t.Errorf("Drain() = (%v, %v), want (%v, true)", gotTime, ok, disruptionTime)
-		}
-	})
+	// 2. Evict/replace p1 only: p2 is still 10d old, so Overdue must remain active and p2's PDB stays open.
+	firstReplacement := now.Add(-time.Minute)
+	if err := fc.Delete(t.Context(), p1); err != nil {
+		t.Fatalf("Delete(p1) error = %v", err)
+	}
+	if err := fc.Create(t.Context(), pod("p1-new", firstReplacement)); err != nil {
+		t.Fatalf("Create(p1-new) error = %v", err)
+	}
+	got = reconcileOnce()
+	if got.Status.MaintenanceReadiness != workloadsv1.ReadinessOverdue || got.Status.LastDisruptionTime != nil {
+		t.Fatalf("step 2 (partial drain): readiness=%q lastDisruption=%v, want Overdue and nil", got.Status.MaintenanceReadiness, got.Status.LastDisruptionTime)
+	}
+	assertPDB("p2", "100%")
+	assertPDB("p1-new", "100%")
 
-	t.Run("discards_pending_disruption_when_workloadclass_not_found", func(t *testing.T) {
-		tracker := utils.NewDisruptionTracker(4)
-		tracker.Record(newWC(nil), time.Now().UTC())
-		r := &WorkloadClassReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), Scheme: scheme, DisruptionTracker: tracker}
-		if _, err := r.Reconcile(t.Context(), req); err != nil {
-			t.Fatalf("Reconcile() error = %v", err)
-		}
-		if _, ok := tracker.Drain(req.NamespacedName); ok {
-			t.Error("expected pending disruption to be discarded when WorkloadClass is NotFound")
-		}
-	})
+	// 3. Evict/replace p2: all active governed pods are now newer than baseline, so LastDisruptionTime
+	// advances to the oldest replacement (p1-new), Overdue resets to NotReady, and both PDBs close.
+	if err := fc.Delete(t.Context(), p2); err != nil {
+		t.Fatalf("Delete(p2) error = %v", err)
+	}
+	if err := fc.Create(t.Context(), pod("p2-new", now)); err != nil {
+		t.Fatalf("Create(p2-new) error = %v", err)
+	}
+	got = reconcileOnce()
+	if got.Status.MaintenanceReadiness != workloadsv1.ReadinessNotReady {
+		t.Errorf("step 3 (drain complete): readiness = %q, want NotReady", got.Status.MaintenanceReadiness)
+	}
+	if got.Status.LastDisruptionTime == nil || !got.Status.LastDisruptionTime.Time.Equal(firstReplacement) {
+		t.Errorf("step 3: lastDisruptionTime = %v, want %v", got.Status.LastDisruptionTime, firstReplacement)
+	}
+	assertPDB("p1-new", "0")
+	assertPDB("p2-new", "0")
 }

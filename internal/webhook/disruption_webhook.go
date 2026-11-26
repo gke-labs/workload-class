@@ -47,11 +47,6 @@ type DisruptionWebhook struct {
 	// LeaseTracker receives Per-Pod PDB lease requests for authorized subjects, which are applied
 	// asynchronously by the WorkloadClass controller. If nil, no leases are requested.
 	LeaseTracker *utils.PendingLeaseTracker
-
-	// DisruptionTracker records observed eviction timestamps for governed WorkloadClasses so the
-	// WorkloadClass controller can persist Status.LastDisruptionTime asynchronously while keeping
-	// the admission webhook read-only. If nil, disruptions are not recorded.
-	DisruptionTracker *utils.DisruptionTracker
 }
 
 // +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods/eviction,verbs=create,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
@@ -97,7 +92,6 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	// Emergency Override
 	if bestWC.Spec.DisruptionPolicy.EmergencyOverride {
-		v.recordDisruption(bestWC)
 		return admission.Allowed("Emergency override active")
 	}
 
@@ -122,7 +116,6 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	// Maintenance Starvation (Override on Overdue)
 	if bestWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
-		v.recordDisruption(bestWC)
 		return admission.Allowed("Workload class is overdue for maintenance, bypassing constraints")
 	}
 
@@ -139,17 +132,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 
-	v.recordDisruption(bestWC)
 	return admission.Allowed("Eviction allowed by WorkloadClass policy")
-}
-
-// recordDisruption queues the current UTC timestamp for asynchronous persistence on
-// WorkloadClass.Status.LastDisruptionTime so MaintenanceReadiness=Overdue resets after disruptions.
-func (v *DisruptionWebhook) recordDisruption(wc *workloadsv1.WorkloadClass) {
-	if v.DisruptionTracker == nil || wc == nil {
-		return
-	}
-	v.DisruptionTracker.Record(wc, time.Now().UTC())
 }
 
 // handleAuthorizedSubject handles an eviction request from a subject listed in the WorkloadClass'
@@ -176,19 +159,16 @@ func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *wor
 		if !apierrors.IsNotFound(err) {
 			log.Error(err, "Failed to get Per-Pod PDB, allowing eviction without a lease", "pdb", pdbName)
 		}
-		v.recordDisruption(wc)
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
 
 	if !utils.IsWorkloadClassManagedPDB(pdb) {
 		// The PDB with this name was not created by a WorkloadClass, so it must not be leased.
-		v.recordDisruption(wc)
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
 
 	for _, s := range subjects {
 		if utils.SubjectAlreadyLeasing(pdb, pod, s) {
-			v.recordDisruption(wc)
 			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s, PDB %s already leased for this Pod", s, pdbName))
 		}
 	}
@@ -202,18 +182,14 @@ func (v *DisruptionWebhook) handleAuthorizedSubject(ctx context.Context, wc *wor
 		// The PDB for this Pod instance does not block evictions, so no lease is needed. A stale PDB left behind
 		// by a previous Pod with the same name is still leased, since the controller will soon re-sync it for
 		// this Pod and may close it.
-		v.recordDisruption(wc)
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
 
 	if v.LeaseTracker == nil {
 		log.Info("No lease tracker configured, allowing eviction without requesting a PDB lease")
-		v.recordDisruption(wc)
 		return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", subject))
 	}
 
-	// Do not record LastDisruptionTime here: the Per-Pod PDB is still closed, so kube-apiserver will reject
-	// this first attempt with 429 TooManyRequests. The retry will hit SubjectAlreadyLeasing above and record it.
 	if !v.LeaseTracker.Enqueue(wc, pod, subject) {
 		log.Info("Lease tracker event channel is full, lease will be applied on the next WorkloadClass reconcile", "pdb", pdbName)
 	}
