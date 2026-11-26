@@ -261,8 +261,17 @@ const (
 	// to associate each PDB with a single Pod instance by UID.
 	PodUIDLabel = "workloads.gke.io/pod-uid"
 
-	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails.
+	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails across all pillars.
 	ConditionTypeValidated = "Validated"
+
+	// ConditionTypeDisruptionValidated indicates whether the WorkloadClass disruption policy passed spec and
+	// guardrail validation independently of placement validation.
+	ConditionTypeDisruptionValidated = "DisruptionValidated"
+
+	// ConditionTypePlacementValidated indicates whether the WorkloadClass placement configuration
+	// (capacityStrategy and infrastructureProfileRef) passed guardrail validation and plugin attachment
+	// independently of disruption validation.
+	ConditionTypePlacementValidated = "PlacementValidated"
 
 	// ReasonValidationPassed indicates that the WorkloadClass passed all Guardrail checks.
 	ReasonValidationPassed = "ValidationPassed"

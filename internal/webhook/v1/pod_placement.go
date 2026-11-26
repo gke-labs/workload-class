@@ -36,7 +36,9 @@ const (
 	// SpotLabelValue is the value for SpotLabelKey on Spot VM nodes.
 	SpotLabelValue = utils.SpotLabelValue
 	// ProvisioningLabelKey is the GKE node label indicating provisioning model ("spot" or "standard").
-	ProvisioningLabelKey = "cloud.google.com/gke-provisioning"
+	ProvisioningLabelKey = utils.ProvisioningLabelKey
+	// ProvisioningSpotValue is the value for ProvisioningLabelKey on Spot VM nodes.
+	ProvisioningSpotValue = utils.ProvisioningSpotValue
 	// MachineFamilyLabelKey is the GKE node label indicating the GCE machine family (e.g., "n2d", "t2d").
 	MachineFamilyLabelKey = "cloud.google.com/machine-family"
 	// ComputeClassLabelKey is the GKE node label / nodeSelector key used to target a Custom Compute Class.
@@ -187,9 +189,21 @@ func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string)
 }
 
 // mutateForOnDemand pins the Pod to On-Demand (non-Spot) nodes.
+// On-Demand paths never inherit a policy's CustomComputeClass (which may only contain Spot priorities).
+// If the Pod itself already selects a GKE Custom Compute Class, it uses
+// cloud.google.com/gke-provisioning NotIn [spot] instead of cloud.google.com/gke-spot DoesNotExist
+// to comply with GKE Warden's ComputeClass selector restrictions, and ensures the matching
+// cloud.google.com/compute-class toleration is present.
 func mutateForOnDemand(pod *corev1.Pod) {
 	delete(pod.Spec.NodeSelector, SpotLabelKey)
 	removeSpotToleration(pod)
+
+	if ccc := ensureComputeClass(pod, nil); ccc != "" {
+		requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
+			{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotNotIn()}},
+		})
+		return
+	}
 
 	requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
 		{MatchExpressions: []corev1.NodeSelectorRequirement{spotDoesNotExist()}},
@@ -201,37 +215,42 @@ func mutateForOnDemand(pod *corev1.Pod) {
 //   - FallbackToOnDemand: the Pod prefers Spot nodes but may fall back to On-Demand nodes. If the
 //     GKESpotPlacementPolicy restricts fallback machine families, On-Demand fallback is limited to them.
 //
-// If a GKESpotPlacementPolicy is provided and specifies a CustomComputeClass, the Pod is also targeted at
-// that class unless it already selects a compute class. spotPolicy may be nil, in which case no
-// GKE-specific refinements are applied.
+// If a GKESpotPlacementPolicy is provided and specifies a CustomComputeClass, the Pod is targeted at
+// that class (with the matching NoSchedule toleration) unless it already selects a compute class.
+// When a Custom Compute Class is active, cloud.google.com/gke-provisioning is used instead of
+// cloud.google.com/gke-spot and machine-family selectors are omitted to comply with GKE Warden.
 func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, spotPolicy *workloadsv1.GKESpotPlacementPolicy) {
-	var ccc string
 	var families []string
 	if spotPolicy != nil {
-		ccc = spotPolicy.Spec.CustomComputeClass
 		families = spotPolicy.Spec.FallbackAllowedMachineFamilies
 	}
 
 	ensureSpotToleration(pod)
-
-	if ccc != "" {
-		if _, ok := pod.Spec.NodeSelector[ComputeClassLabelKey]; !ok {
-			setNodeSelector(pod, ComputeClassLabelKey, ccc)
-		}
-	}
+	ccc := ensureComputeClass(pod, spotPolicy)
 
 	if fallbackAction == workloadsv1.FallbackActionFail {
+		if ccc != "" {
+			delete(pod.Spec.NodeSelector, SpotLabelKey)
+			requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{provisioningSpotIn()}},
+			})
+			return
+		}
 		setNodeSelector(pod, SpotLabelKey, SpotLabelValue)
 		return
 	}
 
 	// FallbackToOnDemand: prefer Spot capacity, allow On-Demand fallback.
+	spotPref := spotIn()
+	if ccc != "" {
+		spotPref = provisioningSpotIn()
+	}
 	addPreferredSchedulingTerm(pod, corev1.PreferredSchedulingTerm{
 		Weight:     100,
-		Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
+		Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{spotPref}},
 	})
 
-	if len(families) > 0 {
+	if len(families) > 0 && ccc == "" {
 		// Spot nodes of any family, OR On-Demand nodes of an allowed family.
 		requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
 			{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
@@ -243,6 +262,39 @@ func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, s
 	}
 }
 
+// ensureComputeClass applies spotPolicy.Spec.CustomComputeClass if the Pod does not already select a
+// compute class, ensures the matching cloud.google.com/compute-class NoSchedule toleration is present,
+// and returns the active compute class name (or "" if none is selected).
+func ensureComputeClass(pod *corev1.Pod, spotPolicy *workloadsv1.GKESpotPlacementPolicy) string {
+	ccc := pod.Spec.NodeSelector[ComputeClassLabelKey]
+	if ccc == "" && spotPolicy != nil && spotPolicy.Spec.CustomComputeClass != "" {
+		ccc = spotPolicy.Spec.CustomComputeClass
+		setNodeSelector(pod, ComputeClassLabelKey, ccc)
+	}
+	if ccc != "" {
+		ensureComputeClassToleration(pod, ccc)
+	}
+	return ccc
+}
+
+// ensureComputeClassToleration idempotently ensures the Pod has a NoSchedule toleration matching
+// cloud.google.com/compute-class=<ccc>, replacing any prior toleration for ComputeClassLabelKey.
+func ensureComputeClassToleration(pod *corev1.Pod, ccc string) {
+	filtered := pod.Spec.Tolerations[:0]
+	for _, t := range pod.Spec.Tolerations {
+		if t.Key == ComputeClassLabelKey {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	pod.Spec.Tolerations = append(filtered, corev1.Toleration{
+		Key:      ComputeClassLabelKey,
+		Operator: corev1.TolerationOpEqual,
+		Value:    ccc,
+		Effect:   corev1.TaintEffectNoSchedule,
+	})
+}
+
 // spotIn returns a node selector requirement matching Spot nodes (gke-spot In [true]).
 func spotIn() corev1.NodeSelectorRequirement {
 	return corev1.NodeSelectorRequirement{Key: SpotLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{SpotLabelValue}}
@@ -251,6 +303,18 @@ func spotIn() corev1.NodeSelectorRequirement {
 // spotDoesNotExist returns a node selector requirement matching non-Spot nodes (gke-spot DoesNotExist).
 func spotDoesNotExist() corev1.NodeSelectorRequirement {
 	return corev1.NodeSelectorRequirement{Key: SpotLabelKey, Operator: corev1.NodeSelectorOpDoesNotExist}
+}
+
+// provisioningSpotIn returns a node selector requirement matching Spot nodes via gke-provisioning,
+// which is permitted by GKE Warden alongside cloud.google.com/compute-class.
+func provisioningSpotIn() corev1.NodeSelectorRequirement {
+	return corev1.NodeSelectorRequirement{Key: ProvisioningLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{ProvisioningSpotValue}}
+}
+
+// provisioningSpotNotIn returns a node selector requirement matching non-Spot nodes via gke-provisioning,
+// which is permitted by GKE Warden alongside cloud.google.com/compute-class.
+func provisioningSpotNotIn() corev1.NodeSelectorRequirement {
+	return corev1.NodeSelectorRequirement{Key: ProvisioningLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{ProvisioningSpotValue}}
 }
 
 // setNodeSelector sets key=value in the Pod's nodeSelector, initializing the map if needed.
