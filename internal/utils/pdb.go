@@ -130,9 +130,9 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pd
 		},
 	}
 
-	// IfHealthyBudget will block evictions of unhealthy Pods if there is no budget.
-	policy := policyv1.IfHealthyBudget
-	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
+	// MinAvailable and MaxUnavailable are mutually exclusive; clear MinAvailable so external edits
+	// cannot leave the PDB in an invalid state.
+	pdb.Spec.MinAvailable = nil
 
 	open := &intstr.IntOrString{
 		Type:   openType,
@@ -145,6 +145,8 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pd
 
 	if !isValid {
 		pdb.Spec.MaxUnavailable = open
+		policy := policyv1.AlwaysAllow
+		pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 		return nil
 	}
 
@@ -159,6 +161,18 @@ func SyncPDBWithWorkloadClass(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, pd
 	} else {
 		pdb.Spec.MaxUnavailable = closed
 	}
+
+	// When the Per-Pod PDB is closed (maxUnavailable: 0), always enforce IfHealthyBudget so unhealthy
+	// pods cannot bypass closed disruption windows. When open (Ready/Overdue), default to AlwaysAllow
+	// to prevent single-pod Per-Pod PDB deadlocks on unhealthy pods, while honoring explicit overrides.
+	policy := policyv1.IfHealthyBudget
+	if pdb.Spec.MaxUnavailable == open {
+		policy = policyv1.AlwaysAllow
+		if wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy != nil && *wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy != "" {
+			policy = *wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy
+		}
+	}
+	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
 	return nil
 }
@@ -299,7 +313,9 @@ func PDBWithLease(pdb *policyv1.PodDisruptionBudget, pod *corev1.Pod, subject wo
 		},
 	}
 
-	policy := policyv1.IfHealthyBudget
+	pdb.Spec.MinAvailable = nil
+
+	policy := policyv1.AlwaysAllow
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
 	pdb.Spec.MaxUnavailable = &intstr.IntOrString{

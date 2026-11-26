@@ -17,7 +17,9 @@ limitations under the License.
 package v1
 
 import (
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // SpotPlacementType specifies the desired compute provisioning model for a workload.
@@ -46,6 +48,9 @@ const (
 )
 
 // DisruptionPolicy specifies the policy governing pod disruptions.
+// +kubebuilder:validation:XValidation:rule="!(has(self.maxUnavailable) && has(self.minAvailable))",message="maxUnavailable and minAvailable are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxUnavailable) || (type(self.maxUnavailable) == int ? self.maxUnavailable >= 0 : self.maxUnavailable.matches('^(100|[1-9]?[0-9])%$'))",message="maxUnavailable must be a non-negative integer or a percentage string between 0% and 100%"
+// +kubebuilder:validation:XValidation:rule="!has(self.minAvailable) || (type(self.minAvailable) == int ? self.minAvailable >= 0 : self.minAvailable.matches('^(100|[1-9]?[0-9])%$'))",message="minAvailable must be a non-negative integer or a percentage string between 0% and 100%"
 type DisruptionPolicy struct {
 	// AllowedDisruptionWindows defines when disruptions are allowed.
 	// When unset or empty, disruptions are allowed at all times on all days of the week.
@@ -83,6 +88,35 @@ type DisruptionPolicy struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// UnhealthyPodEvictionPolicy specifies how unhealthy (non-Ready) pods are evicted during an open
+	// disruption window or when MaintenanceReadiness is Overdue.
+	// Supported values are "AlwaysAllow" (default when open) and "IfHealthyBudget".
+	// When MaintenanceReadiness is NotReady (maxUnavailable: 0), Per-Pod PDBs always enforce
+	// "IfHealthyBudget" so unhealthy pods cannot bypass closed disruption windows.
+	// +optional
+	// +kubebuilder:validation:Enum=IfHealthyBudget;AlwaysAllow
+	UnhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType `json:"unhealthyPodEvictionPolicy,omitempty"`
+
+	// MaxUnavailable limits how many governed Pods may be concurrently unavailable during disruptions
+	// (an integer such as 1, or a percentage string such as "25%"). Mutually exclusive with MinAvailable.
+	// When neither MaxUnavailable nor MinAvailable is set, in-window pacing is disabled.
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+
+	// MinAvailable specifies the minimum number or percentage of governed Pods that must remain
+	// Ready during disruptions (e.g., 2 or "75%"). Mutually exclusive with MaxUnavailable.
+	// +optional
+	MinAvailable *intstr.IntOrString `json:"minAvailable,omitempty"`
+
+	// DisruptionStuckThresholdSeconds is the number of seconds an in-window eviction may remain
+	// blocked by the pacing budget before break-glass allows it to proceed. Defaults to 120 when unset.
+	// Set to 0 to disable break-glass (strict budget enforcement with no timeout override, e.g., for quorum systems).
+	// Does not apply to automated actors bypassing windows via allowedDisruptionsOutsideOfWindow.
+	// +optional
+	// +kubebuilder:default=120
+	// +kubebuilder:validation:Minimum=0
+	DisruptionStuckThresholdSeconds *int32 `json:"disruptionStuckThresholdSeconds,omitempty"`
 }
 
 // DisruptionWindow defines a temporal window when disruptions are allowed.
@@ -227,8 +261,17 @@ const (
 	// to associate each PDB with a single Pod instance by UID.
 	PodUIDLabel = "workloads.gke.io/pod-uid"
 
-	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails.
+	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails across all pillars.
 	ConditionTypeValidated = "Validated"
+
+	// ConditionTypeDisruptionValidated indicates whether the WorkloadClass disruption policy passed spec and
+	// guardrail validation independently of placement validation.
+	ConditionTypeDisruptionValidated = "DisruptionValidated"
+
+	// ConditionTypePlacementValidated indicates whether the WorkloadClass placement configuration
+	// (capacityStrategy and infrastructureProfileRef) passed guardrail validation and plugin attachment
+	// independently of disruption validation.
+	ConditionTypePlacementValidated = "PlacementValidated"
 
 	// ReasonValidationPassed indicates that the WorkloadClass passed all Guardrail checks.
 	ReasonValidationPassed = "ValidationPassed"

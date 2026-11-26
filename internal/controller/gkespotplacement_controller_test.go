@@ -75,6 +75,13 @@ func TestGKESpotPlacementReconciler_Reconcile(t *testing.T) {
 		{name: "validated without a profile ref", wc: gkeSpotWC(nil, trueCondition(workloadsv1.ConditionTypeValidated))},
 	}
 
+	if !isReady(gkeSpotWC(nil,
+		metav1.Condition{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+		trueCondition(workloadsv1.ConditionTypePlacementValidated),
+	)) {
+		t.Errorf("isReady() = false when PlacementValidated=True and overall Validated=False, want true")
+	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			var objs []client.Object

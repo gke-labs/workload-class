@@ -90,6 +90,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 		},
 	}
 	ifHealthy := policyv1.IfHealthyBudget
+	alwaysAllow := policyv1.AlwaysAllow
 
 	tests := []struct {
 		name               string
@@ -130,7 +131,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "maintenance_readiness_ready",
+			name: "maintenance_readiness_ready_defaults_to_always_allow",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -145,14 +146,38 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			isValid:            true,
 			wantErr:            false,
 			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
-			wantUnhealthyEvict: &ifHealthy,
+			wantUnhealthyEvict: &alwaysAllow,
 		},
 		{
-			name: "maintenance_readiness_not_ready_clears_lease_annotations",
+			name: "maintenance_readiness_ready_honors_explicit_if_healthy_budget",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
 					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						UnhealthyPodEvictionPolicy: &ifHealthy,
+					},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					MaintenanceReadiness: workloadsv1.ReadinessReady,
+				},
+			},
+			pod:                testPod,
+			pdb:                &policyv1.PodDisruptionBudget{},
+			isValid:            true,
+			wantErr:            false,
+			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
+			wantUnhealthyEvict: &ifHealthy,
+		},
+		{
+			name: "maintenance_readiness_not_ready_forces_if_healthy_budget_and_clears_lease_annotations",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						UnhealthyPodEvictionPolicy: &alwaysAllow,
+					},
 				},
 				Status: workloadsv1.WorkloadClassStatus{
 					MaintenanceReadiness: workloadsv1.ReadinessNotReady,
@@ -174,7 +199,7 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			wantUnhealthyEvict: &ifHealthy,
 		},
 		{
-			name: "maintenance_readiness_overdue",
+			name: "maintenance_readiness_overdue_defaults_to_always_allow",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
 				Spec: workloadsv1.WorkloadClassSpec{
@@ -189,12 +214,17 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			isValid:            true,
 			wantErr:            false,
 			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
-			wantUnhealthyEvict: &ifHealthy,
+			wantUnhealthyEvict: &alwaysAllow,
 		},
 		{
-			name: "invalid_workload_class_opens_pdb_to_100_percent",
+			name: "invalid_workload_class_opens_pdb_to_100_percent_and_always_allow",
 			wc: &workloadsv1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						UnhealthyPodEvictionPolicy: &ifHealthy,
+					},
+				},
 				Status: workloadsv1.WorkloadClassStatus{
 					MaintenanceReadiness: workloadsv1.ReadinessNotReady,
 				},
@@ -204,7 +234,26 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			isValid:            false,
 			wantErr:            false,
 			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
-			wantUnhealthyEvict: &ifHealthy,
+			wantUnhealthyEvict: &alwaysAllow,
+		},
+		{
+			name: "clears_externally_set_min_available",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: "default"},
+				Status: workloadsv1.WorkloadClassStatus{
+					MaintenanceReadiness: workloadsv1.ReadinessReady,
+				},
+			},
+			pod: testPod,
+			pdb: &policyv1.PodDisruptionBudget{
+				Spec: policyv1.PodDisruptionBudgetSpec{
+					MinAvailable: func() *intstr.IntOrString { v := intstr.FromInt32(1); return &v }(),
+				},
+			},
+			isValid:            true,
+			wantErr:            false,
+			wantMaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
+			wantUnhealthyEvict: &alwaysAllow,
 		},
 	}
 
@@ -216,6 +265,9 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 				return
 			}
 			if !tt.wantErr {
+				if tt.pdb.Spec.MinAvailable != nil {
+					t.Errorf("SyncPDBWithWorkloadClass() MinAvailable = %v, want nil", tt.pdb.Spec.MinAvailable)
+				}
 				if !reflect.DeepEqual(tt.pdb.Spec.MaxUnavailable, tt.wantMaxUnavailable) {
 					t.Errorf("SyncPDBWithWorkloadClass() MaxUnavailable = %v, want %v", tt.pdb.Spec.MaxUnavailable, tt.wantMaxUnavailable)
 				}
@@ -549,7 +601,7 @@ func TestPDBWithLease(t *testing.T) {
 				if tt.pdb.Labels[PodUIDLabel] != string(tt.pod.UID) {
 					t.Errorf("PDBWithLease() Labels[%s] = %q, want %q", PodUIDLabel, tt.pdb.Labels[PodUIDLabel], tt.pod.UID)
 				}
-				wantPolicy := policyv1.IfHealthyBudget
+				wantPolicy := policyv1.AlwaysAllow
 				if tt.pdb.Spec.UnhealthyPodEvictionPolicy == nil || *tt.pdb.Spec.UnhealthyPodEvictionPolicy != wantPolicy {
 					t.Errorf("PDBWithLease() UnhealthyPodEvictionPolicy = %v, want %v", tt.pdb.Spec.UnhealthyPodEvictionPolicy, wantPolicy)
 				}

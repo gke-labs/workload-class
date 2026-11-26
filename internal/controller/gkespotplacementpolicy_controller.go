@@ -107,6 +107,15 @@ func (r *GKESpotPlacementPolicyReconciler) validateAgainstGuardrails(ctx context
 		return metav1.Condition{}, err
 	}
 
+	if spotPolicy.Spec.CustomComputeClass != "" && len(spotPolicy.Spec.FallbackAllowedMachineFamilies) > 0 {
+		// Surface incompatible legacy policies persisted before the CEL rule took effect.
+		guardrailViolations := validateSpotPolicyAgainstGuardrails(spotPolicy, guardrails.Items)
+		violations := make([]string, 0, 1+len(guardrailViolations))
+		violations = append(violations, "fallbackAllowedMachineFamilies cannot be used with customComputeClass")
+		violations = append(violations, guardrailViolations...)
+		return condition(spotPolicy.Generation, violations), nil
+	}
+
 	if len(guardrails.Items) == 0 {
 		return metav1.Condition{
 			Type:               workloadsv1.ConditionTypeValidated,
