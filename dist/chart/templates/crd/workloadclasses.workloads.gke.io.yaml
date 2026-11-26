@@ -225,6 +225,17 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  unhealthyPodEvictionPolicy:
+                    description: |-
+                      UnhealthyPodEvictionPolicy specifies how unhealthy (non-Ready) pods are evicted during an open
+                      disruption window or when MaintenanceReadiness is Overdue.
+                      Supported values are "AlwaysAllow" (default when open) and "IfHealthyBudget".
+                      When MaintenanceReadiness is NotReady (maxUnavailable: 0), Per-Pod PDBs always enforce
+                      "IfHealthyBudget" so unhealthy pods cannot bypass closed disruption windows.
+                    enum:
+                    - IfHealthyBudget
+                    - AlwaysAllow
+                    type: string
                 type: object
               infrastructureProfileRef:
                 description: |-
