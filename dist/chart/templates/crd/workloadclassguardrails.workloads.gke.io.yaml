@@ -111,6 +111,111 @@ spec:
                     required:
                     - maxNonDisruptionDurationDays
                     type: object
+                  resourceManagement:
+                    description: ResourceManagement defines the constraints within
+                      which WorkloadClasses can set autoscaling and rightsizing.
+                    properties:
+                      allowedAutoscalingProfiles:
+                        description: |-
+                          AllowedAutoscalingProfiles lists the autoscaling profiles that WorkloadClasses may use. Empty allows all
+                          profiles.
+                        items:
+                          description: AutoscalingProfile selects how quickly autoscaled
+                            workloads scale up and down.
+                          enum:
+                          - Responsive
+                          - Balanced
+                          - Conservative
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedMetricTypes:
+                        description: |-
+                          AllowedMetricTypes lists the HorizontalPodAutoscaler metric types that WorkloadClasses may use. Empty allows
+                          all metric types.
+                        items:
+                          description: MetricSourceType indicates the type of metric.
+                          enum:
+                          - Object
+                          - Pods
+                          - Resource
+                          - ContainerResource
+                          - External
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedRightsizingModes:
+                        description: |-
+                          AllowedRightsizingModes lists the rightsizing modes that WorkloadClasses may use. Empty allows all modes.
+                          Quote "Off" in YAML, where an unquoted Off is read as a boolean.
+                        items:
+                          description: RightsizingMode selects whether and when rightsizing
+                            applies new container sizes.
+                          enum:
+                          - "Off"
+                          - Recommend
+                          - OnCreate
+                          - Auto
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedUpdateStrategies:
+                        description: |-
+                          AllowedUpdateStrategies lists the update strategies that WorkloadClasses may use with the Auto rightsizing
+                          mode. Empty allows all strategies. Note that InPlacePreferred alone can still recreate a Pod.
+                        items:
+                          description: RightsizingUpdateStrategy selects how the Auto
+                            rightsizing mode applies a new size to a running Pod.
+                          enum:
+                          - InPlacePreferred
+                          - Recreate
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      containerBounds:
+                        description: |-
+                          ContainerBounds is the widest per-container range that rightsizing may use. A WorkloadClass's rightsizing
+                          bounds must sit inside it, and it applies where a WorkloadClass sets none. Unset means no limit.
+                        properties:
+                          max:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Max is the per-container ceiling, by resource.
+                            maxProperties: 2
+                            type: object
+                            x-kubernetes-validations:
+                            - message: only cpu and memory are supported
+                              rule: self.all(r, r == 'cpu' || r == 'memory')
+                          min:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Min is the per-container floor, by resource.
+                            maxProperties: 2
+                            type: object
+                            x-kubernetes-validations:
+                            - message: only cpu and memory are supported
+                              rule: self.all(r, r == 'cpu' || r == 'memory')
+                        type: object
+                        x-kubernetes-validations:
+                        - message: min must not exceed max for any resource
+                          rule: '!has(self.min) || !has(self.max) || self.min.all(r,
+                            !(r in self.max) || quantity(string(self.min[r])).compareTo(quantity(string(self.max[r])))
+                            <= 0)'
+                      maxReplicas:
+                        description: MaxReplicas is the upper limit on any WorkloadClass's
+                          autoscaling replicas.max. Unset means no limit.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
                 required:
                 - disruption
                 type: object

@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -61,6 +62,50 @@ type UserPDBPolicy struct {
 type Constraints struct {
 	// Disruption defines the constraints within which WorkloadClasses can set disruption policies.
 	Disruption Disruption `json:"disruption"`
+
+	// ResourceManagement defines the constraints within which WorkloadClasses can set autoscaling and rightsizing.
+	// +optional
+	ResourceManagement *ResourceManagementConstraints `json:"resourceManagement,omitempty"`
+}
+
+// ResourceManagementConstraints defines the constraints within which WorkloadClasses can set autoscaling and
+// rightsizing. When several guardrails apply to a WorkloadClass, the strictest value wins. Unset constraints
+// don't restrict WorkloadClasses.
+type ResourceManagementConstraints struct {
+	// AllowedRightsizingModes lists the rightsizing modes that WorkloadClasses may use. Empty allows all modes.
+	// Quote "Off" in YAML, where an unquoted Off is read as a boolean.
+	// +optional
+	// +listType=set
+	AllowedRightsizingModes []RightsizingMode `json:"allowedRightsizingModes,omitempty"`
+
+	// AllowedUpdateStrategies lists the update strategies that WorkloadClasses may use with the Auto rightsizing
+	// mode. Empty allows all strategies. Note that InPlacePreferred alone can still recreate a Pod.
+	// +optional
+	// +listType=set
+	AllowedUpdateStrategies []RightsizingUpdateStrategy `json:"allowedUpdateStrategies,omitempty"`
+
+	// MaxReplicas is the upper limit on any WorkloadClass's autoscaling replicas.max. Unset means no limit.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+
+	// AllowedAutoscalingProfiles lists the autoscaling profiles that WorkloadClasses may use. Empty allows all
+	// profiles.
+	// +optional
+	// +listType=set
+	AllowedAutoscalingProfiles []AutoscalingProfile `json:"allowedAutoscalingProfiles,omitempty"`
+
+	// AllowedMetricTypes lists the HorizontalPodAutoscaler metric types that WorkloadClasses may use. Empty allows
+	// all metric types.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:Enum=Object;Pods;Resource;ContainerResource;External
+	AllowedMetricTypes []autoscalingv2.MetricSourceType `json:"allowedMetricTypes,omitempty"`
+
+	// ContainerBounds is the widest per-container range that rightsizing may use. A WorkloadClass's rightsizing
+	// bounds must sit inside it, and it applies where a WorkloadClass sets none. Unset means no limit.
+	// +optional
+	ContainerBounds *ContainerBounds `json:"containerBounds,omitempty"`
 }
 
 // Disruption defines the constraints within which WorkloadClasses can set disruption policies.

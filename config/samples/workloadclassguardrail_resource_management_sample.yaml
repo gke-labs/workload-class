@@ -1,0 +1,30 @@
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClassGuardrail
+metadata:
+  name: resource-management
+spec:
+  constraints:
+    disruption:
+      maxNonDisruptionDurationDays: 30
+    # Limits on the autoscaling and rightsizing that WorkloadClasses may request.
+    # When several guardrails apply, the strictest value wins.
+    resourceManagement:
+      # Rightsizing modes that classes may use. Quote "Off": unquoted, YAML reads it as a boolean.
+      allowedRightsizingModes: ["Off", Recommend, OnCreate, Auto]
+      # Update strategies that classes may use with the Auto mode.
+      allowedUpdateStrategies: [InPlacePreferred]
+      # Upper limit on any class's replicas.max.
+      maxReplicas: 100
+      # Autoscaling profiles that classes may use.
+      allowedAutoscalingProfiles: [Balanced, Conservative]
+      # HorizontalPodAutoscaler metric types that classes may use.
+      allowedMetricTypes: [Resource, Pods, External]
+      # Widest per-container range that rightsizing may use. A class's bounds must sit inside it,
+      # and it applies where a class sets none.
+      containerBounds:
+        min:
+          cpu: 10m
+          memory: 32Mi
+        max:
+          cpu: "16"
+          memory: 64Gi
