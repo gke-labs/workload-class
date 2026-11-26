@@ -207,7 +207,7 @@ func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *cor
 	)
 	getCounts := func() (existingPodCounts, error) {
 		if !countsLoaded {
-			counts, countsErr = d.countWorkloadClassPods(ctx, pod, wlc)
+			counts, countsErr = d.countWorkloadClassPods(ctx, pod, wlc, spotPolicy)
 			countsLoaded = true
 		}
 		return counts, countsErr

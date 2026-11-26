@@ -41,12 +41,18 @@ const (
 	MachineFamilyLabelKey = "cloud.google.com/machine-family"
 	// ComputeClassLabelKey is the GKE node label / nodeSelector key used to target a Custom Compute Class.
 	ComputeClassLabelKey = "cloud.google.com/compute-class"
-	// ReservationAffinityLabelKey is the GKE node label selecting reservation consumption mode ("any" or "specific").
-	ReservationAffinityLabelKey = "cloud.google.com/reservation-affinity"
+	// ReservationAffinityLabelKey is the GKE node label selecting specific reservation consumption.
+	ReservationAffinityLabelKey = utils.ReservationAffinityLabelKey
 	// ReservationNameLabelKey is the GKE node label selecting a specific GCE reservation by name.
-	ReservationNameLabelKey = "cloud.google.com/reservation-name"
+	ReservationNameLabelKey = utils.ReservationNameLabelKey
 	// ReservationProjectLabelKey is the GKE node label selecting the host project for a shared GCE reservation.
-	ReservationProjectLabelKey = "cloud.google.com/reservation-project"
+	ReservationProjectLabelKey = utils.ReservationProjectLabelKey
+
+	// spotPreferredWeight is the scheduler preference weight for Spot nodes (highest priority).
+	spotPreferredWeight int32 = 100
+	// fallbackReservationPreferredWeight is the scheduler preference weight for matching specific
+	// reservation nodes during a Spot stockout (below Spot, above plain On-Demand).
+	fallbackReservationPreferredWeight int32 = 50
 )
 
 // existingPodCounts holds placement counts for the active Pods currently selected by a WorkloadClass
@@ -57,19 +63,19 @@ type existingPodCounts struct {
 	// effectiveSpot is the number of Pods counted as Spot for SpotRatio purposes (scheduled on a Spot node, or
 	// targeted for Spot when unscheduled or the node cannot be fetched).
 	effectiveSpot int
-	// fallback is the number of Spot-targeted Pods scheduled on a known non-Spot node.
+	// fallback is the number of Spot-targeted Pods scheduled on a known non-Spot, non-reservation On-Demand node.
 	fallback int
 }
 
 // isWorkloadInFallback reports whether the WorkloadClass is currently running Pods on On-Demand fallback.
 // It honors the InFallback condition when set and otherwise inspects existing Pods: a Pod that was
-// targeted for Spot but is running on a non-Spot node indicates the workload has fallen back.
-func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) bool {
+// targeted for Spot but is running on a non-Spot, non-reservation node indicates the workload has fallen back.
+func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass, spotPolicy *workloadsv1.GKESpotPlacementPolicy) bool {
 	if meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
 		return true
 	}
 
-	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc)
+	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc, spotPolicy)
 	if err != nil {
 		podlog.Error(err, "Failed to list Pods to determine fallback state", "workloadClass", wc.Name, "namespace", incomingPod.Namespace)
 		return false
@@ -80,7 +86,7 @@ func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomi
 // countExistingWorkloadClassPods returns how many active Pods selected by the WorkloadClass are
 // (or are targeted to be) on Spot, and the total number of active selected Pods.
 func (d *PodPlacementDefaulter) countExistingWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (spotCount, totalCount int) {
-	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc)
+	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc, nil)
 	if err != nil {
 		podlog.Error(err, "Failed to list Pods to compute Spot ratio", "workloadClass", wc.Name, "namespace", incomingPod.Namespace)
 		return 0, 0
@@ -89,25 +95,28 @@ func (d *PodPlacementDefaulter) countExistingWorkloadClassPods(ctx context.Conte
 }
 
 // countWorkloadClassPods classifies the active Pods selected by the WorkloadClass (excluding the incoming Pod)
-// in a single pass, caching node lookups so each distinct node is fetched at most once.
-func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (existingPodCounts, error) {
+// in a single pass, caching node lookups so each distinct node is fetched at most once. Pods scheduled on
+// nodes matching spotPolicy.Spec.FallbackReservation are running on prepaid reserved capacity and are not
+// counted as On-Demand fallback.
+func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass, spotPolicy *workloadsv1.GKESpotPlacementPolicy) (existingPodCounts, error) {
 	pods, err := d.listWorkloadClassPods(ctx, incomingPod, wc)
 	if err != nil {
 		return existingPodCounts{}, err
 	}
 
-	type nodeSpot struct {
-		isSpot bool
-		known  bool
+	var fallbackRes *workloadsv1.FallbackReservationPolicy
+	if spotPolicy != nil {
+		fallbackRes = spotPolicy.Spec.FallbackReservation
 	}
-	nodes := make(map[string]nodeSpot)
-	lookupNode := func(nodeName string) (bool, bool) {
+
+	nodes := make(map[string]podNodeClass)
+	lookupNode := func(nodeName string) podNodeClass {
 		if n, ok := nodes[nodeName]; ok {
-			return n.isSpot, n.known
+			return n
 		}
-		isSpot, known := d.isNodeSpot(ctx, nodeName)
-		nodes[nodeName] = nodeSpot{isSpot: isSpot, known: known}
-		return isSpot, known
+		info := d.classifyNode(ctx, nodeName, fallbackRes)
+		nodes[nodeName] = info
+		return info
 	}
 
 	var counts existingPodCounts
@@ -120,11 +129,13 @@ func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, inco
 			}
 			continue
 		}
-		isSpot, known := lookupNode(existing.Spec.NodeName)
+		info := lookupNode(existing.Spec.NodeName)
 		switch {
-		case known && isSpot:
+		case info.known && info.isSpot:
 			counts.effectiveSpot++
-		case known && !isSpot:
+		case info.known && info.isReserved:
+			// Prepaid reservation node: not Spot, and not On-Demand fallback.
+		case info.known && !info.isSpot:
 			if targeted {
 				counts.fallback++
 			}
@@ -179,17 +190,25 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 	return pods, nil
 }
 
-// isNodeSpot reports whether the named node carries the GKE Spot label. known is false when the
-// node name is empty or the node can't be fetched, so callers can fall back to other signals.
-func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string) (isSpot, known bool) {
+type podNodeClass struct {
+	isSpot     bool
+	isReserved bool
+	known      bool
+}
+
+func (d *PodPlacementDefaulter) classifyNode(ctx context.Context, nodeName string, res *workloadsv1.FallbackReservationPolicy) podNodeClass {
 	if nodeName == "" {
-		return false, false
+		return podNodeClass{}
 	}
 	node := &corev1.Node{}
 	if err := d.Client.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
-		return false, false
+		return podNodeClass{}
 	}
-	return utils.IsSpotNode(node), true
+	return podNodeClass{
+		isSpot:     utils.IsSpotNode(node),
+		isReserved: utils.IsMatchingReservationNode(node, res),
+		known:      true,
+	}
 }
 
 // mutateForOnDemand pins the Pod to On-Demand (non-Spot) nodes.
@@ -233,62 +252,51 @@ func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, s
 		return
 	}
 
-	// FallbackToOnDemand: prefer Spot capacity, allow fallback to On-Demand / reservation nodes.
+	// FallbackToOnDemand: prefer Spot capacity (weight 100), then matching specific reservation
+	// capacity if configured (weight 50), and finally plain On-Demand capacity (weight 0).
 	addPreferredSchedulingTerm(pod, corev1.PreferredSchedulingTerm{
-		Weight:     100,
+		Weight:     spotPreferredWeight,
 		Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
 	})
-
-	fallbackReqs := []corev1.NodeSelectorRequirement{spotDoesNotExist()}
-	if len(families) > 0 {
-		fallbackReqs = append(fallbackReqs, corev1.NodeSelectorRequirement{
-			Key:      MachineFamilyLabelKey,
-			Operator: corev1.NodeSelectorOpIn,
-			Values:   families,
+	if resReqs := fallbackReservationRequirements(reservation); len(resReqs) > 0 {
+		addPreferredSchedulingTerm(pod, corev1.PreferredSchedulingTerm{
+			Weight:     fallbackReservationPreferredWeight,
+			Preference: corev1.NodeSelectorTerm{MatchExpressions: append([]corev1.NodeSelectorRequirement{spotDoesNotExist()}, resReqs...)},
 		})
 	}
-	fallbackReqs = append(fallbackReqs, fallbackReservationRequirements(reservation)...)
 
-	if len(fallbackReqs) > 1 {
-		// Spot nodes, OR non-Spot fallback nodes matching the allowed machine families / reservation.
+	if len(families) > 0 {
+		// Spot nodes, OR non-Spot fallback nodes (reservation or On-Demand) in the allowed machine families.
 		requireNodeSelectorTerms(pod, []corev1.NodeSelectorTerm{
 			{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}},
-			{MatchExpressions: fallbackReqs},
+			{MatchExpressions: []corev1.NodeSelectorRequirement{
+				spotDoesNotExist(),
+				{
+					Key:      MachineFamilyLabelKey,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   families,
+				},
+			}},
 		})
 	}
 }
 
 func fallbackReservationRequirements(res *workloadsv1.FallbackReservationPolicy) []corev1.NodeSelectorRequirement {
-	if res == nil {
+	if res == nil || res.Name == "" {
 		return nil
 	}
-	switch res.Affinity {
-	case workloadsv1.ReservationAffinityAny:
-		return []corev1.NodeSelectorRequirement{
-			{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"any"}},
-		}
-	case workloadsv1.ReservationAffinitySpecific:
-		reqs := []corev1.NodeSelectorRequirement{
-			{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
-		}
-		if res.Name != "" {
-			reqs = append(reqs, corev1.NodeSelectorRequirement{
-				Key:      ReservationNameLabelKey,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{res.Name},
-			})
-		}
-		if res.Project != "" {
-			reqs = append(reqs, corev1.NodeSelectorRequirement{
-				Key:      ReservationProjectLabelKey,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{res.Project},
-			})
-		}
-		return reqs
-	default:
-		return nil
+	reqs := []corev1.NodeSelectorRequirement{
+		{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{utils.ReservationAffinitySpecificValue}},
+		{Key: ReservationNameLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{res.Name}},
 	}
+	if res.Project != "" {
+		reqs = append(reqs, corev1.NodeSelectorRequirement{
+			Key:      ReservationProjectLabelKey,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{res.Project},
+		})
+	}
+	return reqs
 }
 
 // spotIn returns a node selector requirement matching Spot nodes (gke-spot In [true]).

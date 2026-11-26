@@ -76,21 +76,15 @@ spec:
                 x-kubernetes-list-type: set
               fallbackReservation:
                 description: |-
-                  FallbackReservation directs Pods falling back from Spot during a stockout onto available GKE
-                  reservation capacity (specific or any matching reservation). Pods scheduled onto fallback
-                  reservation nodes are tracked as in-fallback and automatically revert to Spot under Active reversion.
+                  FallbackReservation directs Pods falling back from Spot during a stockout to prefer a specific
+                  GCE reservation before spilling onto plain On-Demand capacity (Spot weight 100 > reservation
+                  weight 50 > On-Demand weight 0). Pods scheduled onto matching prepaid reservation nodes are not
+                  treated as On-Demand fallback and are skipped by Spot reversion so already-paid capacity is not disrupted.
                 properties:
-                  affinity:
-                    description: Affinity selects whether fallback targets any matching
-                      reservation ("Any") or a specific named reservation ("Specific").
-                    enum:
-                    - Any
-                    - Specific
-                    type: string
                   name:
-                    description: Name is the GCE reservation name (cloud.google.com/reservation-name),
-                      required when affinity is "Specific".
+                    description: Name is the GCE reservation name (cloud.google.com/reservation-name).
                     maxLength: 63
+                    minLength: 1
                     type: string
                   project:
                     description: Project is the optional GCP project ID owning a shared
@@ -98,18 +92,8 @@ spec:
                     maxLength: 63
                     type: string
                 required:
-                - affinity
+                - name
                 type: object
-                x-kubernetes-validations:
-                - message: name is required when affinity is Specific
-                  rule: self.affinity != 'Specific' || (has(self.name) && size(self.name)
-                    > 0)
-                - message: name can only be set when affinity is Specific
-                  rule: self.affinity == 'Specific' || !has(self.name) || size(self.name)
-                    == 0
-                - message: project can only be set when affinity is Specific
-                  rule: self.affinity == 'Specific' || !has(self.project) || size(self.project)
-                    == 0
               reversion:
                 default: {}
                 description: |-

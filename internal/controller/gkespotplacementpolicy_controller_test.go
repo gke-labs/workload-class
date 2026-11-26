@@ -253,50 +253,32 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 			Expect(wcCond.Message).To(ContainSubstring("GKESpotPlacementPolicy 'test-spot-policy' is invalid"))
 		})
 
-		It("should enforce CEL validation rules on fallbackReservation", func() {
-			specificNoName := &workloadsv1.GKESpotPlacementPolicy{
-				ObjectMeta: metav1.ObjectMeta{Name: "cel-specific-no-name"},
+		It("should enforce CRD schema validation on fallbackReservation", func() {
+			emptyName := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "res-empty-name"},
 				Spec: workloadsv1.GKESpotPlacementPolicySpec{
-					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
-						Affinity: workloadsv1.ReservationAffinitySpecific,
-					},
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: ""},
 				},
 			}
-			Expect(k8sClient.Create(ctx, specificNoName)).To(MatchError(ContainSubstring("name is required when affinity is Specific")))
+			Expect(k8sClient.Create(ctx, emptyName)).To(HaveOccurred())
 
-			anyWithName := &workloadsv1.GKESpotPlacementPolicy{
-				ObjectMeta: metav1.ObjectMeta{Name: "cel-any-with-name"},
+			validNoProject := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "res-valid-no-project"},
 				Spec: workloadsv1.GKESpotPlacementPolicySpec{
-					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
-						Affinity: workloadsv1.ReservationAffinityAny,
-						Name:     "res-1",
-					},
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: "res-1"},
 				},
 			}
-			Expect(k8sClient.Create(ctx, anyWithName)).To(MatchError(ContainSubstring("name can only be set when affinity is Specific")))
+			Expect(k8sClient.Create(ctx, validNoProject)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validNoProject) })
 
-			anyWithProject := &workloadsv1.GKESpotPlacementPolicy{
-				ObjectMeta: metav1.ObjectMeta{Name: "cel-any-with-project"},
+			validWithProject := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "res-valid-with-project"},
 				Spec: workloadsv1.GKESpotPlacementPolicySpec{
-					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
-						Affinity: workloadsv1.ReservationAffinityAny,
-						Project:  "shared-host",
-					},
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: "res-1", Project: "shared-host"},
 				},
 			}
-			Expect(k8sClient.Create(ctx, anyWithProject)).To(MatchError(ContainSubstring("project can only be set when affinity is Specific")))
-
-			validSpecific := &workloadsv1.GKESpotPlacementPolicy{
-				ObjectMeta: metav1.ObjectMeta{Name: "cel-valid-specific"},
-				Spec: workloadsv1.GKESpotPlacementPolicySpec{
-					FallbackReservation: &workloadsv1.FallbackReservationPolicy{
-						Affinity: workloadsv1.ReservationAffinitySpecific,
-						Name:     "res-1",
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, validSpecific)).To(Succeed())
-			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validSpecific) })
+			Expect(k8sClient.Create(ctx, validWithProject)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validWithProject) })
 		})
 	})
 })

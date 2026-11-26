@@ -67,31 +67,16 @@ const (
 	ReasonSpotStockout = "SpotStockout"
 )
 
-// ReservationAffinityType specifies how fallback Pods target GKE reservations during a Spot stockout.
-// +kubebuilder:validation:Enum=Any;Specific
-type ReservationAffinityType string
-
-const (
-	// ReservationAffinityAny targets any matching available GKE reservation on fallback nodes.
-	ReservationAffinityAny ReservationAffinityType = "Any"
-
-	// ReservationAffinitySpecific targets a specific named GKE reservation on fallback nodes.
-	ReservationAffinitySpecific ReservationAffinityType = "Specific"
-)
-
-// FallbackReservationPolicy directs Spot-fallback Pods onto GKE reservation capacity during Spot stockouts.
-// +kubebuilder:validation:XValidation:rule="self.affinity != 'Specific' || (has(self.name) && size(self.name) > 0)",message="name is required when affinity is Specific"
-// +kubebuilder:validation:XValidation:rule="self.affinity == 'Specific' || !has(self.name) || size(self.name) == 0",message="name can only be set when affinity is Specific"
-// +kubebuilder:validation:XValidation:rule="self.affinity == 'Specific' || !has(self.project) || size(self.project) == 0",message="project can only be set when affinity is Specific"
+// FallbackReservationPolicy directs Spot-fallback Pods to prefer a specific named GKE reservation
+// during Spot stockouts before spilling over to plain On-Demand capacity.
+// Note: Standard GKE On-Demand nodes already consume matching any-affinity GCE reservations automatically
+// without a Pod node selector, so this policy specifically targets named ("specific" affinity) reservations.
 type FallbackReservationPolicy struct {
-	// Affinity selects whether fallback targets any matching reservation ("Any") or a specific named reservation ("Specific").
+	// Name is the GCE reservation name (cloud.google.com/reservation-name).
 	// +kubebuilder:validation:Required
-	Affinity ReservationAffinityType `json:"affinity"`
-
-	// Name is the GCE reservation name (cloud.google.com/reservation-name), required when affinity is "Specific".
-	// +optional
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
-	Name string `json:"name,omitempty"`
+	Name string `json:"name"`
 
 	// Project is the optional GCP project ID owning a shared GCE reservation (cloud.google.com/reservation-project).
 	// +optional
@@ -115,9 +100,10 @@ type GKESpotPlacementPolicySpec struct {
 	// +listType=set
 	FallbackAllowedMachineFamilies []string `json:"fallbackAllowedMachineFamilies,omitempty"`
 
-	// FallbackReservation directs Pods falling back from Spot during a stockout onto available GKE
-	// reservation capacity (specific or any matching reservation). Pods scheduled onto fallback
-	// reservation nodes are tracked as in-fallback and automatically revert to Spot under Active reversion.
+	// FallbackReservation directs Pods falling back from Spot during a stockout to prefer a specific
+	// GCE reservation before spilling onto plain On-Demand capacity (Spot weight 100 > reservation
+	// weight 50 > On-Demand weight 0). Pods scheduled onto matching prepaid reservation nodes are not
+	// treated as On-Demand fallback and are skipped by Spot reversion so already-paid capacity is not disrupted.
 	// +optional
 	FallbackReservation *FallbackReservationPolicy `json:"fallbackReservation,omitempty"`
 

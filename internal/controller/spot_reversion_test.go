@@ -374,7 +374,7 @@ func TestReconcileSpotReversion(t *testing.T) {
 			if err != nil {
 				t.Fatalf("listSpotNodeNames() unexpected error: %v", err)
 			}
-			pods, err := r.classifyWorkloadPods(context.Background(), wc, spotNodes)
+			pods, err := r.classifyWorkloadPods(context.Background(), wc, spotNodes, nil)
 			if err != nil {
 				t.Fatalf("classifyWorkloadPods() unexpected error: %v", err)
 			}
@@ -393,6 +393,56 @@ func TestReconcileSpotReversion(t *testing.T) {
 				t.Errorf("remaining Pods = %v, want %v", got, tc.wantRemaining)
 			}
 		})
+	}
+}
+
+func TestReconcileSpotReversion_SkipsMatchingReservationNodes(t *testing.T) {
+	scheme := newGKESpotScheme()
+	utilruntime.Must(policyv1.AddToScheme(scheme))
+	now := time.Date(2026, 9, 18, 15, 0, 0, 0, time.UTC)
+	twoHoursAgo := now.Add(-2 * time.Hour)
+
+	wc := newManagedWC(fallbackCS("100%"))
+	policy := newPolicy(workloadsv1.SpotReversionPolicy{
+		Action:                workloadsv1.ActiveReversionAction,
+		MinDurationOnFallback: &metav1.Duration{Duration: 0},
+	})
+	policy.Spec.FallbackReservation = &workloadsv1.FallbackReservationPolicy{Name: "ml-a3-res", Project: "host-proj"}
+
+	resNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "res-node-1",
+		Labels: map[string]string{
+			utils.ReservationAffinityLabelKey: utils.ReservationAffinitySpecificValue,
+			utils.ReservationNameLabelKey:     "ml-a3-res",
+			utils.ReservationProjectLabelKey:  "host-proj",
+		},
+	}}
+	resPod := newWorkloadPod("reserved-1", "res-node-1", twoHoursAgo)
+	resPod.Spec.Tolerations = fallbackPodAt("", twoHoursAgo).Spec.Tolerations
+	odPod := fallbackPodAt("ondemand-1", twoHoursAgo)
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workloadsv1.WorkloadClass{}).
+		WithObjects(spotNode("spot-node-1", true, false), onDemandNodeObj.DeepCopy(), resNode, wc, policy, maxFallbackGuardrail("g-max", "30m"), resPod, odPod).
+		Build()
+	r := &GKESpotPlacementReconciler{Client: c, Scheme: scheme}
+
+	pods, err := r.reconcileFallbackState(context.Background(), wc, policy)
+	if err != nil {
+		t.Fatalf("reconcileFallbackState() error: %v", err)
+	}
+	if _, err := r.reconcileSpotReversion(context.Background(), wc, policy, pods, now); err != nil {
+		t.Fatalf("reconcileSpotReversion() error: %v", err)
+	}
+	// Plain On-Demand pod is evicted back to Spot; prepaid reservation pod stays untouched.
+	if got := remainingPodNames(t, c); !slices.Equal(got, []string{"reserved-1"}) {
+		t.Fatalf("remaining Pods = %v, want [reserved-1]", got)
+	}
+	// Once only the prepaid reservation pod remains, InFallback flips to False.
+	if _, err := r.reconcileFallbackState(context.Background(), wc, policy); err != nil {
+		t.Fatalf("second reconcileFallbackState() error: %v", err)
+	}
+	if got := inFallbackStatus(t, c, wc); got != metav1.ConditionFalse {
+		t.Errorf("InFallback = %q, want False when only prepaid reservation Pods remain", got)
 	}
 }
 
