@@ -217,6 +217,11 @@ func mutateForSpot(pod *corev1.Pod, fallbackAction workloadsv1.FallbackAction, s
 	if ccc != "" {
 		if _, ok := pod.Spec.NodeSelector[ComputeClassLabelKey]; !ok {
 			setNodeSelector(pod, ComputeClassLabelKey, ccc)
+			// GKE taints compute-class nodes with cloud.google.com/compute-class=<name>:NoSchedule and adds
+			// the matching toleration in its own mutating webhook, which runs before this one (webhooks run
+			// in name order, reinvocationPolicy Never). Without the toleration the pod can't schedule and
+			// node auto-provisioning reports "node(s) had untolerated taint(s)".
+			ensureComputeClassToleration(pod, ccc)
 		}
 	}
 
@@ -259,6 +264,21 @@ func setNodeSelector(pod *corev1.Pod, key, value string) {
 		pod.Spec.NodeSelector = make(map[string]string)
 	}
 	pod.Spec.NodeSelector[key] = value
+}
+
+// ensureComputeClassToleration adds the toleration for the GKE compute-class node taint if missing.
+func ensureComputeClassToleration(pod *corev1.Pod, ccc string) {
+	for _, t := range pod.Spec.Tolerations {
+		if t.Key == ComputeClassLabelKey && t.Value == ccc && (t.Effect == corev1.TaintEffectNoSchedule || t.Effect == "") {
+			return
+		}
+	}
+	pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{
+		Key:      ComputeClassLabelKey,
+		Operator: corev1.TolerationOpEqual,
+		Value:    ccc,
+		Effect:   corev1.TaintEffectNoSchedule,
+	})
 }
 
 // ensureSpotToleration adds the GKE Spot toleration to the Pod if it isn't already present.

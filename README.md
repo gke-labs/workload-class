@@ -378,7 +378,7 @@ spec:
 
 | Field | Effect |
 | --- | --- |
-| `customComputeClass` | Adds the `cloud.google.com/compute-class` nodeSelector to Spot-targeted Pods, unless the Pod already selects a compute class. |
+| `customComputeClass` | Adds the `cloud.google.com/compute-class` nodeSelector and the matching `cloud.google.com/compute-class=<name>:NoSchedule` toleration to Spot-targeted Pods, unless the Pod already selects a compute class. GKE taints compute class nodes and normally adds this toleration in its own admission webhook, which runs before this one, so the plugin adds it itself. |
 | `fallbackAllowedMachineFamilies` | During fallback, restricts On-Demand nodes to these `cloud.google.com/machine-family` values. Spot nodes of any family remain allowed. |
 | `reversion.action` | What happens to fallback Pods once Spot capacity returns (see [Fallback and Reversion](#fallback-and-reversion)). Default: `None`. |
 | `reversion.minDurationOnFallback` | Minimum time a Pod must run on fallback before Active reversion evicts it. When omitted, a **5m** floor applies so a wrong capacity signal can't evict the same Pod in a loop. Set `0s` to opt out. Values above `0s` require `action: Active`. |
