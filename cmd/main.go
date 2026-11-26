@@ -262,9 +262,10 @@ func main() {
 	setupLog.Info("Registering disruption webhook")
 	mgr.GetWebhookServer().Register("/validate-disruption", &admission.Webhook{
 		Handler: &internalwebhook.DisruptionWebhook{
-			Client:       mgr.GetClient(),
-			Recorder:     mgr.GetEventRecorder("disruption-webhoook"),
-			LeaseTracker: leaseTracker,
+			Client:         mgr.GetClient(),
+			Recorder:       mgr.GetEventRecorder("disruption-webhoook"),
+			LeaseTracker:   leaseTracker,
+			BlockedTracker: utils.NewBlockedPodTracker(),
 		},
 	})
 
