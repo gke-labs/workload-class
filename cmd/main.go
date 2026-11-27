@@ -97,6 +97,7 @@ func main() {
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
 	var enableInitialResources bool
+	var enableResourceManagement bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -123,6 +124,10 @@ func main() {
 		"Burst limit when talking to the Kubernetes API server. 0 keeps controller-runtime's default "+
 			"(client-side limiting disabled); a positive value sets the client-side burst; "+
 			"a negative value (e.g. -1) is passed through.")
+	flag.BoolVar(&enableResourceManagement, "enable-resource-management", true,
+		"If set, the manager creates and manages the autoscalers that the resourceManagement of a WorkloadClass asks "+
+			"for on the Deployments and StatefulSets it governs. Use --enable-resource-management=false to turn this off; "+
+			"existing managed autoscalers are then left as they are.")
 	flag.BoolVar(&enableInitialResources, "enable-initial-resources", true,
 		"If set, the Pod webhook fills in the initialResources of a WorkloadClass on the containers of the Pods it "+
 			"governs. Use --enable-initial-resources=false to turn off this Pod mutation without affecting placement.")
@@ -295,6 +300,20 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "gkespotplacement")
 		os.Exit(1)
+	}
+	if enableResourceManagement {
+		// One controller per kind of workload that resource management governs.
+		for _, kind := range []string{utils.DeploymentKind, utils.StatefulSetKind} {
+			if err := (&controller.WorkloadAutoscalingReconciler{
+				Client:   mgr.GetClient(),
+				Scheme:   mgr.GetScheme(),
+				Recorder: mgr.GetEventRecorder("workloadautoscaling-controller"),
+				Kind:     kind,
+			}).SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "Failed to create controller", "controller", "workloadautoscaling", "kind", kind)
+				os.Exit(1)
+			}
+		}
 	}
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {

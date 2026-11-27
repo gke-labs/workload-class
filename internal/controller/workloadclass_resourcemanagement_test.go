@@ -267,3 +267,73 @@ func TestReconcileSetsAndRemovesResourceManagementCondition(t *testing.T) {
 		t.Errorf("expected the condition to be removed, got %+v", *cond)
 	}
 }
+
+func TestWarnUtilizationWithoutRequests(t *testing.T) {
+	utilization := func(name corev1.ResourceName) autoscalingv2.MetricSpec {
+		return autoscalingv2.MetricSpec{
+			Type: autoscalingv2.ResourceMetricSourceType,
+			Resource: &autoscalingv2.ResourceMetricSource{
+				Name:   name,
+				Target: autoscalingv2.MetricTarget{Type: autoscalingv2.UtilizationMetricType},
+			},
+		}
+	}
+	autoscaling := func(metrics ...autoscalingv2.MetricSpec) *workloadsv1.ResourceManagement {
+		return &workloadsv1.ResourceManagement{Autoscaling: &workloadsv1.Autoscaling{
+			Replicas: workloadsv1.ReplicaBounds{Max: 5},
+			Metrics:  metrics,
+		}}
+	}
+	recorder := events.NewFakeRecorder(10)
+	r := &WorkloadClassReconciler{Recorder: recorder}
+	recorded := func() []string {
+		var got []string
+		for {
+			select {
+			case ev := <-recorder.Events:
+				got = append(got, ev)
+			default:
+				return got
+			}
+		}
+	}
+
+	wc := rmWorkloadClass(autoscaling(utilization(corev1.ResourceCPU), utilization(corev1.ResourceMemory)))
+	r.warnUtilizationWithoutRequests(wc)
+	got := recorded()
+	if len(got) != 1 || !strings.Contains(got[0], reasonUtilizationWithoutRequests) || !strings.Contains(got[0], "utilization of cpu and memory") {
+		t.Fatalf("expected one UtilizationWithoutRequests warning for cpu and memory, got %q", got)
+	}
+	if !strings.HasPrefix(got[0], corev1.EventTypeWarning) {
+		t.Errorf("expected a Warning event, got %q", got[0])
+	}
+
+	// The warning is recorded once per generation.
+	r.warnUtilizationWithoutRequests(wc)
+	if got := recorded(); len(got) != 0 {
+		t.Errorf("expected no second warning for the same generation, got %q", got)
+	}
+	wc.Generation++
+	r.warnUtilizationWithoutRequests(wc)
+	if got := recorded(); len(got) != 1 {
+		t.Errorf("expected a warning for the new generation, got %q", got)
+	}
+
+	// No warning when requests are filled in, when nothing scales on utilization, or without autoscaling.
+	withInitial := rmWorkloadClass(autoscaling(utilization(corev1.ResourceCPU)))
+	withInitial.Name = "with-initial-resources"
+	withInitial.Spec.ResourceManagement.InitialResources = rmInitialResources().InitialResources
+	podsMetric := rmWorkloadClass(autoscaling(autoscalingv2.MetricSpec{Type: autoscalingv2.PodsMetricSourceType}))
+	podsMetric.Name = "pods-metric"
+	noAutoscaling := rmWorkloadClass(rmInitialResources())
+	noAutoscaling.Name = "no-autoscaling"
+	for _, quiet := range []*workloadsv1.WorkloadClass{withInitial, podsMetric, noAutoscaling, rmWorkloadClass(nil)} {
+		r.warnUtilizationWithoutRequests(quiet)
+		if got := recorded(); len(got) != 0 {
+			t.Errorf("WorkloadClass %q: expected no warning, got %q", quiet.Name, got)
+		}
+	}
+
+	// A reconciler without a recorder never panics.
+	(&WorkloadClassReconciler{}).warnUtilizationWithoutRequests(rmWorkloadClass(autoscaling(utilization(corev1.ResourceCPU))))
+}
