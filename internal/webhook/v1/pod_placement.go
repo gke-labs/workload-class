@@ -96,12 +96,13 @@ func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, inco
 		isSpot bool
 		known  bool
 	}
+	targetCCC := d.onTargetComputeClass(ctx, wc)
 	nodes := make(map[string]nodeSpot)
 	lookupNode := func(nodeName string) (bool, bool) {
 		if n, ok := nodes[nodeName]; ok {
 			return n.isSpot, n.known
 		}
-		isSpot, known := d.isNodeSpot(ctx, nodeName)
+		isSpot, known := d.isNodeOnTarget(ctx, nodeName, targetCCC)
 		nodes[nodeName] = nodeSpot{isSpot: isSpot, known: known}
 		return isSpot, known
 	}
@@ -175,9 +176,10 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 	return pods, nil
 }
 
-// isNodeSpot reports whether the named node carries the GKE Spot label. known is false when the
-// node name is empty or the node can't be fetched, so callers can fall back to other signals.
-func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string) (isSpot, known bool) {
+// isNodeOnTarget reports whether the named node is where Spot-targeted Pods are meant to run: a Spot node,
+// or, when targetCCC is set (see utils.OnTargetComputeClass), a node of that compute class. known is false when
+// the node name is empty or the node can't be fetched, so callers can fall back to other signals.
+func (d *PodPlacementDefaulter) isNodeOnTarget(ctx context.Context, nodeName, targetCCC string) (onTarget, known bool) {
 	if nodeName == "" {
 		return false, false
 	}
@@ -185,7 +187,20 @@ func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string)
 	if err := d.Client.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 		return false, false
 	}
-	return utils.IsSpotNode(node), true
+	return utils.IsOnTargetNode(node, targetCCC), true
+}
+
+// onTargetComputeClass returns the compute class whose nodes count as on target for wc, or "".
+func (d *PodPlacementDefaulter) onTargetComputeClass(ctx context.Context, wc *workloadsv1.WorkloadClass) string {
+	ipr := wc.Spec.InfrastructureProfileRef
+	if !utils.ReferencesGKESpotPlacementPolicy(ipr) {
+		return ""
+	}
+	policy, err := d.fetchSpotPlacementPolicy(ctx, ipr)
+	if err != nil {
+		return ""
+	}
+	return utils.OnTargetComputeClass(policy)
 }
 
 // mutateForOnDemand pins the Pod to On-Demand (non-Spot) nodes.

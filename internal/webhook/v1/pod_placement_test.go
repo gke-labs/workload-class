@@ -317,5 +317,44 @@ var _ = Describe("Pod placement helpers", func() {
 			d := newDefaulter(newExistingPod("batch-0", "spot-node", true), newNode("spot-node", true))
 			Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc)).To(BeFalse())
 		})
+
+		Context("with a non-Spot customComputeClass", func() {
+			cccNode := func(name, ccc string) *corev1.Node {
+				n := newNode(name, false)
+				n.Labels[utils.ComputeClassNodeLabelKey] = ccc
+				return n
+			}
+			pods := func() []client.Object {
+				return []client.Object{
+					newExistingPod("batch-0", "perf-node", true),
+					newExistingPod("batch-1", "perf-node", true),
+					newExistingPod("batch-2", "od-node", false),
+					cccNode("perf-node", "performance"), cccNode("od-node", "standard"),
+				}
+			}
+
+			It("counts Pods on the policy's compute class as fallback without the opt-in annotation", func() {
+				wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
+				policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "performance"})
+				d := newDefaulter(append(pods(), policy)...)
+				spot, total := d.countExistingWorkloadClassPods(testCtx, newIncomingPod(), wlc)
+				Expect(spot).To(Equal(0))
+				Expect(total).To(Equal(3))
+				Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc)).To(BeTrue())
+			})
+
+			It("counts Pods on the policy's compute class as on target with the opt-in annotation", func() {
+				wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
+				policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{CustomComputeClass: "performance"})
+				policy.Annotations = map[string]string{utils.CountComputeClassAsTargetAnnotation: "true"}
+				d := newDefaulter(append(pods(), policy)...)
+				spot, total := d.countExistingWorkloadClassPods(testCtx, newIncomingPod(), wlc)
+				Expect(spot).To(Equal(2))
+				Expect(total).To(Equal(3))
+				Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc)).To(BeFalse())
+				// At 50%, 2 of 3 existing on target: the 4th Pod goes to the default capacity.
+				Expect(utils.ShouldUseSpot(spot, total, 50)).To(BeFalse())
+			})
+		})
 	})
 })

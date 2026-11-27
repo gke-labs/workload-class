@@ -111,3 +111,28 @@ func TestIsSpotNode(t *testing.T) {
 		t.Errorf("expected nil node not to be Spot")
 	}
 }
+
+func TestIsOnTargetNode(t *testing.T) {
+	spot := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{SpotLabelKey: SpotLabelValue}}}
+	perf := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{ComputeClassNodeLabelKey: "performance"}}}
+	plain := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}}
+	cases := []struct {
+		name string
+		node *corev1.Node
+		ccc  string
+		want bool
+	}{
+		{"spot without ccc", spot, "", true},
+		{"spot with ccc", spot, "performance", true},
+		{"ccc node without opt-in", perf, "", false},
+		{"ccc node with matching ccc", perf, "performance", true},
+		{"ccc node with other ccc", perf, "standard", false},
+		{"plain node", plain, "performance", false},
+		{"nil node", nil, "performance", false},
+	}
+	for _, c := range cases {
+		if got := IsOnTargetNode(c.node, c.ccc); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
