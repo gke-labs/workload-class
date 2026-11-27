@@ -33,15 +33,15 @@ func TestApplyRestConfigRateLimits(t *testing.T) {
 	}{
 		{
 			name:      "defaults_preserve_controller_runtime_unlimited_config",
-			initial:   &rest.Config{QPS: -1, Burst: -1},
+			initial:   &rest.Config{QPS: -1},
 			qps:       defaultKubeAPIQPS,
 			burst:     defaultKubeAPIBurst,
 			wantQPS:   -1,
-			wantBurst: -1,
+			wantBurst: 0,
 		},
 		{
 			name:      "positive_values_override_unlimited_config",
-			initial:   &rest.Config{QPS: -1, Burst: -1},
+			initial:   &rest.Config{QPS: -1},
 			qps:       75.5,
 			burst:     150,
 			wantQPS:   75.5,
@@ -76,6 +76,31 @@ func TestApplyRestConfigRateLimits(t *testing.T) {
 			}
 			if tc.initial.Burst != tc.wantBurst {
 				t.Errorf("Burst = %v, want %v", tc.initial.Burst, tc.wantBurst)
+			}
+		})
+	}
+}
+
+func TestValidateRestConfigRateLimits(t *testing.T) {
+	testCases := []struct {
+		name    string
+		qps     float64
+		burst   int
+		wantErr bool
+	}{
+		{name: "defaults_valid", qps: defaultKubeAPIQPS, burst: defaultKubeAPIBurst},
+		{name: "positive_qps_zero_burst_valid", qps: 50, burst: 0},
+		{name: "positive_qps_positive_burst_valid", qps: 50, burst: 100},
+		{name: "positive_qps_negative_burst_rejected", qps: 50, burst: -1, wantErr: true},
+		{name: "zero_qps_negative_burst_valid", qps: 0, burst: -1},
+		{name: "negative_qps_negative_burst_valid", qps: -1, burst: -1},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRestConfigRateLimits(tc.qps, tc.burst)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateRestConfigRateLimits(%v, %d) err = %v, wantErr %v", tc.qps, tc.burst, err, tc.wantErr)
 			}
 		})
 	}

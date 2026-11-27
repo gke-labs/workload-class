@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -55,9 +56,19 @@ const (
 	defaultKubeAPIBurst = 0
 )
 
+// validateRestConfigRateLimits rejects flag combinations that break client-go's token-bucket
+// rate limiter. A positive QPS enables rate.NewLimiter, where a negative burst causes Wait to
+// fail every request with "exceeds limiter's burst".
+func validateRestConfigRateLimits(qps float64, burst int) error {
+	if qps > 0 && burst < 0 {
+		return fmt.Errorf("--kube-api-burst (%d) must be >= 0 when --kube-api-qps (%v) is positive", burst, qps)
+	}
+	return nil
+}
+
 // applyRestConfigRateLimits overrides cfg.QPS and cfg.Burst when the corresponding
 // flag value is non-zero. A value of 0 leaves controller-runtime's default intact
-// (since controller-runtime v0.21, GetConfigOrDie returns negative values to disable
+// (since controller-runtime v0.21, GetConfigOrDie returns QPS: -1, Burst: 0 to disable
 // client-side throttling in favor of server-side API Priority and Fairness).
 // Positive values configure a client-side token-bucket limiter, and negative values
 // (e.g. -1) are passed through to explicitly disable client-side limiting.
@@ -120,8 +131,8 @@ func main() {
 			"a negative value (e.g. -1) is passed through to explicitly disable the limiter.")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", defaultKubeAPIBurst,
 		"Burst limit when talking to the Kubernetes API server. 0 keeps controller-runtime's default "+
-			"(client-side limiting disabled); a positive value sets the client-side burst; "+
-			"a negative value (e.g. -1) is passed through.")
+			"(client-side limiting disabled); a positive value sets the client-side burst (only effective "+
+			"when client-side QPS limiting is enabled); a negative value is only allowed when --kube-api-qps <= 0.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -129,6 +140,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := validateRestConfigRateLimits(kubeAPIQPS, kubeAPIBurst); err != nil {
+		setupLog.Error(err, "Invalid Kubernetes API rate limit flags")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -198,6 +214,10 @@ func main() {
 	}
 
 	restConfig := ctrl.GetConfigOrDie()
+	if kubeAPIQPS == 0 && kubeAPIBurst > 0 && restConfig.QPS <= 0 {
+		setupLog.Info("Ignoring --kube-api-burst because client-side rate limiting is disabled",
+			"kube-api-qps", restConfig.QPS, "kube-api-burst", kubeAPIBurst)
+	}
 	applyRestConfigRateLimits(restConfig, kubeAPIQPS, kubeAPIBurst)
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
