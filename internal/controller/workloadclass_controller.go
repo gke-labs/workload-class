@@ -115,6 +115,16 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	baseValidationCond := validatedCondition(ctx, wc, guardrails, overlapping)
 	disruptionCond := disruptionValidatedCondition(wc, guardrails, overlapping)
 
+	// 1.2 Advance status.lastDisruptionTime monotonically from the oldest active governed Pod's
+	// CreationTimestamp before calculating readiness. Requiring every active governed Pod to be
+	// newer than the current baseline prevents a single-Pod eviction during an Overdue drain or
+	// upgrade from resetting Overdue and closing the remaining Pods' Per-Pod PDBs.
+	nextLastDisruption, err := r.nextLastDisruptionTime(ctx, wc, &disruptionCond)
+	if err != nil {
+		log.Error(err, "Failed to list governed Pods for LastDisruptionTime calculation")
+		return ctrl.Result{}, err
+	}
+
 	// 2. Calculate Readiness (cluster-wide guardrail EmergencyOverride immediately opens maintenance readiness)
 	var (
 		readiness     workloadsv1.MaintenanceReadiness
@@ -156,6 +166,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypePlacementValidated) || changed
 		}
 		changed = meta.SetStatusCondition(&latest.Status.Conditions, cond) || changed
+		changed = applyMonotonicLastDisruptionTime(latest, nextLastDisruption) || changed
 		if latest.Status.MaintenanceReadiness != readiness {
 			latest.Status.MaintenanceReadiness = readiness
 			log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
@@ -586,32 +597,9 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	// Get pods for the next two checks
-	pods := &corev1.PodList{}
-	selector, err := utils.WorkloadClassPodSelector(ctx, r.Client, wc)
+	matchedPods, err := r.matchedWorkloadPods(ctx, wc)
 	if err != nil {
 		return workloadsv1.ReadinessNotReady, 0, err
-	}
-	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return workloadsv1.ReadinessNotReady, 0, err
-	}
-	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
-	if err != nil {
-		return workloadsv1.ReadinessNotReady, 0, err
-	}
-	wcs := &workloadsv1.WorkloadClassList{}
-	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
-		return workloadsv1.ReadinessNotReady, 0, err
-	}
-
-	var matchedPods []corev1.Pod
-	for _, pod := range pods.Items {
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		if bestMatch := utils.BestMatchWorkloadClassForPod(&pod, enforcedWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
-			continue
-		}
-		matchedPods = append(matchedPods, pod)
 	}
 
 	// 4. Check Pod Ages (Min Initial Run) and if grace periods have passed (GraceTerminationDurationSeconds)
@@ -644,6 +632,121 @@ func (r *WorkloadClassReconciler) calculateReadiness(ctx context.Context, wc *wo
 	}
 
 	return workloadsv1.ReadinessReady, nextWindow, nil
+}
+
+// matchedWorkloadPods returns all non-terminal Pods in wc's namespace whose best-match
+// WorkloadClass is wc.
+func (r *WorkloadClassReconciler) matchedWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass) ([]corev1.Pod, error) {
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	if enforcedWC != nil && enforcedWC.Name != wc.Name {
+		return nil, nil
+	}
+
+	selector := labels.Everything()
+	if enforcedWC == nil {
+		if wc.Spec.PodSelector == nil {
+			return nil, nil
+		}
+		s, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid podSelector: %w", err)
+		}
+		selector = s
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, err
+	}
+	wcs := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+		return nil, err
+	}
+
+	var matched []corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs.Items); bestMatch == nil || bestMatch.Name != wc.Name {
+			continue
+		}
+		matched = append(matched, *pod)
+	}
+	return matched, nil
+}
+
+// deriveLastDisruptionTime derives a monotonic update for wc.Status.LastDisruptionTime from the
+// oldest active governed Pod's CreationTimestamp.
+//
+// It returns (next, true) only when at least one active Pod has a non-zero CreationTimestamp and
+// the oldest such timestamp (truncated to whole seconds to match RFC3339 status serialization) is
+// strictly after the current baseline (wc.Status.LastDisruptionTime if set, otherwise
+// wc.CreationTimestamp). It never moves LastDisruptionTime backwards when adopting older Pods.
+func deriveLastDisruptionTime(wc *workloadsv1.WorkloadClass, pods []corev1.Pod) (*metav1.Time, bool) {
+	if wc == nil {
+		return nil, false
+	}
+	var oldest metav1.Time
+	for i := range pods {
+		pod := &pods[i]
+		if !utils.IsPodActive(pod) || pod.CreationTimestamp.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || pod.CreationTimestamp.Before(&oldest) {
+			oldest = pod.CreationTimestamp
+		}
+	}
+	if oldest.IsZero() {
+		return nil, false
+	}
+
+	baseline := wc.CreationTimestamp
+	if wc.Status.LastDisruptionTime != nil {
+		baseline = *wc.Status.LastDisruptionTime
+	}
+	truncated := metav1.NewTime(oldest.Truncate(time.Second))
+	if !baseline.IsZero() && !truncated.After(baseline.Truncate(time.Second)) {
+		return nil, false
+	}
+	return &truncated, true
+}
+
+// nextLastDisruptionTime advances wc.Status.LastDisruptionTime in memory when the oldest active
+// governed Pod's CreationTimestamp is strictly after the current baseline, returning the new
+// timestamp so it can also be persisted inside UpdateWorkloadClassStatus.
+func (r *WorkloadClassReconciler) nextLastDisruptionTime(ctx context.Context, wc *workloadsv1.WorkloadClass, disruptionCond *metav1.Condition) (*metav1.Time, error) {
+	if !utils.IsValidated(disruptionCond) {
+		return nil, nil
+	}
+	matchedPods, err := r.matchedWorkloadPods(ctx, wc)
+	if err != nil {
+		return nil, err
+	}
+	next, ok := deriveLastDisruptionTime(wc, matchedPods)
+	if !ok {
+		return nil, nil
+	}
+	wc.Status.LastDisruptionTime = next
+	return next, nil
+}
+
+// applyMonotonicLastDisruptionTime sets wc.Status.LastDisruptionTime to next only if next is
+// non-nil and strictly after any existing timestamp (truncated to whole seconds).
+func applyMonotonicLastDisruptionTime(wc *workloadsv1.WorkloadClass, next *metav1.Time) bool {
+	if next == nil {
+		return false
+	}
+	if wc.Status.LastDisruptionTime != nil && !next.After(wc.Status.LastDisruptionTime.Truncate(time.Second)) {
+		return false
+	}
+	t := *next
+	wc.Status.LastDisruptionTime = &t
+	return true
 }
 
 // placementPluginCondition returns a PlacementPluginAttached metav1.Condition from the WorkloadClass status if it matches
