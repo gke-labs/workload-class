@@ -90,8 +90,12 @@ var _ = Describe("Workload autoscaling controllers", Ordered, func() {
 			Scheme:                 scheme.Scheme,
 			Metrics:                metricsserver.Options{BindAddress: "0"},
 			HealthProbeBindAddress: "0",
-			Cache:                  cache.Options{DefaultNamespaces: map[string]cache.Config{namespace: {}}},
-			Controller:             config.Controller{SkipNameValidation: ptr.To(true)},
+			// As in cmd/main.go, the cached Deployments and StatefulSets are trimmed.
+			Cache: cache.Options{
+				DefaultNamespaces: map[string]cache.Config{namespace: {}},
+				ByObject:          WorkloadCacheByObject(),
+			},
+			Controller: config.Controller{SkipNameValidation: ptr.To(true)},
 		})
 		Expect(err).NotTo(HaveOccurred())
 

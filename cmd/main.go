@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -44,6 +45,7 @@ import (
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/controller"
+	wcmetrics "github.com/gke-labs/workload-class/internal/metrics"
 	"github.com/gke-labs/workload-class/internal/utils"
 	internalwebhook "github.com/gke-labs/workload-class/internal/webhook"
 	webhookv1 "github.com/gke-labs/workload-class/internal/webhook/v1"
@@ -217,6 +219,16 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
+	// The workload autoscaling controllers watch every Deployment and StatefulSet in the cluster, so their
+	// cached copies are trimmed down to the fields that the controllers read.
+	cacheByObject := controller.WorkloadCacheByObject()
+	// Only the cluster autoscaler status ConfigMap is read (for Spot capacity detection), so scope the
+	// ConfigMap informer to it rather than caching every ConfigMap in the cluster.
+	cacheByObject[&corev1.ConfigMap{}] = cache.ByObject{
+		Namespaces: map[string]cache.Config{controller.ClusterAutoscalerStatusNamespace: {}},
+		Field:      fields.OneTermEqualSelector("metadata.name", controller.ClusterAutoscalerStatusName),
+	}
+
 	restConfig := ctrl.GetConfigOrDie()
 	applyRestConfigRateLimits(restConfig, kubeAPIQPS, kubeAPIBurst)
 
@@ -230,16 +242,7 @@ func main() {
 		// VerticalPodAutoscalers are handled as unstructured objects. Read them from the cache, like typed
 		// objects, rather than from the API server on every reconcile.
 		Client: client.Options{Cache: &client.CacheOptions{Unstructured: true}},
-		// Only the cluster autoscaler status ConfigMap is read (for Spot capacity detection), so scope the
-		// ConfigMap informer to it rather than caching every ConfigMap in the cluster.
-		Cache: cache.Options{
-			ByObject: map[client.Object]cache.ByObject{
-				&corev1.ConfigMap{}: {
-					Namespaces: map[string]cache.Config{controller.ClusterAutoscalerStatusNamespace: {}},
-					Field:      fields.OneTermEqualSelector("metadata.name", controller.ClusterAutoscalerStatusName),
-				},
-			},
-		},
+		Cache:  cache.Options{ByObject: cacheByObject},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -327,6 +330,9 @@ func main() {
 		os.Exit(1)
 	}
 	if enableResourceManagement {
+		// Report the number of managed autoscalers on the metrics endpoint.
+		ctrlmetrics.Registry.MustRegister(wcmetrics.NewManagedAutoscalersCollector(mgr.GetClient(), vpaInstalled))
+
 		// One controller per kind of workload that resource management governs.
 		for _, kind := range []string{utils.DeploymentKind, utils.StatefulSetKind} {
 			if err := (&controller.WorkloadAutoscalingReconciler{

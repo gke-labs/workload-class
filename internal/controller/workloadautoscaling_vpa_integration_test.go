@@ -103,7 +103,11 @@ var _ = Describe("Workload rightsizing controllers", Ordered, func() {
 			Scheme:                 scheme.Scheme,
 			Metrics:                metricsserver.Options{BindAddress: "0"},
 			HealthProbeBindAddress: "0",
-			Cache:                  cache.Options{DefaultNamespaces: map[string]cache.Config{namespace: {}}},
+			// As in cmd/main.go, the cached Deployments and StatefulSets are trimmed.
+			Cache: cache.Options{
+				DefaultNamespaces: map[string]cache.Config{namespace: {}},
+				ByObject:          WorkloadCacheByObject(),
+			},
 			// As in cmd/main.go: read the unstructured VPAs from the cache.
 			Client:     client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 			Controller: config.Controller{SkipNameValidation: ptr.To(true)},
