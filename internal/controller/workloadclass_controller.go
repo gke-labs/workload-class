@@ -114,6 +114,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	baseValidationCond := validatedCondition(ctx, wc, guardrails, overlapping)
 	disruptionCond := disruptionValidatedCondition(wc, guardrails, overlapping)
+	// The resource management pillar is validated independently of the disruption and placement pillars, so a
+	// resource management error never drops disruption protection or disables valid placement configuration.
+	resourceManagementCond := resourceManagementValidatedCondition(wc, guardrails, overlapping)
 
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
@@ -146,6 +149,11 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			changed = meta.SetStatusCondition(&latest.Status.Conditions, *placementCond) || changed
 		} else {
 			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypePlacementValidated) || changed
+		}
+		if resourceManagementCond != nil {
+			changed = meta.SetStatusCondition(&latest.Status.Conditions, *resourceManagementCond) || changed
+		} else {
+			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypeResourceManagementValidated) || changed
 		}
 		changed = meta.SetStatusCondition(&latest.Status.Conditions, cond) || changed
 		if latest.Status.MaintenanceReadiness != readiness {
@@ -747,7 +755,8 @@ func gracePeriodPassed(wc *workloadsv1.WorkloadClass, pod *corev1.Pod, now time.
 
 // validatedCondition builds the Validated condition for the WorkloadClass.
 //
-// Spec, guardrail, and capacity strategy violations take precedence and are reported with ReasonValidationFailed.
+// Spec, guardrail, capacity strategy, and resource management violations take precedence and are reported with
+// ReasonValidationFailed.
 // If the only problem is that the PodSelector overlaps with other WorkloadClasses in the namespace,
 // ReasonSelectorOverlap is used instead. Overlap is intentionally reported symmetrically on every
 // WorkloadClass involved so that any affected workload owner sees the conflict, while keeping a
@@ -762,6 +771,7 @@ func validatedCondition(
 	violations := validateSpec(wc)
 	violations = append(violations, validateAgainstGuardrails(wc, guardrails.Items)...)
 	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
 	return buildValidationCondition(workloadsv1.ConditionTypeValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
 }
 
@@ -795,6 +805,43 @@ func placementValidatedCondition(
 	cond := buildValidationCondition(workloadsv1.ConditionTypePlacementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
 	reconcileConditions(&cond, pluginCond)
 	return &cond
+}
+
+// resourceManagementValidatedCondition builds the ResourceManagementValidated condition, which gates the
+// HorizontalPodAutoscalers and VerticalPodAutoscalers created for the workloads that the WorkloadClass governs.
+// It returns nil when the WorkloadClass has no resourceManagement, so the reconciler removes any stale condition.
+//
+// Like the other per-pillar conditions, it reports a PodSelector overlap with ReasonSelectorOverlap only when
+// there is no other violation, so consumers can keep treating an overlapping WorkloadClass as valid.
+func resourceManagementValidatedCondition(
+	wc *workloadsv1.WorkloadClass,
+	guardrails *workloadsv1.WorkloadClassGuardrailList,
+	overlapping []workloadsv1.WorkloadClass,
+) *metav1.Condition {
+	if wc.Spec.ResourceManagement == nil {
+		return nil
+	}
+	var violations []string
+	if wc.Spec.PodSelector != nil {
+		if _, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
+			violations = append(violations, fmt.Sprintf("`podSelector` must be a valid label selector: %v", err))
+		}
+	}
+	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
+	cond := buildValidationCondition(workloadsv1.ConditionTypeResourceManagementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+	return &cond
+}
+
+// validateResourceManagement returns the problems in the WorkloadClass resourceManagement that the CRD schema
+// does not catch, and the effective guardrail resourceManagement constraints that it violates. Guardrail names
+// are omitted, as in validateAgainstGuardrails, and constraints across all guardrails are combined into the
+// strictest effective limit.
+func validateResourceManagement(wc *workloadsv1.WorkloadClass, guardrails []workloadsv1.WorkloadClassGuardrail) []string {
+	if wc.Spec.ResourceManagement == nil {
+		return nil
+	}
+	violations := utils.ResourceManagementSpecViolations(wc.Spec.ResourceManagement)
+	return append(violations, utils.ResourceManagementViolations(wc, utils.EffectiveResourceManagementConstraints(guardrails))...)
 }
 
 func buildValidationCondition(

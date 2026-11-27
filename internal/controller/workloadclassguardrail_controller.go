@@ -93,6 +93,11 @@ func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *work
 		violations = append(violations, pluginViolations...)
 	}
 
+	if rmViolations := utils.ResourceManagementConstraintViolations(g.Spec.Constraints.ResourceManagement); len(rmViolations) > 0 {
+		log.Info("validation of resourceManagement constraints failed", "violations", rmViolations)
+		violations = append(violations, rmViolations...)
+	}
+
 	return condition(g.Generation, violations)
 }
 

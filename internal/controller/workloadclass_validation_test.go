@@ -23,8 +23,11 @@ import (
 	"strings"
 	"testing"
 
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -380,5 +383,217 @@ func TestProtectsPods(t *testing.T) {
 				t.Errorf("protectsPods(%q, %t) = %t, want %t", tc.reason, tc.hasGuardrails, got, tc.want)
 			}
 		})
+	}
+}
+
+func testRMGuardrail(name string, rm *workloadsv1.ResourceManagementConstraints) workloadsv1.WorkloadClassGuardrail {
+	g := testGuardrail(name, workloadsv1.Disruption{MaxNonDisruptionDurationDays: 30})
+	g.Spec.Constraints.ResourceManagement = rm
+	return g
+}
+
+func testResourceManagementWC() *workloadsv1.WorkloadClass {
+	wc := testWorkloadClass("wc", "ns", map[string]string{"app": "nginx"})
+	wc.Generation = 4
+	wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 10
+	wc.Spec.ResourceManagement = &workloadsv1.ResourceManagement{
+		Autoscaling: &workloadsv1.Autoscaling{
+			Replicas: workloadsv1.ReplicaBounds{Min: ptr.To[int32](2), Max: 20},
+			Metrics:  []autoscalingv2.MetricSpec{cpuUtilizationMetric()},
+			Profile:  workloadsv1.AutoscalingProfileBalanced,
+		},
+		Rightsizing: &workloadsv1.Rightsizing{
+			Mode:           workloadsv1.RightsizingModeAuto,
+			UpdateStrategy: workloadsv1.RightsizingUpdateStrategyInPlacePreferred,
+			Bounds: &workloadsv1.ContainerBounds{
+				Min: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+				Max: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")},
+			},
+		},
+	}
+	return wc
+}
+
+func TestResourceManagementValidatedCondition(t *testing.T) {
+	permissive := testRMGuardrail("permissive", &workloadsv1.ResourceManagementConstraints{
+		MaxReplicas:             ptr.To[int32](100),
+		AllowedRightsizingModes: []workloadsv1.RightsizingMode{workloadsv1.RightsizingModeRecommend, workloadsv1.RightsizingModeAuto},
+	})
+	overlapping := []workloadsv1.WorkloadClass{*testWorkloadClass("wc-same", "ns", map[string]string{"app": "nginx"})}
+
+	testCases := []struct {
+		name        string
+		mutate      func(*workloadsv1.WorkloadClass)
+		guardrails  []workloadsv1.WorkloadClassGuardrail
+		overlapping []workloadsv1.WorkloadClass
+		wantStatus  metav1.ConditionStatus
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name:       "no_guardrails",
+			wantStatus: metav1.ConditionTrue,
+			wantReason: workloadsv1.ReasonNoGuardrails,
+		},
+		{
+			name:       "guardrails_without_resource_management_constraints",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{testRMGuardrail("disruption-only", nil)},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: workloadsv1.ReasonValidationPassed,
+		},
+		{
+			name:       "complies_with_guardrails",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{permissive},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: workloadsv1.ReasonValidationPassed,
+		},
+		{
+			name: "max_replicas",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{
+				permissive,
+				testRMGuardrail("strict", &workloadsv1.ResourceManagementConstraints{MaxReplicas: ptr.To[int32](10)}),
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.autoscaling.replicas.max` must be at most 10 (guardrail limit), got 20",
+		},
+		{
+			name: "allowed_autoscaling_profiles",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{testRMGuardrail("profiles", &workloadsv1.ResourceManagementConstraints{
+				AllowedAutoscalingProfiles: []workloadsv1.AutoscalingProfile{workloadsv1.AutoscalingProfileConservative},
+			})},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.autoscaling.profile` must be one of 'Conservative' (guardrail limit), got 'Balanced'",
+		},
+		{
+			name: "allowed_metric_types",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{testRMGuardrail("metrics", &workloadsv1.ResourceManagementConstraints{
+				AllowedMetricTypes: []autoscalingv2.MetricSourceType{autoscalingv2.ExternalMetricSourceType},
+			})},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.autoscaling.metrics` must only use metric types 'External' (guardrail limit), got 'Resource'",
+		},
+		{
+			name: "allowed_rightsizing_modes",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{testRMGuardrail("modes", &workloadsv1.ResourceManagementConstraints{
+				AllowedRightsizingModes: []workloadsv1.RightsizingMode{workloadsv1.RightsizingModeOff, workloadsv1.RightsizingModeRecommend},
+			})},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.rightsizing.mode` must be one of 'Off', 'Recommend' (guardrail limit), got 'Auto'",
+		},
+		{
+			name: "allowed_update_strategies",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{testRMGuardrail("strategies", &workloadsv1.ResourceManagementConstraints{
+				AllowedUpdateStrategies: []workloadsv1.RightsizingUpdateStrategy{workloadsv1.RightsizingUpdateStrategyRecreate},
+			})},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.rightsizing.updateStrategy` must be one of 'Recreate' (guardrail limit), got 'InPlacePreferred'",
+		},
+		{
+			name: "container_bounds",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{testRMGuardrail("bounds", &workloadsv1.ResourceManagementConstraints{
+				ContainerBounds: &workloadsv1.ContainerBounds{Max: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")}},
+			})},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.rightsizing.bounds.max.memory` must be at most '4Gi' (guardrail limit), got '8Gi'",
+		},
+		{
+			name: "guardrail_conflict",
+			guardrails: []workloadsv1.WorkloadClassGuardrail{
+				testRMGuardrail("auto-only", &workloadsv1.ResourceManagementConstraints{
+					AllowedRightsizingModes: []workloadsv1.RightsizingMode{workloadsv1.RightsizingModeAuto},
+				}),
+				testRMGuardrail("off-only", &workloadsv1.ResourceManagementConstraints{
+					AllowedRightsizingModes: []workloadsv1.RightsizingMode{workloadsv1.RightsizingModeOff},
+				}),
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "cluster guardrails restrict `allowedRightsizingModes` to disjoint sets",
+		},
+		{
+			name: "spec_violation",
+			mutate: func(wc *workloadsv1.WorkloadClass) {
+				wc.Spec.ResourceManagement.Autoscaling.Metrics[0].Resource.Target.Type = autoscalingv2.ValueMetricType
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`resourceManagement.autoscaling.metrics[0].resource.target.type` must be one of 'Utilization', 'AverageValue'",
+		},
+		{
+			name: "invalid_pod_selector",
+			mutate: func(wc *workloadsv1.WorkloadClass) {
+				wc.Spec.PodSelector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "tier", Operator: metav1.LabelSelectorOpIn}}
+			},
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonValidationFailed,
+			wantMessage: "`podSelector` must be a valid label selector",
+		},
+		{
+			name:        "selector_overlap_only",
+			guardrails:  []workloadsv1.WorkloadClassGuardrail{permissive},
+			overlapping: overlapping,
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  workloadsv1.ReasonSelectorOverlap,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := testResourceManagementWC()
+			if tc.mutate != nil {
+				tc.mutate(wc)
+			}
+			got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{Items: tc.guardrails}, tc.overlapping)
+			if got == nil {
+				t.Fatal("resourceManagementValidatedCondition() = nil, want a condition")
+			}
+			if got.Type != workloadsv1.ConditionTypeResourceManagementValidated {
+				t.Errorf("Type = %q, want %q", got.Type, workloadsv1.ConditionTypeResourceManagementValidated)
+			}
+			if got.Status != tc.wantStatus || got.Reason != tc.wantReason {
+				t.Errorf("got (%s, %s), want (%s, %s); message: %q", got.Status, got.Reason, tc.wantStatus, tc.wantReason, got.Message)
+			}
+			if !strings.Contains(got.Message, tc.wantMessage) {
+				t.Errorf("Message = %q, want it to contain %q", got.Message, tc.wantMessage)
+			}
+			if got.ObservedGeneration != wc.Generation {
+				t.Errorf("ObservedGeneration = %d, want %d", got.ObservedGeneration, wc.Generation)
+			}
+		})
+	}
+}
+
+func TestResourceManagementValidatedConditionUnset(t *testing.T) {
+	wc := testWorkloadClass("wc", "ns", map[string]string{"app": "nginx"})
+	if got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{}, nil); got != nil {
+		t.Errorf("resourceManagementValidatedCondition() = %+v, want nil when resourceManagement is unset", got)
+	}
+}
+
+// A resource management violation fails the overall Validated rollup, but never the DisruptionValidated condition
+// that gates Per-Pod PDB protection.
+func TestResourceManagementViolationIsIsolatedFromDisruption(t *testing.T) {
+	wc := testResourceManagementWC()
+	guardrails := &workloadsv1.WorkloadClassGuardrailList{Items: []workloadsv1.WorkloadClassGuardrail{
+		testRMGuardrail("strict", &workloadsv1.ResourceManagementConstraints{MaxReplicas: ptr.To[int32](5)}),
+	}}
+
+	disruption := disruptionValidatedCondition(wc, guardrails, nil)
+	if disruption.Status != metav1.ConditionTrue || disruption.Reason != workloadsv1.ReasonValidationPassed {
+		t.Errorf("DisruptionValidated = (%s, %s), want (True, %s); message: %q",
+			disruption.Status, disruption.Reason, workloadsv1.ReasonValidationPassed, disruption.Message)
+	}
+
+	validated := validatedCondition(context.Background(), wc, guardrails, nil)
+	if validated.Status != metav1.ConditionFalse || validated.Reason != workloadsv1.ReasonValidationFailed {
+		t.Errorf("Validated = (%s, %s), want (False, %s)", validated.Status, validated.Reason, workloadsv1.ReasonValidationFailed)
+	}
+	if want := "`resourceManagement.autoscaling.replicas.max` must be at most 5"; !strings.Contains(validated.Message, want) {
+		t.Errorf("Validated message = %q, want it to contain %q", validated.Message, want)
 	}
 }
