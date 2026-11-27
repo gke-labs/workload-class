@@ -66,9 +66,23 @@ type WorkloadClassReconciler struct {
 	// are applied.
 	LeaseTracker *utils.PendingLeaseTracker
 
-	// utilizationWarned records the generation of each WorkloadClass for which the UtilizationWithoutRequests
-	// event was last recorded, so that it is recorded once per generation rather than on every reconcile.
-	utilizationWarned sync.Map
+	// VPAInstalled reports whether the VerticalPodAutoscaler CRD is installed on the cluster. If it is not,
+	// WorkloadClasses that set rightsizing stay valid, but are told that rightsizing is not applied.
+	VPAInstalled bool
+
+	// CoordinatedResources are the resources for which the platform coordinates horizontal scaling on
+	// utilization with rightsizing (see utils.RightsizedResources).
+	CoordinatedResources []corev1.ResourceName
+
+	// recorded holds the generation of each WorkloadClass for which each once-per-generation event was last
+	// recorded (see recordOncePerGeneration).
+	recorded sync.Map
+}
+
+// oncePerGenerationKey identifies a once-per-generation event of a WorkloadClass.
+type oncePerGenerationKey struct {
+	reason        string
+	workloadClass client.ObjectKey
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -90,7 +104,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if apierrors.IsNotFound(err) {
 			// Discard any lease requests for a deleted WorkloadClass.
 			r.LeaseTracker.Drain(req.NamespacedName)
-			r.utilizationWarned.Delete(req.NamespacedName)
+			for _, reason := range oncePerGenerationReasons {
+				r.recorded.Delete(oncePerGenerationKey{reason: reason, workloadClass: req.NamespacedName})
+			}
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -124,9 +140,10 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Resource management is validated independently of the other pillars: a violation never drops disruption
 	// protection or disables valid placement configuration, and the other pillars never disable resource
 	// management. The condition only depends on the spec, the guardrails and the overlapping WorkloadClasses.
-	rmCond := resourceManagementValidatedCondition(wc, guardrails, overlapping)
+	rmCond := resourceManagementValidatedCondition(wc, guardrails, overlapping, r.VPAInstalled)
 
 	r.warnUtilizationWithoutRequests(wc)
+	r.warnRightsizingNotApplied(wc)
 
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
@@ -821,10 +838,15 @@ func placementValidatedCondition(
 //
 // It returns nil when the WorkloadClass does not set resourceManagement and no guardrail requires initial
 // resources, so that the condition is only present on WorkloadClasses that the pillar applies to.
+//
+// vpaInstalled only changes the message of the condition, never its status: a WorkloadClass that sets
+// rightsizing on a cluster without the VerticalPodAutoscaler CRD stays valid, so that its initial resources
+// and autoscaling still apply, and its message says that rightsizing is not applied.
 func resourceManagementValidatedCondition(
 	wc *workloadsv1.WorkloadClass,
 	guardrails *workloadsv1.WorkloadClassGuardrailList,
 	overlapping []workloadsv1.WorkloadClass,
+	vpaInstalled bool,
 ) *metav1.Condition {
 	if wc.Spec.ResourceManagement == nil &&
 		!utils.EffectiveResourceManagementConstraints(guardrails.Items).RequireInitialResources {
@@ -838,12 +860,81 @@ func resourceManagementValidatedCondition(
 	}
 	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
 	cond := buildValidationCondition(workloadsv1.ConditionTypeResourceManagementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+	if !vpaInstalled && wantsRightsizing(wc) {
+		cond.Message = truncateMessage(cond.Message+"; "+vpaNotInstalledMsg, maxConditionMessageLen)
+	}
 	return &cond
 }
 
-// reasonUtilizationWithoutRequests is the event reason recorded on a WorkloadClass that scales on the
-// utilization of a resource without setting initial resources.
-const reasonUtilizationWithoutRequests = "UtilizationWithoutRequests"
+// wantsRightsizing reports whether the WorkloadClass sets rightsizing with a mode other than Off.
+func wantsRightsizing(wc *workloadsv1.WorkloadClass) bool {
+	rm := wc.Spec.ResourceManagement
+	return rm != nil && utils.EffectiveRightsizingMode(rm.Rightsizing) != workloadsv1.RightsizingModeOff
+}
+
+const (
+	// reasonUtilizationWithoutRequests is the event reason recorded on a WorkloadClass that scales on the
+	// utilization of a resource without setting initial resources.
+	reasonUtilizationWithoutRequests = "UtilizationWithoutRequests"
+	// reasonVPANotInstalled is the event reason recorded on a WorkloadClass that sets rightsizing when the
+	// VerticalPodAutoscaler CRD is not installed on the cluster.
+	reasonVPANotInstalled = "VPANotInstalled"
+	// reasonRightsizingSkipped is the event reason recorded on a WorkloadClass whose rightsizing leaves a
+	// resource alone because its autoscaling scales on the utilization of that resource.
+	reasonRightsizingSkipped = "RightsizingSkipped"
+
+	actionValidateResourceManagement = "ValidateResourceManagement"
+
+	vpaNotInstalledMsg = "VPA is not installed; rightsizing is not applied"
+)
+
+// oncePerGenerationReasons are the reasons of the events that are recorded once per generation of a
+// WorkloadClass.
+var oncePerGenerationReasons = []string{reasonUtilizationWithoutRequests, reasonVPANotInstalled, reasonRightsizingSkipped}
+
+// recordOncePerGeneration records an event on the WorkloadClass, unless an event with the same reason was
+// already recorded for its current generation. The WorkloadClass is reconciled on every change of its Pods
+// and at every readiness transition, so recording on each reconcile would repeat the event indefinitely.
+func (r *WorkloadClassReconciler) recordOncePerGeneration(wc *workloadsv1.WorkloadClass, eventType, reason, note string, args ...any) {
+	if r.Recorder == nil {
+		return
+	}
+	key := oncePerGenerationKey{reason: reason, workloadClass: client.ObjectKeyFromObject(wc)}
+	if gen, ok := r.recorded.Load(key); ok && gen == wc.Generation {
+		return
+	}
+	r.recorded.Store(key, wc.Generation)
+	r.Recorder.Eventf(wc, nil, eventType, reason, actionValidateResourceManagement, note, args...)
+}
+
+// warnRightsizingNotApplied records an event when the rightsizing of the WorkloadClass is not applied, or
+// only in part, even though the WorkloadClass is valid:
+//   - VPANotInstalled: the VerticalPodAutoscaler CRD is not installed, so no VPA can be created.
+//   - RightsizingSkipped: a resource is left out of rightsizing because the autoscaling of the
+//     WorkloadClass scales on its utilization (see utils.RightsizedResources).
+func (r *WorkloadClassReconciler) warnRightsizingNotApplied(wc *workloadsv1.WorkloadClass) {
+	if !wantsRightsizing(wc) {
+		return
+	}
+	if !r.VPAInstalled {
+		r.recordOncePerGeneration(wc, corev1.EventTypeWarning, reasonVPANotInstalled,
+			"rightsizing is set, but the VerticalPodAutoscaler CRD is not installed on the cluster, so rightsizing is not applied")
+		return
+	}
+	controlled, skipped := utils.RightsizedResources(wc.Spec.ResourceManagement, r.CoordinatedResources)
+	if len(skipped) == 0 {
+		return
+	}
+	names := make([]string, 0, len(skipped))
+	for _, name := range skipped {
+		names = append(names, string(name))
+	}
+	note := "rightsizing leaves %s to horizontal scaling, because autoscaling scales on its utilization"
+	if len(controlled) == 0 {
+		note += "; no VerticalPodAutoscaler is created"
+	}
+	r.recordOncePerGeneration(wc, corev1.EventTypeNormal, reasonRightsizingSkipped, note, strings.Join(names, " and "))
+}
 
 // warnUtilizationWithoutRequests records a warning event when the WorkloadClass scales on the utilization of
 // a resource but does not set initialResources. Utilization is measured against the request, so the
@@ -854,25 +945,19 @@ const reasonUtilizationWithoutRequests = "UtilizationWithoutRequests"
 // of an admission warning.
 func (r *WorkloadClassReconciler) warnUtilizationWithoutRequests(wc *workloadsv1.WorkloadClass) {
 	rm := wc.Spec.ResourceManagement
-	if r.Recorder == nil || rm == nil || rm.Autoscaling == nil || rm.InitialResources != nil {
+	if rm == nil || rm.Autoscaling == nil || rm.InitialResources != nil {
 		return
 	}
 	resources := utils.UtilizationTargetedResources(rm.Autoscaling.Metrics)
 	if len(resources) == 0 {
 		return
 	}
-	key := client.ObjectKeyFromObject(wc)
-	if gen, ok := r.utilizationWarned.Load(key); ok && gen == wc.Generation {
-		return
-	}
-	r.utilizationWarned.Store(key, wc.Generation)
-
 	names := make([]string, 0, len(resources))
 	for _, name := range resources {
 		names = append(names, string(name))
 	}
 	list := strings.Join(names, " and ")
-	r.Recorder.Eventf(wc, nil, corev1.EventTypeWarning, reasonUtilizationWithoutRequests, "ValidateResourceManagement",
+	r.recordOncePerGeneration(wc, corev1.EventTypeWarning, reasonUtilizationWithoutRequests,
 		"autoscaling scales on the utilization of %s, but initialResources is not set: containers without a %s request cannot be scaled on utilization",
 		list, list)
 }

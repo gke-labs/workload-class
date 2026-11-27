@@ -98,6 +98,7 @@ func main() {
 	var kubeAPIBurst int
 	var enableInitialResources bool
 	var enableResourceManagement bool
+	var coordinatedHPAVPAResources string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -128,6 +129,10 @@ func main() {
 		"If set, the manager creates and manages the autoscalers that the resourceManagement of a WorkloadClass asks "+
 			"for on the Deployments and StatefulSets it governs. Use --enable-resource-management=false to turn this off; "+
 			"existing managed autoscalers are then left as they are.")
+	flag.StringVar(&coordinatedHPAVPAResources, "coordinated-hpa-vpa-resources", "",
+		"Comma-separated list of the resources (cpu, memory) for which the platform coordinates horizontal scaling on "+
+			"utilization with rightsizing. By default, a resource whose utilization a WorkloadClass scales on is left out "+
+			"of rightsizing. Only list a resource if the platform keeps the two autoscalers from fighting over its request.")
 	flag.BoolVar(&enableInitialResources, "enable-initial-resources", true,
 		"If set, the Pod webhook fills in the initialResources of a WorkloadClass on the containers of the Pods it "+
 			"governs. Use --enable-initial-resources=false to turn off this Pod mutation without affecting placement.")
@@ -138,6 +143,12 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	coordinatedResources, err := utils.ParseCoordinatedResources(coordinatedHPAVPAResources)
+	if err != nil {
+		setupLog.Error(err, "Invalid --coordinated-hpa-vpa-resources")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -216,6 +227,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "63ace8e3.gke.io",
+		// VerticalPodAutoscalers are handled as unstructured objects. Read them from the cache, like typed
+		// objects, rather than from the API server on every reconcile.
+		Client: client.Options{Cache: &client.CacheOptions{Unstructured: true}},
 		// Only the cluster autoscaler status ConfigMap is read (for Spot capacity detection), so scope the
 		// ConfigMap informer to it rather than caching every ConfigMap in the cluster.
 		Cache: cache.Options{
@@ -249,12 +263,23 @@ func main() {
 	// multiple replicas, requests received by a non-leader replica would never be applied.
 	leaseTracker := utils.NewPendingLeaseTracker(utils.DefaultPendingLeaseBufferSize)
 
+	// Rightsizing needs the VerticalPodAutoscaler CRD. It is looked up once: watching a kind that the API
+	// server does not serve would keep the manager from starting.
+	vpaInstalled, err := controller.IsVPAInstalled(mgr.GetRESTMapper())
+	if err != nil {
+		setupLog.Error(err, "Failed to check whether the VerticalPodAutoscaler CRD is installed")
+		os.Exit(1)
+	}
+	setupLog.Info("Checked for the VerticalPodAutoscaler CRD", "installed", vpaInstalled)
+
 	if err := (&controller.WorkloadClassReconciler{
-		Client:       mgr.GetClient(),
-		APIReader:    mgr.GetAPIReader(),
-		Scheme:       mgr.GetScheme(),
-		Recorder:     mgr.GetEventRecorder("workloadclass-controller"),
-		LeaseTracker: leaseTracker,
+		Client:               mgr.GetClient(),
+		APIReader:            mgr.GetAPIReader(),
+		Scheme:               mgr.GetScheme(),
+		Recorder:             mgr.GetEventRecorder("workloadclass-controller"),
+		LeaseTracker:         leaseTracker,
+		VPAInstalled:         vpaInstalled,
+		CoordinatedResources: coordinatedResources,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadClass")
 		os.Exit(1)
@@ -305,10 +330,12 @@ func main() {
 		// One controller per kind of workload that resource management governs.
 		for _, kind := range []string{utils.DeploymentKind, utils.StatefulSetKind} {
 			if err := (&controller.WorkloadAutoscalingReconciler{
-				Client:   mgr.GetClient(),
-				Scheme:   mgr.GetScheme(),
-				Recorder: mgr.GetEventRecorder("workloadautoscaling-controller"),
-				Kind:     kind,
+				Client:               mgr.GetClient(),
+				Scheme:               mgr.GetScheme(),
+				Recorder:             mgr.GetEventRecorder("workloadautoscaling-controller"),
+				Kind:                 kind,
+				VPAInstalled:         vpaInstalled,
+				CoordinatedResources: coordinatedResources,
 			}).SetupWithManager(mgr); err != nil {
 				setupLog.Error(err, "Failed to create controller", "controller", "workloadautoscaling", "kind", kind)
 				os.Exit(1)

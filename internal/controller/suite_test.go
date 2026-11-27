@@ -67,7 +67,11 @@ var _ = BeforeSuite(func() {
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "config", "crd", "bases"),
+			// The upstream VerticalPodAutoscaler CRDs, for the specs that exercise rightsizing.
+			filepath.Join("..", "..", "test", "testdata", "crds"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 

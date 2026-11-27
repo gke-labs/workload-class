@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -58,6 +59,9 @@ func wasScheme(t *testing.T) *runtime.Scheme {
 			t.Fatalf("failed to build scheme: %v", err)
 		}
 	}
+	// VerticalPodAutoscalers are handled as unstructured objects.
+	scheme.AddKnownTypeWithName(utils.VPAGroupVersionKind, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(utils.VPAGroupVersionKind.GroupVersion().WithKind("VerticalPodAutoscalerList"), &unstructured.UnstructuredList{})
 	return scheme
 }
 
@@ -503,18 +507,18 @@ func TestWorkloadAutoscalingMapFunctions(t *testing.T) {
 	// A managed HPA maps to its controller owner, and a user HPA to its scale target.
 	managed := utils.BuildHPA(wasClass(), utils.WorkloadRef{Kind: utils.DeploymentKind, Namespace: wasNamespace, Name: "web"})
 	managed.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", Controller: ptr.To(true)}}
-	if got := names(e.r.findWorkloadForHPA(ctx, managed)); !slices.Equal(got, []string{"shop/web"}) {
+	if got := names(e.r.findWorkloadForAutoscaler(ctx, managed)); !slices.Equal(got, []string{"shop/web"}) {
 		t.Errorf("managed HPA maps to %v, want [shop/web]", got)
 	}
-	if got := names(e.r.findWorkloadForHPA(ctx, wasUserHPA("my-hpa", "Deployment", "api"))); !slices.Equal(got, []string{"shop/api"}) {
+	if got := names(e.r.findWorkloadForAutoscaler(ctx, wasUserHPA("my-hpa", "Deployment", "api"))); !slices.Equal(got, []string{"shop/api"}) {
 		t.Errorf("user HPA maps to %v, want [shop/api]", got)
 	}
 	// HPAs of the other kind of workload belong to the other reconciler.
 	managed.OwnerReferences[0].Kind = "StatefulSet"
-	if got := e.r.findWorkloadForHPA(ctx, managed); len(got) != 0 {
+	if got := e.r.findWorkloadForAutoscaler(ctx, managed); len(got) != 0 {
 		t.Errorf("expected a StatefulSet's managed HPA to be ignored, got %v", got)
 	}
-	if got := e.r.findWorkloadForHPA(ctx, wasUserHPA("sts-hpa", "StatefulSet", "db")); len(got) != 0 {
+	if got := e.r.findWorkloadForAutoscaler(ctx, wasUserHPA("sts-hpa", "StatefulSet", "db")); len(got) != 0 {
 		t.Errorf("expected a StatefulSet's user HPA to be ignored, got %v", got)
 	}
 }

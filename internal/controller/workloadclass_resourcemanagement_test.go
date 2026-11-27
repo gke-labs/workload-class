@@ -160,7 +160,7 @@ func TestResourceManagementValidatedCondition(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resourceManagementValidatedCondition(tc.wc, tc.guardrails, tc.overlapping)
+			got := resourceManagementValidatedCondition(tc.wc, tc.guardrails, tc.overlapping, true)
 			if tc.wantNil {
 				if got != nil {
 					t.Fatalf("expected no condition, got %+v", *got)
