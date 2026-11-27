@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -373,10 +374,23 @@ func (r *WorkloadAutoscalingReconciler) deleteManagedAutoscaler(ctx context.Cont
 }
 
 // claimAutoscaler sets the workload as the controller owner of a managed autoscaler. It refuses to modify an existing
-// object with the managed name that is not managed by a WorkloadClass.
+// object with the managed name that is not managed by a WorkloadClass, or that another object controls.
+//
+// The one exception is a previous incarnation of the workload: an object of the same kind and name with another UID.
+// When a workload is deleted and recreated before the garbage collector removes its autoscalers, the new workload
+// takes them over rather than waiting for them to be deleted and recreated. The garbage collector then finds a live
+// owner and keeps them.
 func (r *WorkloadAutoscalingReconciler) claimAutoscaler(owner, obj client.Object, kind string) error {
 	if obj.GetResourceVersion() != "" && !utils.IsWorkloadClassManagedAutoscaler(obj) {
 		return fmt.Errorf("%s %s/%s already exists and is not managed by a WorkloadClass", kind, obj.GetNamespace(), obj.GetName())
+	}
+	if ref := metav1.GetControllerOf(obj); ref != nil && ref.UID != owner.GetUID() {
+		if !targetsWorkload(ref.APIVersion, ref.Kind, ref.Name, utils.WorkloadRef{Kind: r.Workload.Kind, Name: owner.GetName()}) {
+			return fmt.Errorf("%s %s/%s is controlled by %s %s", kind, obj.GetNamespace(), obj.GetName(), ref.Kind, ref.Name)
+		}
+		obj.SetOwnerReferences(slices.DeleteFunc(slices.Clone(obj.GetOwnerReferences()), func(o metav1.OwnerReference) bool {
+			return o.UID == ref.UID
+		}))
 	}
 	return controllerutil.SetControllerReference(owner, obj, r.Scheme)
 }
