@@ -274,6 +274,26 @@ var _ = Describe("Workload autoscaling controllers", Ordered, func() {
 		expectNoHPA("wc-deployment-db")
 	})
 
+	It("applies the namespace's enforced WorkloadClass to every workload", func() {
+		// At this point, no PodSelector matches the Deployment "db".
+		expectNoHPA("wc-deployment-db")
+
+		ns := &corev1.Namespace{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
+		if ns.Labels == nil {
+			ns.Labels = map[string]string{}
+		}
+		ns.Labels[workloadsv1.EnforcedClassLabel] = "web-services"
+		Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+		hpa := expectHPA("wc-deployment-db", 50)
+		Expect(hpa.Labels).To(HaveKeyWithValue(utils.WorkloadClassLabel, "web-services"))
+
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
+		delete(ns.Labels, workloadsv1.EnforcedClassLabel)
+		Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+		expectNoHPA("wc-deployment-db")
+	})
+
 	It("deletes the HPAs when the WorkloadClass is deleted", func() {
 		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "web-services", Namespace: namespace}}
 		Expect(k8sClient.Delete(ctx, wc)).To(Succeed())

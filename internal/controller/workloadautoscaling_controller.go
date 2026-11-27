@@ -60,6 +60,8 @@ const (
 	reasonAutoscalerNameConflict = "AutoscalerNameConflict"
 
 	actionReconcileAutoscaler = "ReconcileAutoscaler"
+
+	hpaKindName = "HorizontalPodAutoscaler"
 )
 
 // WorkloadAutoscalingReconciler reconciles the managed autoscalers of one kind of workload (Deployments or
@@ -168,7 +170,9 @@ func (r *WorkloadAutoscalingReconciler) governingWorkloadClass(ctx context.Conte
 //   - A user-created HPA that targets the workload takes precedence: no managed HPA is kept for the workload.
 //   - If the WorkloadClass does not ask for an HPA, the managed HPA is deleted. The workload keeps its
 //     current number of replicas.
-//   - An object that uses the managed name but is not managed by a WorkloadClass is never modified.
+//   - An object that uses the managed name but is not managed by a WorkloadClass, or that another object
+//     controls, is never modified.
+//   - A managed HPA left behind by a previous workload with the same name is replaced.
 func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, workload client.Object, ref utils.WorkloadRef, wc *workloadsv1.WorkloadClass) error {
 	log := logf.FromContext(ctx)
 	name := utils.ManagedAutoscalerName(ref.Kind, ref.Name)
@@ -193,10 +197,9 @@ func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, worklo
 	}
 
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ref.Namespace}}
-	conflict := false
+	ownership := ownedByWorkload
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
-		if hpa.ResourceVersion != "" && !utils.IsWorkloadClassManagedAutoscaler(hpa) {
-			conflict = true
+		if ownership = autoscalerOwnership(hpa, workload, ref); ownership != ownedByWorkload {
 			return nil
 		}
 		if hpa.Labels == nil {
@@ -213,12 +216,15 @@ func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, worklo
 	if err != nil {
 		return fmt.Errorf("failed to reconcile HorizontalPodAutoscaler %s: %w", name, err)
 	}
-	if conflict {
-		log.Info("HorizontalPodAutoscaler with the managed name is not managed by a WorkloadClass; it will not be modified",
+	if ownership == ownedByPreviousWorkload {
+		return r.deleteStaleAutoscaler(ctx, hpa, hpaKindName)
+	}
+	if ownership == ownedByOther {
+		log.Info("HorizontalPodAutoscaler with the managed name does not belong to the workload; it will not be modified",
 			"horizontalPodAutoscaler", name)
 		r.Recorder.Eventf(workload, hpa, corev1.EventTypeWarning, reasonAutoscalerNameConflict, actionReconcileAutoscaler,
-			"HorizontalPodAutoscaler %s already exists and is not managed by a WorkloadClass, so the autoscaling of WorkloadClass %s is not applied",
-			name, wc.Name)
+			"HorizontalPodAutoscaler %s already exists and does not belong to this %s, so the autoscaling of WorkloadClass %s is not applied",
+			name, ref.Kind, wc.Name)
 		return nil
 	}
 	if op != controllerutil.OperationResultNone {
@@ -226,6 +232,53 @@ func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, worklo
 		r.Recorder.Eventf(workload, hpa, corev1.EventTypeNormal, reasonAutoscalerApplied, actionReconcileAutoscaler,
 			"HorizontalPodAutoscaler %s %s from the autoscaling of WorkloadClass %s", name, op, wc.Name)
 	}
+	return nil
+}
+
+// autoscalerOwner says who an existing object with the name of a managed autoscaler belongs to.
+type autoscalerOwner int
+
+const (
+	// ownedByWorkload: the object does not exist yet, or it is a managed autoscaler that the workload
+	// controls or that has no controller. It is created, updated or adopted.
+	ownedByWorkload autoscalerOwner = iota
+	// ownedByPreviousWorkload: a managed autoscaler controlled by an object with the kind and name of the
+	// workload but another UID. The workload was deleted and recreated with the same name, and the
+	// autoscaler of its previous incarnation has not been garbage collected yet. It is deleted, so that a
+	// new one can be created for the current workload.
+	ownedByPreviousWorkload
+	// ownedByOther: an object that is not managed by a WorkloadClass, or that another object controls. It is
+	// never modified or deleted.
+	ownedByOther
+)
+
+// autoscalerOwnership classifies an existing object with the name of the workload's managed autoscaler.
+func autoscalerOwnership(autoscaler, workload client.Object, ref utils.WorkloadRef) autoscalerOwner {
+	if autoscaler.GetResourceVersion() == "" {
+		return ownedByWorkload
+	}
+	if !utils.IsWorkloadClassManagedAutoscaler(autoscaler) {
+		return ownedByOther
+	}
+	owner := metav1.GetControllerOf(autoscaler)
+	switch {
+	case owner == nil || owner.UID == workload.GetUID():
+		return ownedByWorkload
+	case owner.Kind == ref.Kind && owner.Name == ref.Name:
+		return ownedByPreviousWorkload
+	default:
+		return ownedByOther
+	}
+}
+
+// deleteStaleAutoscaler deletes a managed autoscaler that belongs to a previous incarnation of the workload.
+// Its deletion re-queues the workload, which then gets a new autoscaler.
+func (r *WorkloadAutoscalingReconciler) deleteStaleAutoscaler(ctx context.Context, autoscaler client.Object, kind string) error {
+	uid := autoscaler.GetUID()
+	if err := r.Delete(ctx, autoscaler, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete %s %s of a previous workload: %w", kind, autoscaler.GetName(), err)
+	}
+	logf.FromContext(ctx).Info("Deleted autoscaler of a previous workload with the same name", "kind", kind, "name", autoscaler.GetName())
 	return nil
 }
 
