@@ -224,6 +224,9 @@ spec:
     - jsonPath: .status.conditions[?(@.type=='Validated')].status
       name: Validated
       type: string
+    - jsonPath: .status.conditions[?(@.type=='ResourceManagementValidated')].status
+      name: Autoscaling
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date

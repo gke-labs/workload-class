@@ -51,6 +51,10 @@ import (
 )
 
 const (
+	// EventReasonAutoscalerApplied is recorded on a workload when the controller creates or updates one of its
+	// managed autoscalers.
+	EventReasonAutoscalerApplied = "AutoscalerApplied"
+
 	// EventReasonUserAutoscalerPresent is recorded on a workload when a user-created autoscaler targets it, so the
 	// controller does not create its own autoscaler of that kind.
 	EventReasonUserAutoscalerPresent = "UserAutoscalerPresent"
@@ -169,7 +173,7 @@ func (r *WorkloadAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	ctx = logf.IntoContext(ctx, log.WithValues("workloadClass", wc.Name))
-	hpaErr := r.reconcileHPA(ctx, obj, workload, utils.BuildHPA(wc, workload))
+	hpaErr := r.reconcileHPA(ctx, obj, wc, workload, utils.BuildHPA(wc, workload))
 	vpaErr := r.reconcileVPA(ctx, obj, wc, workload)
 	return ctrl.Result{}, errors.Join(hpaErr, vpaErr)
 }
@@ -225,7 +229,7 @@ func autoscalingGateFor(wc *workloadsv1.WorkloadClass) (autoscalingGate, string)
 
 // reconcileHPA creates or updates the managed HorizontalPodAutoscaler of the workload, or deletes it if desired is
 // nil (the WorkloadClass has no autoscaling) or a user-created HorizontalPodAutoscaler targets the workload.
-func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, owner client.Object, workload utils.WorkloadRef, desired *autoscalingv2.HorizontalPodAutoscaler) error {
+func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, owner client.Object, wc *workloadsv1.WorkloadClass, workload utils.WorkloadRef, desired *autoscalingv2.HorizontalPodAutoscaler) error {
 	hpas := &autoscalingv2.HorizontalPodAutoscalerList{}
 	if err := r.List(ctx, hpas, client.InNamespace(workload.Namespace)); err != nil {
 		return fmt.Errorf("failed to list HorizontalPodAutoscalers: %w", err)
@@ -258,6 +262,7 @@ func (r *WorkloadAutoscalingReconciler) reconcileHPA(ctx context.Context, owner 
 	}
 	if op != controllerutil.OperationResultNone {
 		logf.FromContext(ctx).Info("Reconciled HorizontalPodAutoscaler", "horizontalPodAutoscaler", hpa.Name, "operation", op)
+		r.recordAutoscalerApplied(owner, wc, "HorizontalPodAutoscaler", hpa.Name, op)
 	}
 	return nil
 }
@@ -328,6 +333,7 @@ func (r *WorkloadAutoscalingReconciler) reconcileVPA(ctx context.Context, owner 
 	}
 	if op != controllerutil.OperationResultNone {
 		logf.FromContext(ctx).Info("Reconciled VerticalPodAutoscaler", "verticalPodAutoscaler", vpa.Name, "operation", op)
+		r.recordAutoscalerApplied(owner, wc, "VerticalPodAutoscaler", vpa.Name, op)
 	}
 	return nil
 }
@@ -393,6 +399,20 @@ func (r *WorkloadAutoscalingReconciler) claimAutoscaler(owner, obj client.Object
 		}))
 	}
 	return controllerutil.SetControllerReference(owner, obj, r.Scheme)
+}
+
+// recordAutoscalerApplied records an AutoscalerApplied event on the workload, related to its WorkloadClass, when a
+// managed autoscaler was created or updated.
+func (r *WorkloadAutoscalingReconciler) recordAutoscalerApplied(owner client.Object, wc *workloadsv1.WorkloadClass, kind, name string, op controllerutil.OperationResult) {
+	if r.Recorder == nil {
+		return
+	}
+	verb := "Updated"
+	if op == controllerutil.OperationResultCreated {
+		verb = "Created"
+	}
+	r.Recorder.Eventf(owner, wc, corev1.EventTypeNormal, EventReasonAutoscalerApplied, eventActionReconcileAutoscaler,
+		"%s %s %s from WorkloadClass %s", verb, kind, name, wc.Name)
 }
 
 func (r *WorkloadAutoscalingReconciler) recordUserAutoscalerPresent(owner client.Object, workload utils.WorkloadRef, kind, name string) {
@@ -623,8 +643,11 @@ func workloadClassAutoscalingPredicate() predicate.Funcs {
 }
 
 // SetupWorkloadAutoscalingControllers registers a WorkloadAutoscalingReconciler for each kind of workload that
-// resourceManagement applies to.
+// resourceManagement applies to, and the workloadclass_managed_autoscalers metric.
 func SetupWorkloadAutoscalingControllers(mgr ctrl.Manager, caps utils.AutoscalerCapabilities) error {
+	if err := registerManagedAutoscalerCollector(&ManagedAutoscalerCollector{Reader: mgr.GetClient(), VPAInstalled: caps.VPAInstalled}); err != nil {
+		return fmt.Errorf("failed to register the managed autoscaler metrics: %w", err)
+	}
 	for _, kind := range WorkloadKinds {
 		r := &WorkloadAutoscalingReconciler{
 			Client:       mgr.GetClient(),

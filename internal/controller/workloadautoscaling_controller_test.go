@@ -171,11 +171,16 @@ var _ = Describe("WorkloadAutoscaling Controller", func() {
 		Expect(metav1.IsControlledBy(hpa, deployment)).To(BeTrue())
 		want := utils.BuildHPA(wc, utils.WorkloadRef{Kind: "Deployment", Name: "web", Namespace: namespace})
 		Expect(equality.Semantic.DeepEqual(hpa.Spec, want.Spec)).To(BeTrue(), "spec = %+v, want %+v", hpa.Spec, want.Spec)
+		Expect(recorder.Events).To(Receive(And(
+			ContainSubstring(EventReasonAutoscalerApplied),
+			ContainSubstring("Created HorizontalPodAutoscaler wc-deployment-web from WorkloadClass web"),
+		)))
 
 		By("reconciling again without changes")
 		resourceVersion := hpa.ResourceVersion
 		Expect(reconcileWorkload(deployments, deployment)).To(Succeed())
 		Expect(getHPA(managedHPAKey("Deployment", "web")).ResourceVersion).To(Equal(resourceVersion))
+		Expect(recorder.Events).NotTo(Receive(), "an unchanged HorizontalPodAutoscaler records no event")
 	})
 
 	It("creates the HorizontalPodAutoscaler of a StatefulSet", func() {
@@ -207,6 +212,8 @@ var _ = Describe("WorkloadAutoscaling Controller", func() {
 		Expect(k8sClient.Update(ctx, hpa)).To(Succeed())
 		Expect(reconcileWorkload(deployments, deployment)).To(Succeed())
 		Expect(getHPA(managedHPAKey("Deployment", "web")).Spec.MaxReplicas).To(Equal(int32(10)))
+		Expect(recorder.Events).To(Receive(ContainSubstring("Created HorizontalPodAutoscaler")))
+		Expect(recorder.Events).To(Receive(ContainSubstring("Updated HorizontalPodAutoscaler")))
 
 		Expect(k8sClient.Delete(ctx, hpa)).To(Succeed())
 		Expect(reconcileWorkload(deployments, deployment)).To(Succeed())
@@ -293,7 +300,7 @@ var _ = Describe("WorkloadAutoscaling Controller", func() {
 		Expect(reconcileWorkload(deployments, deployment)).To(Succeed())
 		expectNoHPA(managedHPAKey("Deployment", "web"))
 		Expect(getHPA(client.ObjectKeyFromObject(userHPA)).Spec.MaxReplicas).To(Equal(int32(3)))
-		Expect(recorder.Events).To(Receive(ContainSubstring(EventReasonUserAutoscalerPresent)))
+		Eventually(recorder.Events).Should(Receive(ContainSubstring(EventReasonUserAutoscalerPresent)))
 
 		By("deleting the user HorizontalPodAutoscaler")
 		Expect(k8sClient.Delete(ctx, userHPA)).To(Succeed())

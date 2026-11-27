@@ -28,6 +28,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -245,6 +246,10 @@ func main() {
 					Namespaces: map[string]cache.Config{controller.ClusterAutoscalerStatusNamespace: {}},
 					Field:      fields.OneTermEqualSelector("metadata.name", controller.ClusterAutoscalerStatusName),
 				},
+				// The workload autoscaling controllers cache every Deployment and StatefulSet in the cluster, but only
+				// read their metadata and Pod template labels, so the rest is dropped to limit memory use.
+				&appsv1.Deployment{}:  {Transform: controller.TrimWorkloadForCache},
+				&appsv1.StatefulSet{}: {Transform: controller.TrimWorkloadForCache},
 			},
 		},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
