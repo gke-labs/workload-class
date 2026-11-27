@@ -111,6 +111,19 @@ type DisruptionPolicy struct {
 	// +kubebuilder:validation:Enum=IfHealthyBudget;AlwaysAllow
 	UnhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType `json:"unhealthyPodEvictionPolicy,omitempty"`
 
+	// ManageSafeToEvictAnnotation enables automatic lifecycle management of the
+	// "cluster-autoscaler.kubernetes.io/safe-to-evict" annotation on governed Pods.
+	// When true and the WorkloadClass protects Pods (valid against at least one
+	// WorkloadClassGuardrail) and is Ready or Overdue, "safe-to-evict: false" is temporarily
+	// removed and "workloads.gke.io/safe-to-evict-suspended: <workloadclass-name>" is recorded
+	// so Cluster Autoscaler can drain nodes during the maintenance window. When the window closes,
+	// validation fails, this option is disabled, Pod ownership/selector matching changes, or the
+	// WorkloadClass is deleted, suspended Pods have "safe-to-evict: false" restored.
+	// Note: in a cluster with no WorkloadClassGuardrail objects, the WorkloadClass does not
+	// protect Pods and this option has no effect (annotations are never suspended).
+	// +optional
+	ManageSafeToEvictAnnotation bool `json:"manageSafeToEvictAnnotation,omitempty"`
+
 	// MaxUnavailable limits how many governed Pods may be concurrently unavailable during disruptions
 	// (an integer such as 1, or a percentage string such as "25%"). Mutually exclusive with MinAvailable.
 	// When neither MaxUnavailable nor MinAvailable is set, in-window pacing is disabled.

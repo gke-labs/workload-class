@@ -221,6 +221,19 @@ spec:
                       ray.io/cluster, kueue.x-k8s.io/pod-group-name, kueue.x-k8s.io/workload-name).
                     maxLength: 253
                     type: string
+                  manageSafeToEvictAnnotation:
+                    description: |-
+                      ManageSafeToEvictAnnotation enables automatic lifecycle management of the
+                      "cluster-autoscaler.kubernetes.io/safe-to-evict" annotation on governed Pods.
+                      When true and the WorkloadClass protects Pods (valid against at least one
+                      WorkloadClassGuardrail) and is Ready or Overdue, "safe-to-evict: false" is temporarily
+                      removed and "workloads.gke.io/safe-to-evict-suspended: <workloadclass-name>" is recorded
+                      so Cluster Autoscaler can drain nodes during the maintenance window. When the window closes,
+                      validation fails, this option is disabled, Pod ownership/selector matching changes, or the
+                      WorkloadClass is deleted, suspended Pods have "safe-to-evict: false" restored.
+                      Note: in a cluster with no WorkloadClassGuardrail objects, the WorkloadClass does not
+                      protect Pods and this option has no effect (annotations are never suspended).
+                    type: boolean
                   maxNonDisruptionDurationDays:
                     description: |-
                       MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.

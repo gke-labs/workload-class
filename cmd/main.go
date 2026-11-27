@@ -242,6 +242,7 @@ func main() {
 
 	if err := (&controller.WorkloadClassReconciler{
 		Client:       mgr.GetClient(),
+		APIReader:    mgr.GetAPIReader(),
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorder("workloadclass-controller"),
 		LeaseTracker: leaseTracker,
@@ -250,8 +251,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.WorkloadClassGuardrailReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadClassGuardrail")
 		os.Exit(1)
@@ -260,9 +262,10 @@ func main() {
 	setupLog.Info("Registering disruption webhook")
 	mgr.GetWebhookServer().Register("/validate-disruption", &admission.Webhook{
 		Handler: &internalwebhook.DisruptionWebhook{
-			Client:       mgr.GetClient(),
-			Recorder:     mgr.GetEventRecorder("disruption-webhoook"),
-			LeaseTracker: leaseTracker,
+			Client:         mgr.GetClient(),
+			Recorder:       mgr.GetEventRecorder("disruption-webhoook"),
+			LeaseTracker:   leaseTracker,
+			BlockedTracker: utils.NewBlockedPodTracker(),
 		},
 	})
 
@@ -274,8 +277,9 @@ func main() {
 		}
 	}
 	if err := (&controller.GKESpotPlacementPolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "gkespotplacementpolicy")
 		os.Exit(1)
