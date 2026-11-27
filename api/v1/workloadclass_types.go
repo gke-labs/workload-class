@@ -530,6 +530,7 @@ type WorkloadClassStatus struct {
 // +kubebuilder:printcolumn:name="SpotRatio",type="string",JSONPath=".spec.capacityStrategy.spotRatio"
 // +kubebuilder:printcolumn:name="Profile",type="string",JSONPath=".spec.infrastructureProfileRef.name"
 // +kubebuilder:printcolumn:name="Validated",type="string",JSONPath=".status.conditions[?(@.type=='Validated')].status"
+// +kubebuilder:printcolumn:name="Autoscaling",type="string",JSONPath=".status.conditions[?(@.type=='ResourceManagementValidated')].status"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // WorkloadClass is the Schema for the workloadclasses API

@@ -120,7 +120,7 @@ var _ = Describe("WorkloadAutoscaling Controller rightsizing", func() {
 			Expect(controllerRef).NotTo(BeNil())
 			Expect(controllerRef.UID).To(Equal(deployment.UID))
 			if wantEvent != "" {
-				Expect(recorder.Events).To(Receive(ContainSubstring(wantEvent)))
+				Eventually(recorder.Events).Should(Receive(ContainSubstring(wantEvent)))
 			}
 
 			By("reconciling again without changes")
@@ -185,7 +185,7 @@ var _ = Describe("WorkloadAutoscaling Controller rightsizing", func() {
 		createDeployment()
 		reconcileWeb(newReconciler(vpaCaps))
 		expectNoVPA()
-		Expect(recorder.Events).To(Receive(ContainSubstring(EventReasonRightsizingSkipped)))
+		Eventually(recorder.Events).Should(Receive(ContainSubstring(EventReasonRightsizingSkipped)))
 	})
 
 	It("applies the guardrail containerBounds when the WorkloadClass sets no bounds", func() {
@@ -232,7 +232,7 @@ var _ = Describe("WorkloadAutoscaling Controller rightsizing", func() {
 		Expect(k8sClient.Create(ctx, userVPA)).To(Succeed())
 		reconcileWeb(r)
 		expectNoVPA()
-		Expect(recorder.Events).To(Receive(ContainSubstring(EventReasonUserAutoscalerPresent)))
+		Eventually(recorder.Events).Should(Receive(ContainSubstring(EventReasonUserAutoscalerPresent)))
 
 		Expect(k8sClient.Delete(ctx, userVPA)).To(Succeed())
 		reconcileWeb(r)
