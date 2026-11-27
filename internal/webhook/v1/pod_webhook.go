@@ -35,12 +35,14 @@ import (
 // podlog is for logging in this package.
 var podlog = logf.Log.WithName("pod-resource")
 
-// SetupPodWebhookWithManager registers the webhook for Pod in the manager.
-func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
+// SetupPodWebhookWithManager registers the webhook for Pod in the manager. If enableInitialResources is
+// false, the webhook never fills in initial resources and only applies placement.
+func SetupPodWebhookWithManager(mgr ctrl.Manager, enableInitialResources bool) error {
 	return ctrl.NewWebhookManagedBy(mgr, &corev1.Pod{}).
-		WithDefaulter(&PodPlacementDefaulter{
-			Client:   mgr.GetClient(),
-			Recorder: mgr.GetEventRecorder("pod-placement-webhook"),
+		WithDefaulter(&PodDefaulter{
+			Client:                 mgr.GetClient(),
+			Recorder:               mgr.GetEventRecorder("pod-placement-webhook"),
+			EnableInitialResources: enableInitialResources,
 		}).
 		WithDefaulterCustomPath("/mutate-pod-placement").
 		Complete()
@@ -52,27 +54,25 @@ func SetupPodWebhookWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:rbac:groups="";events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses;gkespotplacementpolicies;workloadclassguardrails,verbs=get;list;watch
 
-// PodPlacementDefaulter mutates Pods on creation based on their best-matching WorkloadClass placement policy.
-type PodPlacementDefaulter struct {
+// PodDefaulter mutates Pods on creation based on their best-matching WorkloadClass. It resolves the
+// WorkloadClass once, and then applies each pillar independently: initial resources (resourceManagement)
+// and placement (capacityStrategy). A pillar that is unset, or not validated, never prevents the other
+// from being applied.
+type PodDefaulter struct {
 	Client   client.Client
 	Recorder events.EventRecorder
+
+	// EnableInitialResources controls whether the webhook fills in the initial resources of the
+	// WorkloadClass on the containers of the Pod.
+	EnableInitialResources bool
 }
 
 // Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind Pod.
 //
-// The Pod's placement is derived from its best-matching WorkloadClass's CapacityStrategy:
-//   - If the WorkloadClass references a GKESpotPlacementPolicy, the policy must be attached
-//     (PlacementPluginAttached=True) and its GKE-specific refinements (custom compute class, fallback
-//     machine families, reversion behavior) are applied on top of the CapacityStrategy.
-//   - If the WorkloadClass has no InfrastructureProfileRef, the CapacityStrategy is applied with GKE
-//     defaults (no compute class or machine family restrictions; reversion treated as Lazy).
-//   - If the WorkloadClass references a different infrastructure profile kind, the Pod is left to that
-//     profile's placement plugin and is not mutated.
-//
-// The webhook fails open: if the WorkloadClass or GKESpotPlacementPolicy cannot be resolved, or the
-// WorkloadClass is not ready, the Pod is admitted unmodified. Because the webhook uses
-// failurePolicy=fail, returning an error here would block Pod creation.
-func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) error {
+// The webhook fails open: if the WorkloadClass cannot be resolved, or a pillar is not ready, the Pod is
+// admitted without that pillar's mutations. Because the webhook uses failurePolicy=fail, returning an
+// error here would block Pod creation.
+func (d *PodDefaulter) Default(ctx context.Context, pod *corev1.Pod) error {
 	log := podlog.WithValues("pod", podName(pod), "namespace", pod.Namespace)
 
 	bestWLC, err := utils.FindBestMatchWorkloadClass(ctx, d.Client, d.Recorder, pod)
@@ -86,16 +86,36 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 	}
 	log = log.WithValues("workloadClass", bestWLC.Name)
 
+	d.defaultInitialResources(log, pod, bestWLC)
+	d.defaultPlacement(logf.IntoContext(ctx, log), pod, bestWLC)
+	return nil
+}
+
+// defaultPlacement applies Spot or On-Demand placement to the Pod.
+//
+// The Pod's placement is derived from its best-matching WorkloadClass's CapacityStrategy:
+//   - If the WorkloadClass references a GKESpotPlacementPolicy, the policy must be attached
+//     (PlacementPluginAttached=True) and its GKE-specific refinements (custom compute class, fallback
+//     machine families, reversion behavior) are applied on top of the CapacityStrategy.
+//   - If the WorkloadClass has no InfrastructureProfileRef, the CapacityStrategy is applied with GKE
+//     defaults (no compute class or machine family restrictions; reversion treated as Lazy).
+//   - If the WorkloadClass references a different infrastructure profile kind, the Pod is left to that
+//     profile's placement plugin and its placement is not mutated.
+//
+// If the GKESpotPlacementPolicy cannot be resolved, or the WorkloadClass placement is not ready, the Pod's
+// placement is not mutated. The logger is taken from the context.
+func (d *PodDefaulter) defaultPlacement(ctx context.Context, pod *corev1.Pod, bestWLC *workloadsv1.WorkloadClass) {
+	log := logf.FromContext(ctx)
 	if bestWLC.Spec.CapacityStrategy == nil {
-		log.V(1).Info("WorkloadClass has no CapacityStrategy; Pod will not be mutated")
-		return nil
+		log.V(1).Info("WorkloadClass has no CapacityStrategy; Pod placement will not be mutated")
+		return
 	}
 
 	ipr := bestWLC.Spec.InfrastructureProfileRef
 	usesSpotPolicy := utils.ReferencesGKESpotPlacementPolicy(ipr)
 	if ipr != nil && !usesSpotPolicy {
 		log.V(1).Info("WorkloadClass references a different infrastructure profile; Pod will not be mutated", "kind", ipr.Kind, "group", ipr.Group)
-		return nil
+		return
 	}
 
 	// Only mutate once the controllers have confirmed the WorkloadClass placement configuration is valid
@@ -107,51 +127,51 @@ func (d *PodPlacementDefaulter) Default(ctx context.Context, pod *corev1.Pod) er
 	switch {
 	case placementCond == nil:
 		log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementValidated)
-		return nil
+		return
 	case !utils.IsValidated(placementCond):
 		log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", placementCond.Type, "reason", placementCond.Reason, "message", placementCond.Message)
-		return nil
+		return
 	case bestWLC.Generation > 0 && placementCond.ObservedGeneration != bestWLC.Generation:
 		log.Info("WorkloadClass condition is stale; Pod will not be mutated", "condition", placementCond.Type,
 			"observedGeneration", placementCond.ObservedGeneration, "generation", bestWLC.Generation)
-		return nil
+		return
 	}
 	if usesSpotPolicy {
 		c := meta.FindStatusCondition(bestWLC.Status.Conditions, workloadsv1.ConditionTypePlacementPluginAttached)
 		switch {
 		case c == nil:
 			log.Info("WorkloadClass condition is not set; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementPluginAttached)
-			return nil
+			return
 		case c.Status != metav1.ConditionTrue:
 			log.Info("WorkloadClass condition is not True; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementPluginAttached, "reason", c.Reason, "message", c.Message)
-			return nil
+			return
 		case bestWLC.Generation > 0 && c.ObservedGeneration != bestWLC.Generation:
 			log.Info("WorkloadClass condition is stale; Pod will not be mutated", "condition", workloadsv1.ConditionTypePlacementPluginAttached,
 				"observedGeneration", c.ObservedGeneration, "generation", bestWLC.Generation)
-			return nil
+			return
 		}
 	}
 
 	var spotPolicy *workloadsv1.GKESpotPlacementPolicy
 	if usesSpotPolicy {
+		var err error
 		spotPolicy, err = d.fetchSpotPlacementPolicy(ctx, ipr)
 		if err != nil {
 			log.Error(err, "Failed to get GKESpotPlacementPolicy; Pod will not be mutated", "gkeSpotPlacementPolicy", ipr.Name)
-			return nil
+			return
 		}
 		log = log.WithValues("gkeSpotPlacementPolicy", spotPolicy.Name)
 	}
 
 	if err := d.mutatePodPlacement(ctx, pod, bestWLC, spotPolicy); err != nil {
 		log.Error(err, "Failed to compute Pod placement; Pod will not be mutated")
-		return nil
+		return
 	}
 
 	log.Info("Mutated Pod placement", "targetSpot", utils.IsPodTargetedForSpot(pod))
-	return nil
 }
 
-func (d *PodPlacementDefaulter) fetchSpotPlacementPolicy(ctx context.Context, ipr *workloadsv1.InfrastructureProfileReference) (*workloadsv1.GKESpotPlacementPolicy, error) {
+func (d *PodDefaulter) fetchSpotPlacementPolicy(ctx context.Context, ipr *workloadsv1.InfrastructureProfileReference) (*workloadsv1.GKESpotPlacementPolicy, error) {
 	spotPlacementPolicy := &workloadsv1.GKESpotPlacementPolicy{}
 	if err := d.Client.Get(ctx, types.NamespacedName{Name: ipr.Name}, spotPlacementPolicy); err != nil {
 		return nil, err
@@ -168,7 +188,7 @@ func (d *PodPlacementDefaulter) fetchSpotPlacementPolicy(ctx context.Context, ip
 //   - Otherwise the Pod targets Spot, either strictly (Fail) or preferentially (FallbackToOnDemand). A
 //     FallbackToOnDemand Pod is downgraded to Fail when the workload is in fallback and a guardrail
 //     maxFallbackRatio would be exceeded (see fallbackBudgetExhausted).
-func (d *PodPlacementDefaulter) mutatePodPlacement(ctx context.Context, pod *corev1.Pod, wlc *workloadsv1.WorkloadClass, spotPolicy *workloadsv1.GKESpotPlacementPolicy) error {
+func (d *PodDefaulter) mutatePodPlacement(ctx context.Context, pod *corev1.Pod, wlc *workloadsv1.WorkloadClass, spotPolicy *workloadsv1.GKESpotPlacementPolicy) error {
 	cs := wlc.Spec.CapacityStrategy
 
 	// wlc comes from the informer cache, so defaults are applied to locals rather than written back into it.

@@ -96,9 +96,9 @@ func newNode(name string, spot bool) *corev1.Node {
 	return n
 }
 
-func newDefaulter(objs ...client.Object) *PodPlacementDefaulter {
+func newDefaulter(objs ...client.Object) *PodDefaulter {
 	c := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(objs...).Build()
-	return &PodPlacementDefaulter{Client: c}
+	return &PodDefaulter{Client: c, EnableInitialResources: true}
 }
 
 func requiredTerms(pod *corev1.Pod) []corev1.NodeSelectorTerm {

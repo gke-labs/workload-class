@@ -40,7 +40,7 @@ import (
 // Every WorkloadClassGuardrail that sets maxFallbackRatio for gke-spot-placement applies; the Pod is admitted
 // with fallback only if it fits within all of them. Guardrails with unparsable parameters are skipped; the
 // WorkloadClassGuardrail controller reports those.
-func (d *PodPlacementDefaulter) fallbackBudgetExhausted(ctx context.Context, pod *corev1.Pod, wc *workloadsv1.WorkloadClass, getCounts func() (existingPodCounts, error)) bool {
+func (d *PodDefaulter) fallbackBudgetExhausted(ctx context.Context, pod *corev1.Pod, wc *workloadsv1.WorkloadClass, getCounts func() (existingPodCounts, error)) bool {
 	log := podlog.WithValues("pod", podName(pod), "namespace", pod.Namespace, "workloadClass", wc.Name)
 	ctx = logf.IntoContext(ctx, log)
 
@@ -93,7 +93,7 @@ type fallbackBudget struct {
 
 // fallbackBudgets returns the maxFallbackRatio of every gke-spot-placement constraint across all
 // WorkloadClassGuardrails.
-func (d *PodPlacementDefaulter) fallbackBudgets(ctx context.Context) ([]fallbackBudget, error) {
+func (d *PodDefaulter) fallbackBudgets(ctx context.Context) ([]fallbackBudget, error) {
 	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
 	if err := d.Client.List(ctx, guardrails); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClassGuardrails: %w", err)
