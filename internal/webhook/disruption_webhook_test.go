@@ -568,6 +568,66 @@ func TestHandle_AuthorizedSubjectLease(t *testing.T) {
 	}
 }
 
+func TestHandle_GuardrailEmergencyOverride(t *testing.T) {
+	const (
+		namespace = "default"
+		podName   = "db-0"
+	)
+	labels := map[string]string{"app": "db"}
+	outOfWindowDay := time.Now().UTC().AddDate(0, 0, 1).Weekday().String()
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: namespace},
+		Spec: workloadsv1.WorkloadClassSpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: labels},
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "other", DaysOfWeek: []string{outOfWindowDay}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"},
+				},
+			},
+		},
+		Status: workloadsv1.WorkloadClassStatus{MaintenanceReadiness: workloadsv1.ReadinessNotReady},
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace, Labels: labels}}
+	req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: podName, Namespace: namespace, SubResource: "eviction", UserInfo: authv1.UserInfo{Username: "node-drain"},
+	}}
+
+	t.Run("allows_out_of_window_eviction_when_guardrail_emergency_override_is_active", func(t *testing.T) {
+		c := fakeClient{
+			getNamespaceResult:     ns,
+			getWorkloadClassResult: wc,
+			listWCResult:           &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}},
+			getPodResult:           pod,
+			listGuardrailResult: &workloadsv1.WorkloadClassGuardrailList{
+				Items: []workloadsv1.WorkloadClassGuardrail{{
+					Spec: workloadsv1.WorkloadClassGuardrailSpec{
+						Constraints: workloadsv1.Constraints{Disruption: workloadsv1.Disruption{EmergencyOverride: true}},
+					},
+				}},
+			},
+		}
+		v := &DisruptionWebhook{Client: c}
+		if resp := v.Handle(t.Context(), req); !resp.Allowed {
+			t.Fatalf("expected cluster-wide guardrail EmergencyOverride to allow eviction, got %+v", resp.Result)
+		}
+	})
+
+	t.Run("falls_through_to_normal_enforcement_on_guardrail_list_error", func(t *testing.T) {
+		c := fakeClient{
+			getNamespaceResult:     ns,
+			getWorkloadClassResult: wc,
+			listWCResult:           &workloadsv1.WorkloadClassList{Items: []workloadsv1.WorkloadClass{*wc}},
+			getPodResult:           pod,
+			listGuardrailError:     fmt.Errorf("api error"),
+		}
+		v := &DisruptionWebhook{Client: c}
+		if resp := v.Handle(t.Context(), req); resp.Allowed {
+			t.Fatalf("expected out-of-window eviction to remain denied on guardrail list error")
+		}
+	})
+}
+
 func TestHandle_DisruptionPacing(t *testing.T) {
 	const (
 		namespace     = "default"
@@ -1186,6 +1246,9 @@ type fakeClient struct {
 	listWCError  error
 	listWCResult *workloadsv1.WorkloadClassList
 
+	listGuardrailError  error
+	listGuardrailResult *workloadsv1.WorkloadClassGuardrailList
+
 	getNamespaceError  error
 	getNamespaceResult *corev1.Namespace
 
@@ -1215,6 +1278,14 @@ func (fc fakeClient) List(ctx context.Context, list client.ObjectList, opts ...c
 	case *workloadsv1.WorkloadClassList:
 		fc.listWCResult.DeepCopyInto(typed)
 		return fc.listWCError
+	case *workloadsv1.WorkloadClassGuardrailList:
+		if fc.listGuardrailError != nil {
+			return fc.listGuardrailError
+		}
+		if fc.listGuardrailResult != nil {
+			fc.listGuardrailResult.DeepCopyInto(typed)
+		}
+		return nil
 	case *corev1.PodList:
 		if fc.listPodError != nil {
 			return fc.listPodError

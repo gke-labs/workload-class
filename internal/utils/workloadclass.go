@@ -238,6 +238,17 @@ func IsValidated(cond *metav1.Condition) bool {
 	return cond.Status == metav1.ConditionTrue || cond.Reason == workloadsv1.ReasonSelectorOverlap
 }
 
+// HasGuardrailEmergencyOverride reports whether any cluster-scoped WorkloadClassGuardrail
+// currently has spec.constraints.disruption.emergencyOverride set to true.
+func HasGuardrailEmergencyOverride(guardrails []workloadsv1.WorkloadClassGuardrail) bool {
+	for i := range guardrails {
+		if guardrails[i].Spec.Constraints.Disruption.EmergencyOverride {
+			return true
+		}
+	}
+	return false
+}
+
 // DisruptionValidatedCondition returns the WorkloadClass's DisruptionValidated condition, falling back
 // to the overall Validated condition when DisruptionValidated has not been populated yet.
 func DisruptionValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {

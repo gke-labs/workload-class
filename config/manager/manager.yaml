@@ -26,6 +26,7 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
+        traffic.sidecar.istio.io/excludeInboundPorts: "9443"
       labels:
         control-plane: controller-manager
         app.kubernetes.io/name: workload-class
