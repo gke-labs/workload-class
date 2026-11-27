@@ -23,6 +23,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -64,6 +65,10 @@ type WorkloadClassReconciler struct {
 	// event channel and applies the pending leases of a WorkloadClass when reconciling it. If nil, no leases
 	// are applied.
 	LeaseTracker *utils.PendingLeaseTracker
+
+	// utilizationWarned records the generation of each WorkloadClass for which the UtilizationWithoutRequests
+	// event was last recorded, so that it is recorded once per generation rather than on every reconcile.
+	utilizationWarned sync.Map
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -85,6 +90,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if apierrors.IsNotFound(err) {
 			// Discard any lease requests for a deleted WorkloadClass.
 			r.LeaseTracker.Drain(req.NamespacedName)
+			r.utilizationWarned.Delete(req.NamespacedName)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -119,6 +125,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// protection or disables valid placement configuration, and the other pillars never disable resource
 	// management. The condition only depends on the spec, the guardrails and the overlapping WorkloadClasses.
 	rmCond := resourceManagementValidatedCondition(wc, guardrails, overlapping)
+
+	r.warnUtilizationWithoutRequests(wc)
 
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
@@ -831,6 +839,42 @@ func resourceManagementValidatedCondition(
 	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
 	cond := buildValidationCondition(workloadsv1.ConditionTypeResourceManagementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
 	return &cond
+}
+
+// reasonUtilizationWithoutRequests is the event reason recorded on a WorkloadClass that scales on the
+// utilization of a resource without setting initial resources.
+const reasonUtilizationWithoutRequests = "UtilizationWithoutRequests"
+
+// warnUtilizationWithoutRequests records a warning event when the WorkloadClass scales on the utilization of
+// a resource but does not set initialResources. Utilization is measured against the request, so the
+// HorizontalPodAutoscaler cannot scale containers that have no request for that resource.
+//
+// The WorkloadClass stays valid: workloads that set their own requests scale normally. The event is recorded
+// once per generation of the WorkloadClass. WorkloadClass has no admission webhook, so this takes the place
+// of an admission warning.
+func (r *WorkloadClassReconciler) warnUtilizationWithoutRequests(wc *workloadsv1.WorkloadClass) {
+	rm := wc.Spec.ResourceManagement
+	if r.Recorder == nil || rm == nil || rm.Autoscaling == nil || rm.InitialResources != nil {
+		return
+	}
+	resources := utils.UtilizationTargetedResources(rm.Autoscaling.Metrics)
+	if len(resources) == 0 {
+		return
+	}
+	key := client.ObjectKeyFromObject(wc)
+	if gen, ok := r.utilizationWarned.Load(key); ok && gen == wc.Generation {
+		return
+	}
+	r.utilizationWarned.Store(key, wc.Generation)
+
+	names := make([]string, 0, len(resources))
+	for _, name := range resources {
+		names = append(names, string(name))
+	}
+	list := strings.Join(names, " and ")
+	r.Recorder.Eventf(wc, nil, corev1.EventTypeWarning, reasonUtilizationWithoutRequests, "ValidateResourceManagement",
+		"autoscaling scales on the utilization of %s, but initialResources is not set: containers without a %s request cannot be scaled on utilization",
+		list, list)
 }
 
 // validateResourceManagement returns the spec rules and the effective (strictest) guardrail constraints that
