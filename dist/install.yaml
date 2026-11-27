@@ -113,6 +113,11 @@ spec:
                   rule: '!has(self.minDurationOnFallback) || duration(self.minDurationOnFallback)
                     == duration(''0s'') || self.action == ''Active'''
             type: object
+            x-kubernetes-validations:
+            - message: fallbackAllowedMachineFamilies cannot be used with customComputeClass
+              rule: '!has(self.customComputeClass) || size(self.customComputeClass)
+                == 0 || !has(self.fallbackAllowedMachineFamilies) || size(self.fallbackAllowedMachineFamilies)
+                == 0'
           status:
             description: status defines the observed state of GKESpotPlacementPolicy.
             properties:
@@ -364,6 +369,16 @@ spec:
                     - kind
                     - name
                     x-kubernetes-list-type: map
+                  disruptionStuckThresholdSeconds:
+                    default: 120
+                    description: |-
+                      DisruptionStuckThresholdSeconds is the number of seconds an in-window eviction may remain
+                      blocked by the pacing budget before break-glass allows it to proceed. Defaults to 120 when unset.
+                      Set to 0 to disable break-glass (strict budget enforcement with no timeout override, e.g., for quorum systems).
+                      Does not apply to automated actors bypassing windows via allowedDisruptionsOutsideOfWindow.
+                    format: int32
+                    minimum: 0
+                    type: integer
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
                       immediately.
@@ -376,6 +391,19 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  manageSafeToEvictAnnotation:
+                    description: |-
+                      ManageSafeToEvictAnnotation enables automatic lifecycle management of the
+                      "cluster-autoscaler.kubernetes.io/safe-to-evict" annotation on governed Pods.
+                      When true and the WorkloadClass protects Pods (valid against at least one
+                      WorkloadClassGuardrail) and is Ready or Overdue, "safe-to-evict: false" is temporarily
+                      removed and "workloads.gke.io/safe-to-evict-suspended: <workloadclass-name>" is recorded
+                      so Cluster Autoscaler can drain nodes during the maintenance window. When the window closes,
+                      validation fails, this option is disabled, Pod ownership/selector matching changes, or the
+                      WorkloadClass is deleted, suspended Pods have "safe-to-evict: false" restored.
+                      Note: in a cluster with no WorkloadClassGuardrail objects, the WorkloadClass does not
+                      protect Pods and this option has no effect (annotations are never suspended).
+                    type: boolean
                   maxNonDisruptionDurationDays:
                     description: |-
                       MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
@@ -384,6 +412,23 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  maxUnavailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      MaxUnavailable limits how many governed Pods may be concurrently unavailable during disruptions
+                      (an integer such as 1, or a percentage string such as "25%"). Mutually exclusive with MinAvailable.
+                      When neither MaxUnavailable nor MinAvailable is set, in-window pacing is disabled.
+                    x-kubernetes-int-or-string: true
+                  minAvailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      MinAvailable specifies the minimum number or percentage of governed Pods that must remain
+                      Ready during disruptions (e.g., 2 or "75%"). Mutually exclusive with MaxUnavailable.
+                    x-kubernetes-int-or-string: true
                   minInitialRunDurationDays:
                     description: MinInitialRunDurationDays is the minimum duration
                       a pod must run before it can be disrupted.
@@ -405,6 +450,17 @@ spec:
                     - AlwaysAllow
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: maxUnavailable and minAvailable are mutually exclusive
+                  rule: '!(has(self.maxUnavailable) && has(self.minAvailable))'
+                - message: maxUnavailable must be a non-negative integer or a percentage
+                    string between 0% and 100%
+                  rule: '!has(self.maxUnavailable) || (type(self.maxUnavailable) ==
+                    int ? self.maxUnavailable >= 0 : self.maxUnavailable.matches(''^(100|[1-9]?[0-9])%$''))'
+                - message: minAvailable must be a non-negative integer or a percentage
+                    string between 0% and 100%
+                  rule: '!has(self.minAvailable) || (type(self.minAvailable) == int
+                    ? self.minAvailable >= 0 : self.minAvailable.matches(''^(100|[1-9]?[0-9])%$''))'
               infrastructureProfileRef:
                 description: |-
                   InfrastructureProfileRef references a cluster-scoped, provider-specific infrastructure profile CR
@@ -626,12 +682,19 @@ spec:
                           type: string
                         type: array
                       emergencyOverride:
-                        description: EmergencyOverride allows bypassing all constraints
-                          immediately.
+                        description: |-
+                          EmergencyOverride enables a cluster-wide emergency override that bypasses disruption
+                          constraints and opens Per-Pod PDBs for all WorkloadClasses immediately.
+                          Note: because the admission webhooks run with failurePolicy: Fail, this flag can only be
+                          toggled while the controller-manager is healthy; if it is unavailable, delete the
+                          ValidatingWebhookConfiguration and any closed managed PodDisruptionBudgets directly.
                         type: boolean
                       enforcedDisruptionTimeoutSeconds:
-                        description: EnforcedDisruptionTimeoutSeconds is the maximum
-                          time in seconds before a disruption is forced.
+                        description: |-
+                          EnforcedDisruptionTimeoutSeconds is deprecated and currently a no-op.
+                          It is kept for v1 CRD compatibility with existing manifests and will be removed in a future API version.
+
+                          Deprecated: This field is unused and has no effect.
                         format: int32
                         maximum: 3600
                         type: integer
@@ -649,6 +712,33 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
+                      userPDBPolicy:
+                        description: |-
+                          UserPDBPolicy defines optional controls over user-authored PodDisruptionBudgets to detect or block
+                          misconfigurations such as zero-disruption budgets and overlapping selectors.
+                        properties:
+                          blockOverlapping:
+                            default: true
+                            description: |-
+                              BlockOverlapping flags user PDBs that co-select at least one active Pod alongside another user PDB in the same namespace.
+                              Defaults to true when mode is Warn or Enforce.
+                            type: boolean
+                          blockZeroDisruption:
+                            default: true
+                            description: |-
+                              BlockZeroDisruption flags user PDBs that statically allow zero evictions (maxUnavailable: 0 / 0% or minAvailable: 100%).
+                              Defaults to true when mode is Warn or Enforce.
+                            type: boolean
+                          mode:
+                            default: Allow
+                            description: 'Mode controls enforcement: Allow (default),
+                              Warn (emit admission warnings), or Enforce (reject).'
+                            enum:
+                            - Allow
+                            - Warn
+                            - Enforce
+                            type: string
+                        type: object
                     required:
                     - maxNonDisruptionDurationDays
                     type: object
@@ -1169,6 +1259,7 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
+        traffic.sidecar.istio.io/excludeInboundPorts: "9443"
       labels:
         app.kubernetes.io/name: workload-class
         control-plane: controller-manager
@@ -1306,6 +1397,14 @@ webhooks:
       path: /validate-disruption
   failurePolicy: Fail
   name: vpoddisruption.gke.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      - workload-class-system
   rules:
   - apiGroups:
     - ""

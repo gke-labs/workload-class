@@ -21,6 +21,42 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// UserPDBEnforcementMode defines how WorkloadClassGuardrails handle user-authored PodDisruptionBudgets
+// that violate disruption safety rules.
+// +kubebuilder:validation:Enum=Allow;Warn;Enforce
+type UserPDBEnforcementMode string
+
+const (
+	// UserPDBModeAllow permits all user-authored PDBs without warning or rejection (default).
+	UserPDBModeAllow UserPDBEnforcementMode = "Allow"
+
+	// UserPDBModeWarn admits violating user-authored PDBs with admission warnings.
+	UserPDBModeWarn UserPDBEnforcementMode = "Warn"
+
+	// UserPDBModeEnforce rejects violating user-authored PDBs at admission.
+	UserPDBModeEnforce UserPDBEnforcementMode = "Enforce"
+)
+
+// UserPDBPolicy configures guardrail controls over user-authored PodDisruptionBudgets.
+type UserPDBPolicy struct {
+	// Mode controls enforcement: Allow (default), Warn (emit admission warnings), or Enforce (reject).
+	// +optional
+	// +kubebuilder:default="Allow"
+	Mode UserPDBEnforcementMode `json:"mode,omitempty"`
+
+	// BlockZeroDisruption flags user PDBs that statically allow zero evictions (maxUnavailable: 0 / 0% or minAvailable: 100%).
+	// Defaults to true when mode is Warn or Enforce.
+	// +optional
+	// +kubebuilder:default=true
+	BlockZeroDisruption *bool `json:"blockZeroDisruption,omitempty"`
+
+	// BlockOverlapping flags user PDBs that co-select at least one active Pod alongside another user PDB in the same namespace.
+	// Defaults to true when mode is Warn or Enforce.
+	// +optional
+	// +kubebuilder:default=true
+	BlockOverlapping *bool `json:"blockOverlapping,omitempty"`
+}
+
 // Constraints defines the guardrails for WorkloadClasses.
 type Constraints struct {
 	// Disruption defines the constraints within which WorkloadClasses can set disruption policies.
@@ -43,14 +79,26 @@ type Disruption struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays"`
 
-	// EnforcedDisruptionTimeoutSeconds is the maximum time in seconds before a disruption is forced.
+	// EnforcedDisruptionTimeoutSeconds is deprecated and currently a no-op.
+	// It is kept for v1 CRD compatibility with existing manifests and will be removed in a future API version.
+	//
+	// Deprecated: This field is unused and has no effect.
 	// +optional
 	// +kubebuilder:validation:Maximum=3600
 	EnforcedDisruptionTimeoutSeconds int32 `json:"enforcedDisruptionTimeoutSeconds,omitempty"`
 
-	// EmergencyOverride allows bypassing all constraints immediately.
+	// EmergencyOverride enables a cluster-wide emergency override that bypasses disruption
+	// constraints and opens Per-Pod PDBs for all WorkloadClasses immediately.
+	// Note: because the admission webhooks run with failurePolicy: Fail, this flag can only be
+	// toggled while the controller-manager is healthy; if it is unavailable, delete the
+	// ValidatingWebhookConfiguration and any closed managed PodDisruptionBudgets directly.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// UserPDBPolicy defines optional controls over user-authored PodDisruptionBudgets to detect or block
+	// misconfigurations such as zero-disruption budgets and overlapping selectors.
+	// +optional
+	UserPDBPolicy *UserPDBPolicy `json:"userPDBPolicy,omitempty"`
 }
 
 // PluginConstraints defines guardrail constraints grouped by plugin optimization intent.

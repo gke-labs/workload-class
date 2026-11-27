@@ -68,6 +68,7 @@ const (
 )
 
 // GKESpotPlacementPolicySpec defines the desired state of GKESpotPlacementPolicy.
+// +kubebuilder:validation:XValidation:rule="!has(self.customComputeClass) || size(self.customComputeClass) == 0 || !has(self.fallbackAllowedMachineFamilies) || size(self.fallbackAllowedMachineFamilies) == 0",message="fallbackAllowedMachineFamilies cannot be used with customComputeClass"
 type GKESpotPlacementPolicySpec struct {
 	// CustomComputeClass is the optional name of a GKE Custom Compute Class
 	// (cloud.google.com/compute-class) used for the workload's primary placement.
