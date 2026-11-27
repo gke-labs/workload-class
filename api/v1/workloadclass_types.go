@@ -316,6 +316,25 @@ const (
 	ReasonFallbackActive = "FallbackActive"
 	// ReasonSpotTargetMet indicates that the workload meets its target SpotRatio with no active fallback deficit.
 	ReasonSpotTargetMet = "SpotTargetMet"
+
+	// ConditionTypeMatchedPods indicates whether the WorkloadClass currently matches at least one active Pod.
+	ConditionTypeMatchedPods = "MatchedPods"
+
+	// ReasonPodsMatched indicates that one or more active Pods are matched by this WorkloadClass.
+	ReasonPodsMatched = "PodsMatched"
+	// ReasonZeroMatchedPods indicates that no active Pods currently match this WorkloadClass.
+	ReasonZeroMatchedPods = "ZeroMatchedPods"
+	// ReasonInvalidPodSelector indicates that Pod matching could not be evaluated because podSelector is invalid.
+	ReasonInvalidPodSelector = "InvalidPodSelector"
+
+	// ConditionTypeShadowedByUserPDB indicates whether one or more Pods matched by this WorkloadClass
+	// are covered by user-created PodDisruptionBudgets, causing the WorkloadClass to yield PDB management.
+	ConditionTypeShadowedByUserPDB = "ShadowedByUserPDB"
+
+	// ReasonShadowedByUserPDB indicates that at least one matched Pod is shadowed by a user-created PDB.
+	ReasonShadowedByUserPDB = "ShadowedByUserPDB"
+	// ReasonNotShadowed indicates that no matched Pods are shadowed by user-created PDBs.
+	ReasonNotShadowed = "NotShadowed"
 )
 
 // WorkloadClassStatus defines the observed state of WorkloadClass.

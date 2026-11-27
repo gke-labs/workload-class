@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -357,13 +358,14 @@ func ListUserCreatedPDBs(ctx context.Context, c client.Client, namespace string)
 	return userPDBs, nil
 }
 
-// IsPodCoveredByUserPDB returns true if any user-created PodDisruptionBudget in userPDBs
-// is in the Pod's namespace and has a selector that matches the Pod's labels.
-func IsPodCoveredByUserPDB(pod *corev1.Pod, userPDBs []policyv1.PodDisruptionBudget) bool {
+// MatchingUserPDBNames returns the sorted names of all user-created PodDisruptionBudgets in userPDBs
+// that are in the Pod's namespace and have a selector matching the Pod's labels.
+func MatchingUserPDBNames(pod *corev1.Pod, userPDBs []policyv1.PodDisruptionBudget) []string {
 	if pod == nil {
-		return false
+		return nil
 	}
 	podLabels := labels.Set(pod.Labels)
+	var names []string
 	for i := range userPDBs {
 		pdb := &userPDBs[i]
 		if pdb.Namespace != pod.Namespace || IsWorkloadClassManagedPDB(pdb) || pdb.Spec.Selector == nil {
@@ -374,8 +376,15 @@ func IsPodCoveredByUserPDB(pod *corev1.Pod, userPDBs []policyv1.PodDisruptionBud
 			continue
 		}
 		if selector.Matches(podLabels) {
-			return true
+			names = append(names, pdb.Name)
 		}
 	}
-	return false
+	slices.Sort(names)
+	return names
+}
+
+// IsPodCoveredByUserPDB returns true if any user-created PodDisruptionBudget in userPDBs
+// is in the Pod's namespace and has a selector that matches the Pod's labels.
+func IsPodCoveredByUserPDB(pod *corev1.Pod, userPDBs []policyv1.PodDisruptionBudget) bool {
+	return len(MatchingUserPDBNames(pod, userPDBs)) > 0
 }

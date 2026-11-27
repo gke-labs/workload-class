@@ -140,12 +140,21 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// 2.5 Compute Pod governance observability (MatchedPods and ShadowedByUserPDB) before updating status.
+	// Defer PDB list failures to Step 4 so they do not block Step 5 safe-to-evict restoration.
+	snap, err := r.snapshotPodGovernance(ctx, wc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 3. Update Status with RetryOnConflict so concurrent condition updates from plugin controllers
 	// (e.g., PlacementPluginAttached, InFallback) are preserved rather than clobbered or failing with 409.
 	// If the spec generation changed concurrently, skip writing stale status and let the spec-change event requeue.
 	staleGeneration := false
+	becameShadowed := false
 	expectedGeneration := wc.Generation
 	if err := utils.UpdateWorkloadClassStatus(ctx, r.Client, r.APIReader, wc, func(latest *workloadsv1.WorkloadClass) bool {
+		becameShadowed = false
 		if latest.Generation != expectedGeneration {
 			staleGeneration = true
 			return false
@@ -166,6 +175,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypePlacementValidated) || changed
 		}
 		changed = meta.SetStatusCondition(&latest.Status.Conditions, cond) || changed
+		obsChanged, shadowed := applyObservabilityConditions(latest, snap)
+		changed = obsChanged || changed
+		becameShadowed = shadowed
 		changed = applyMonotonicLastDisruptionTime(latest, nextLastDisruption) || changed
 		if latest.Status.MaintenanceReadiness != readiness {
 			latest.Status.MaintenanceReadiness = readiness
@@ -180,23 +192,13 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.V(1).Info("WorkloadClass spec generation changed concurrently, skipping stale status update", "generation", expectedGeneration)
 		return ctrl.Result{}, nil
 	}
+	r.recordShadowedWarning(wc, snap, becameShadowed)
 
 	// 4. Reconcile the Per-Pod PDBs, applying any leases requested by the disruption webhook.
 	// Leases are drained only now, so earlier failures (e.g., status update conflicts) do not discard them.
 	// Per-Pod PDB protection is gated on DisruptionValidated so placement/plugin errors never drop it.
 	pendingLeases := r.LeaseTracker.Drain(req.NamespacedName)
-	leaseRequeue, pdbErr := r.reconcilePDBs(ctx, wc, disruptionCond, hasGuardrails, pendingLeases)
-	if pdbErr != nil && r.Recorder != nil {
-		r.Recorder.Eventf(
-			wc,
-			nil,
-			corev1.EventTypeWarning,
-			"ReconcilePDBFailed",
-			"Reconciling PodDisruptionBudget",
-			"Failed to reconcile PDB: %s",
-			pdbErr.Error(),
-		)
-	}
+	leaseRequeue, pdbErr := r.reconcilePDBsFromSnapshot(ctx, wc, disruptionCond, hasGuardrails, pendingLeases, snap)
 
 	// 5. Manage Cluster Autoscaler safe-to-evict annotations on governed Pods independently of PDB
 	// reconciliation errors so a failing PDB cannot block restoring safe-to-evict="false".
@@ -227,21 +229,111 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 //     are left for that WorkloadClass to adopt.
 //
 // It returns the time until the earliest active lease expires, or 0 if there are none.
-func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, hasGuardrails bool, pendingLeases []utils.PendingLease) (time.Duration, error) {
-	log := logf.FromContext(ctx)
+type podGovernanceSummary struct {
+	invalidSelector bool
+	matchedCount    int
+	shadowedCount   int
+	shadowingPDBs   []string
+	governed        []*corev1.Pod
+}
 
-	if !wc.DeletionTimestamp.IsZero() {
-		// Owned PDBs are garbage collected through their owner references.
-		log.Info("WorkloadClass is being deleted, skipping PDB reconciliation")
-		return 0, nil
+type podGovernanceSnapshot struct {
+	owned, userPDBs []policyv1.PodDisruptionBudget
+	enforcedWC      *workloadsv1.WorkloadClass
+	wcs             []workloadsv1.WorkloadClass
+	summary         podGovernanceSummary
+	hasSummary      bool
+	pdbListErr      error
+	matchedCond     metav1.Condition
+	shadowedCond    metav1.Condition
+}
+
+func (r *WorkloadClassReconciler) recordShadowedWarning(wc *workloadsv1.WorkloadClass, snap podGovernanceSnapshot, becameShadowed bool) {
+	if r.Recorder == nil || !becameShadowed {
+		return
 	}
+	r.Recorder.Eventf(
+		wc,
+		nil,
+		corev1.EventTypeWarning,
+		workloadsv1.ReasonShadowedByUserPDB,
+		"Reconciling PodDisruptionBudget",
+		"%s",
+		shadowedByUserPDBEventMessage(snap.summary.shadowedCount, snap.summary.shadowingPDBs),
+	)
+}
 
+func (r *WorkloadClassReconciler) reconcilePDBsFromSnapshot(ctx context.Context, wc *workloadsv1.WorkloadClass, disruptionCond metav1.Condition, hasGuardrails bool, pendingLeases []utils.PendingLease, snap podGovernanceSnapshot) (time.Duration, error) {
+	var (
+		leaseRequeue time.Duration
+		pdbErr       error
+	)
+	if snap.pdbListErr != nil {
+		r.reenqueueLeases(wc, pendingLeases...)
+		pdbErr = snap.pdbListErr
+	} else {
+		leaseRequeue, pdbErr = r.reconcilePDBsWithSnapshot(ctx, wc, disruptionCond, hasGuardrails, pendingLeases, snap.owned, snap.userPDBs, snap.enforcedWC, snap.wcs, snap.summary.governed)
+	}
+	if pdbErr != nil && r.Recorder != nil {
+		r.Recorder.Eventf(
+			wc,
+			nil,
+			corev1.EventTypeWarning,
+			"ReconcilePDBFailed",
+			"Reconciling PodDisruptionBudget",
+			"Failed to reconcile PDB: %s",
+			pdbErr.Error(),
+		)
+	}
+	return leaseRequeue, pdbErr
+}
+
+func applyObservabilityConditions(latest *workloadsv1.WorkloadClass, snap podGovernanceSnapshot) (changed, becameShadowed bool) {
+	if !snap.hasSummary {
+		return false, false
+	}
+	wasShadowed := meta.IsStatusConditionTrue(latest.Status.Conditions, workloadsv1.ConditionTypeShadowedByUserPDB)
+	changed = meta.SetStatusCondition(&latest.Status.Conditions, snap.matchedCond) || changed
+	changed = meta.SetStatusCondition(&latest.Status.Conditions, snap.shadowedCond) || changed
+	becameShadowed = !wasShadowed && snap.shadowedCond.Status == metav1.ConditionTrue
+	return changed, becameShadowed
+}
+
+func (r *WorkloadClassReconciler) snapshotPodGovernance(ctx context.Context, wc *workloadsv1.WorkloadClass) (podGovernanceSnapshot, error) {
+	var snap podGovernanceSnapshot
+	if !wc.DeletionTimestamp.IsZero() {
+		return snap, nil
+	}
+	snap.owned, snap.userPDBs, snap.pdbListErr = r.listNamespacePDBs(ctx, wc)
+	if snap.pdbListErr != nil {
+		logf.FromContext(ctx).Error(snap.pdbListErr, "Failed to list PodDisruptionBudgets")
+		return snap, nil
+	}
+	var err error
+	snap.enforcedWC, err = utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
+	if err != nil {
+		return snap, err
+	}
+	wcList := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, wcList, client.InNamespace(wc.Namespace)); err != nil {
+		return snap, fmt.Errorf("failed to list WorkloadClasses: %w", err)
+	}
+	snap.wcs = wcList.Items
+	snap.summary, err = r.classifyClassPods(ctx, wc, snap.enforcedWC, snap.wcs, snap.userPDBs)
+	if err != nil {
+		return snap, err
+	}
+	snap.matchedCond = matchedPodsCondition(wc.Generation, snap.summary)
+	snap.shadowedCond = shadowedByUserPDBCondition(wc.Generation, snap.summary)
+	snap.hasSummary = true
+	return snap, nil
+}
+
+func (r *WorkloadClassReconciler) listNamespacePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass) (owned, userPDBs []policyv1.PodDisruptionBudget, err error) {
 	pdbs := &policyv1.PodDisruptionBudgetList{}
 	if err := r.List(ctx, pdbs, client.InNamespace(wc.Namespace)); err != nil {
-		r.reenqueueLeases(wc, pendingLeases...)
-		return 0, fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
+		return nil, nil, fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
 	}
-	var owned, userPDBs []policyv1.PodDisruptionBudget
 	for _, pdb := range pdbs.Items {
 		switch {
 		case metav1.IsControlledBy(&pdb, wc):
@@ -250,27 +342,63 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 			userPDBs = append(userPDBs, pdb)
 		}
 	}
+	return owned, userPDBs, nil
+}
 
+func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloadsv1.WorkloadClass, condition metav1.Condition, hasGuardrails bool, pendingLeases []utils.PendingLease) (time.Duration, error) {
+	if !wc.DeletionTimestamp.IsZero() {
+		logf.FromContext(ctx).Info("WorkloadClass is being deleted, skipping PDB reconciliation")
+		return 0, nil
+	}
+	owned, userPDBs, err := r.listNamespacePDBs(ctx, wc)
+	if err != nil {
+		r.reenqueueLeases(wc, pendingLeases...)
+		return 0, err
+	}
 	if !protectsPods(condition.Reason, hasGuardrails) {
-		log.Info("WorkloadClass is invalid, opening its PDBs")
+		logf.FromContext(ctx).Info("WorkloadClass is invalid, opening its PDBs")
 		return 0, r.openOwnedPDBs(ctx, wc, owned, userPDBs)
 	}
-
 	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
 		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, err
 	}
-	wcs := &workloadsv1.WorkloadClassList{}
-	if err := r.List(ctx, wcs, client.InNamespace(wc.Namespace)); err != nil {
+	wcList := &workloadsv1.WorkloadClassList{}
+	if err := r.List(ctx, wcList, client.InNamespace(wc.Namespace)); err != nil {
 		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
-
-	governed, err := r.governedPods(ctx, wc, enforcedWC, wcs.Items, userPDBs)
+	summary, err := r.classifyClassPods(ctx, wc, enforcedWC, wcList.Items, userPDBs)
 	if err != nil {
 		r.reenqueueLeases(wc, pendingLeases...)
 		return 0, err
+	}
+	return r.reconcilePDBsWithSnapshot(ctx, wc, condition, hasGuardrails, pendingLeases, owned, userPDBs, enforcedWC, wcList.Items, summary.governed)
+}
+
+func (r *WorkloadClassReconciler) reconcilePDBsWithSnapshot(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	condition metav1.Condition,
+	hasGuardrails bool,
+	pendingLeases []utils.PendingLease,
+	owned, userPDBs []policyv1.PodDisruptionBudget,
+	enforcedWC *workloadsv1.WorkloadClass,
+	wcs []workloadsv1.WorkloadClass,
+	governed []*corev1.Pod,
+) (time.Duration, error) {
+	log := logf.FromContext(ctx)
+
+	if !wc.DeletionTimestamp.IsZero() {
+		// Owned PDBs are garbage collected through their owner references.
+		log.Info("WorkloadClass is being deleted, skipping PDB reconciliation")
+		return 0, nil
+	}
+
+	if !protectsPods(condition.Reason, hasGuardrails) {
+		log.Info("WorkloadClass is invalid, opening its PDBs")
+		return 0, r.openOwnedPDBs(ctx, wc, owned, userPDBs)
 	}
 
 	leases := make(map[string]utils.PendingLease, len(pendingLeases))
@@ -305,7 +433,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 			continue
 		}
 		if utils.IsPodActive(pod) && !utils.IsPodCoveredByUserPDB(pod, userPDBs) {
-			if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs.Items); bestMatch != nil && bestMatch.Name != wc.Name && passedValidation(bestMatch, hasGuardrails) {
+			if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs); bestMatch != nil && bestMatch.Name != wc.Name && passedValidation(bestMatch, hasGuardrails) {
 				// Another WorkloadClass governs the Pod now and will adopt its PDB.
 				continue
 			}
@@ -316,43 +444,124 @@ func (r *WorkloadClassReconciler) reconcilePDBs(ctx context.Context, wc *workloa
 	return requeue, errors.Join(errs...)
 }
 
-// governedPods returns the active Pods governed by the WorkloadClass that are not covered by a user-created PDB.
-func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc, enforcedWC *workloadsv1.WorkloadClass, wcs []workloadsv1.WorkloadClass, userPDBs []policyv1.PodDisruptionBudget) ([]*corev1.Pod, error) {
+// classifyClassPods classifies active Pods whose best-match WorkloadClass is wc into governed Pods
+// and Pods shadowed by user-created PDBs. An invalid PodSelector sets invalidSelector=true so validation
+// status updates are not blocked and observability conditions report Status=Unknown instead of False.
+func (r *WorkloadClassReconciler) classifyClassPods(ctx context.Context, wc, enforcedWC *workloadsv1.WorkloadClass, wcs []workloadsv1.WorkloadClass, userPDBs []policyv1.PodDisruptionBudget) (podGovernanceSummary, error) {
 	if enforcedWC != nil && enforcedWC.Name != wc.Name {
 		// The namespace's enforced WorkloadClass governs every Pod in the namespace.
-		return nil, nil
+		return podGovernanceSummary{}, nil
 	}
 
 	selector := labels.Everything()
 	if enforcedWC == nil {
 		if wc.Spec.PodSelector == nil {
 			// A WorkloadClass without a PodSelector is never the best match for a Pod.
-			return nil, nil
+			return podGovernanceSummary{}, nil
 		}
 		s, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
 		if err != nil {
-			return nil, fmt.Errorf("invalid podSelector: %w", err)
+			return podGovernanceSummary{invalidSelector: true}, nil
 		}
 		selector = s
 	}
 
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return nil, fmt.Errorf("failed to list Pods: %w", err)
+		return podGovernanceSummary{}, fmt.Errorf("failed to list Pods: %w", err)
 	}
 
-	var governed []*corev1.Pod
+	var summary podGovernanceSummary
+	pdbSet := sets.New[string]()
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !utils.IsPodActive(pod) || utils.IsPodCoveredByUserPDB(pod, userPDBs) {
+		if !utils.IsPodActive(pod) {
 			continue
 		}
 		if bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, wcs); bestMatch == nil || bestMatch.Name != wc.Name {
 			continue
 		}
-		governed = append(governed, pod)
+		summary.matchedCount++
+		if matching := utils.MatchingUserPDBNames(pod, userPDBs); len(matching) > 0 {
+			summary.shadowedCount++
+			pdbSet.Insert(matching...)
+			continue
+		}
+		summary.governed = append(summary.governed, pod)
 	}
-	return governed, nil
+	summary.shadowingPDBs = sets.List(pdbSet)
+	return summary, nil
+}
+
+func matchedPodsCondition(generation int64, summary podGovernanceSummary) metav1.Condition {
+	if summary.invalidSelector {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeMatchedPods,
+			Status:             metav1.ConditionUnknown,
+			Reason:             workloadsv1.ReasonInvalidPodSelector,
+			Message:            "Cannot evaluate matched Pods because podSelector is invalid",
+			ObservedGeneration: generation,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+	if summary.matchedCount == 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeMatchedPods,
+			Status:             metav1.ConditionFalse,
+			Reason:             workloadsv1.ReasonZeroMatchedPods,
+			Message:            "WorkloadClass matches no active Pods",
+			ObservedGeneration: generation,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+	return metav1.Condition{
+		Type:               workloadsv1.ConditionTypeMatchedPods,
+		Status:             metav1.ConditionTrue,
+		Reason:             workloadsv1.ReasonPodsMatched,
+		Message:            "WorkloadClass matches at least one active Pod",
+		ObservedGeneration: generation,
+		LastTransitionTime: metav1.Now(),
+	}
+}
+
+func shadowedByUserPDBCondition(generation int64, summary podGovernanceSummary) metav1.Condition {
+	if summary.invalidSelector {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeShadowedByUserPDB,
+			Status:             metav1.ConditionUnknown,
+			Reason:             workloadsv1.ReasonInvalidPodSelector,
+			Message:            "Cannot evaluate user PDB shadowing because podSelector is invalid",
+			ObservedGeneration: generation,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+	if summary.shadowedCount == 0 {
+		return metav1.Condition{
+			Type:               workloadsv1.ConditionTypeShadowedByUserPDB,
+			Status:             metav1.ConditionFalse,
+			Reason:             workloadsv1.ReasonNotShadowed,
+			Message:            "No matched Pods are shadowed by user-created PodDisruptionBudgets",
+			ObservedGeneration: generation,
+			LastTransitionTime: metav1.Now(),
+		}
+	}
+	return metav1.Condition{
+		Type:               workloadsv1.ConditionTypeShadowedByUserPDB,
+		Status:             metav1.ConditionTrue,
+		Reason:             workloadsv1.ReasonShadowedByUserPDB,
+		Message:            "One or more matched Pods are shadowed by user-created PodDisruptionBudgets",
+		ObservedGeneration: generation,
+		LastTransitionTime: metav1.Now(),
+	}
+}
+
+func shadowedByUserPDBEventMessage(shadowedCount int, pdbNames []string) string {
+	limit := min(len(pdbNames), maxReportedOverlaps)
+	listed := utils.QuotedList(pdbNames[:limit])
+	if extra := len(pdbNames) - limit; extra > 0 {
+		listed = fmt.Sprintf("%s, and %d more", listed, extra)
+	}
+	return truncateMessage(fmt.Sprintf("%d matched Pod(s) are shadowed by user-created PodDisruptionBudget(s): %s", shadowedCount, listed), maxConditionMessageLen)
 }
 
 // reconcilePodPDB reconciles the PDB of a single governed Pod and returns the remaining time of its active lease,
