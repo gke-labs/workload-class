@@ -444,6 +444,18 @@ const (
 	// to associate each PDB with a single Pod instance by UID.
 	PodUIDLabel = "workloads.gke.io/pod-uid"
 
+	// ManagedByLabel is the label set on the HorizontalPodAutoscalers and VerticalPodAutoscalers that the
+	// controller creates for the workloads a WorkloadClass governs, with the value ManagedByLabelValue.
+	// Autoscalers without it are user-created, and take precedence over the WorkloadClass.
+	ManagedByLabel = "workloads.gke.io/managed-by"
+
+	// ManagedByLabelValue is the value of ManagedByLabel on the autoscalers that the controller manages.
+	ManagedByLabelValue = "workload-class"
+
+	// WorkloadClassLabel is the label set on the autoscalers that the controller manages, with the name of the
+	// WorkloadClass they were created from.
+	WorkloadClassLabel = "workloads.gke.io/workload-class"
+
 	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails across all pillars.
 	ConditionTypeValidated = "Validated"
 
