@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -279,6 +280,44 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, validWithProject)).To(Succeed())
 			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validWithProject) })
+		})
+
+		It("should skip stale policy status update when spec generation changes concurrently", func() {
+			policy := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: policyName},
+				Spec:       workloadsv1.GKESpotPlacementPolicySpec{Reversion: workloadsv1.SpotReversionPolicy{Action: workloadsv1.ActiveReversionAction}},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			stale := policy.DeepCopy()
+			policy.Spec.Reversion.Action = workloadsv1.LazyReversionAction
+			Expect(k8sClient.Update(ctx, policy)).To(Succeed())
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &GKESpotPlacementPolicyReconciler{Client: &staleCacheClient{Client: k8sClient, stale: []client.Object{stale}}, APIReader: liveReader, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(1))
+			updatedPolicy, updatedWC := &workloadsv1.GKESpotPlacementPolicy{}, &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, policyKey, updatedPolicy)).To(Succeed())
+			Expect(k8sClient.Get(ctx, wcKey, updatedWC)).To(Succeed())
+			Expect(updatedPolicy.Status.Conditions).To(BeEmpty())
+			Expect(updatedWC.Status.Conditions).To(BeEmpty())
+		})
+
+		It("should skip WorkloadClass status update when InfrastructureProfileRef changes concurrently", func() {
+			staleWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, wcKey, staleWC)).To(Succeed())
+			liveWC := staleWC.DeepCopy()
+			liveWC.Spec.InfrastructureProfileRef = nil
+			Expect(k8sClient.Update(ctx, liveWC)).To(Succeed())
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &GKESpotPlacementPolicyReconciler{Client: &staleCacheClient{Client: k8sClient, stale: []client.Object{staleWC}}, APIReader: liveReader, Scheme: k8sClient.Scheme()}
+			Expect(r.updateWorkloadClassStatus(ctx, staleWC, statusOptions{
+				Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonProfileResolved, Message: "attached",
+			})).To(Succeed())
+			Expect(liveReader.gets).To(Equal(1))
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, wcKey, updatedWC)).To(Succeed())
+			Expect(updatedWC.Status.Conditions).To(BeEmpty())
 		})
 
 		It("should reject a GKESpotPlacementPolicy that combines customComputeClass and fallbackAllowedMachineFamilies", func() {
