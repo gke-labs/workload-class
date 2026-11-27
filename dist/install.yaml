@@ -1650,6 +1650,14 @@ rules:
   - create
   - patch
 - apiGroups:
+  - apiextensions.k8s.io
+  resourceNames:
+  - verticalpodautoscalers.autoscaling.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -1669,6 +1677,18 @@ rules:
   - autoscaling
   resources:
   - horizontalpodautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - autoscaling.k8s.io
+  resources:
+  - verticalpodautoscalers
   verbs:
   - create
   - delete

@@ -64,6 +64,11 @@ type WorkloadClassReconciler struct {
 	// event channel and applies the pending leases of a WorkloadClass when reconciling it. If nil, no leases
 	// are applied.
 	LeaseTracker *utils.PendingLeaseTracker
+
+	// VPAInstalled reports whether the VerticalPodAutoscaler is installed. When it isn't, the
+	// ResourceManagementValidated condition of a WorkloadClass that enables rightsizing says that rightsizing is not
+	// applied, and a VPANotInstalled event is recorded. It never changes the condition's status.
+	VPAInstalled bool
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
@@ -116,7 +121,10 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	disruptionCond := disruptionValidatedCondition(wc, guardrails, overlapping)
 	// The resource management pillar is validated independently of the disruption and placement pillars, so a
 	// resource management error never drops disruption protection or disables valid placement configuration.
-	resourceManagementCond := resourceManagementValidatedCondition(wc, guardrails, overlapping)
+	resourceManagementCond := resourceManagementValidatedCondition(wc, guardrails, overlapping, r.VPAInstalled)
+	if !r.VPAInstalled && rightsizingEnabled(wc) && r.Recorder != nil {
+		r.Recorder.Eventf(wc, nil, corev1.EventTypeWarning, EventReasonVPANotInstalled, "ValidateResourceManagement", vpaNotInstalledMsg)
+	}
 
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
@@ -677,6 +685,7 @@ const (
 	placementUnattachedMsg = "WorkloadClass references an infrastructure profile, but the plugin has not attached"
 	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
 	noGuardrailsMsg        = "No Guardrails found to validate against"
+	vpaNotInstalledMsg     = "VPA is not installed; rightsizing is not applied"
 	disjointDaysOfWeekMsg  = "cluster guardrails restrict `daysOfWeek` to disjoint sets, so no disruption window can comply; contact your cluster administrator"
 	maxConditionMessageLen = 32768
 	maxReportedOverlaps    = 5
@@ -813,10 +822,15 @@ func placementValidatedCondition(
 //
 // Like the other per-pillar conditions, it reports a PodSelector overlap with ReasonSelectorOverlap only when
 // there is no other violation, so consumers can keep treating an overlapping WorkloadClass as valid.
+//
+// When the VerticalPodAutoscaler is not installed and the WorkloadClass enables rightsizing, the message says that
+// rightsizing is not applied. The status doesn't change: autoscaling only needs the core HorizontalPodAutoscaler
+// API, so it keeps working.
 func resourceManagementValidatedCondition(
 	wc *workloadsv1.WorkloadClass,
 	guardrails *workloadsv1.WorkloadClassGuardrailList,
 	overlapping []workloadsv1.WorkloadClass,
+	vpaInstalled bool,
 ) *metav1.Condition {
 	if wc.Spec.ResourceManagement == nil {
 		return nil
@@ -829,7 +843,16 @@ func resourceManagementValidatedCondition(
 	}
 	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
 	cond := buildValidationCondition(workloadsv1.ConditionTypeResourceManagementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+	if !vpaInstalled && rightsizingEnabled(wc) {
+		cond.Message = truncateMessage(cond.Message+"; "+vpaNotInstalledMsg, maxConditionMessageLen)
+	}
 	return &cond
+}
+
+// rightsizingEnabled reports whether the WorkloadClass sets rightsizing with a mode other than Off.
+func rightsizingEnabled(wc *workloadsv1.WorkloadClass) bool {
+	rm := wc.Spec.ResourceManagement
+	return rm != nil && rm.Rightsizing != nil && utils.RightsizingModeOrDefault(rm.Rightsizing.Mode) != workloadsv1.RightsizingModeOff
 }
 
 // validateResourceManagement returns the problems in the WorkloadClass resourceManagement that the CRD schema

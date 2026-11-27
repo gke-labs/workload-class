@@ -17,18 +17,23 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	vpav1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -78,10 +83,25 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+// splitList splits a comma-separated flag value, dropping surrounding spaces and empty items.
+func splitList(value string) []string {
+	var items []string
+	for item := range strings.SplitSeq(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(workloadsv1.AddToScheme(scheme))
+	// The VerticalPodAutoscaler types are registered even when the API isn't installed: the controllers only watch
+	// them when it is. The CustomResourceDefinition type is used to detect VerticalPodAutoscaler capabilities.
+	utilruntime.Must(vpav1.AddToScheme(scheme))
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -97,6 +117,7 @@ func main() {
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
 	var enableResourceManagement bool
+	var coordinatedHPAVPAResources string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -124,9 +145,13 @@ func main() {
 			"(client-side limiting disabled); a positive value sets the client-side burst; "+
 			"a negative value (e.g. -1) is passed through.")
 	flag.BoolVar(&enableResourceManagement, "enable-resource-management", true,
-		"If set, the controller creates and manages a HorizontalPodAutoscaler for each Deployment and StatefulSet "+
-			"governed by a WorkloadClass with resourceManagement. Set to false to turn the feature off without a "+
-			"rollback; existing managed autoscalers are then left in place.")
+		"If set, the controller creates and manages a HorizontalPodAutoscaler and a VerticalPodAutoscaler for each "+
+			"Deployment and StatefulSet governed by a WorkloadClass with resourceManagement. Set to false to turn the "+
+			"feature off without a rollback; existing managed autoscalers are then left in place.")
+	flag.StringVar(&coordinatedHPAVPAResources, "coordinated-hpa-vpa-resources", "",
+		"Comma-separated resources (cpu, memory) for which the platform coordinates the HorizontalPodAutoscaler and "+
+			"the VerticalPodAutoscaler, so that rightsizing keeps them even when autoscaling targets their utilization. "+
+			"On GKE, where HPA Rightsizing coordinates CPU, set it to cpu.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -239,6 +264,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	coordinatedResources, err := utils.ParseCoordinatedResources(splitList(coordinatedHPAVPAResources))
+	if err != nil {
+		setupLog.Error(err, "Invalid --coordinated-hpa-vpa-resources")
+		os.Exit(1)
+	}
+	autoscalerCapabilities := utils.AutoscalerCapabilities{CoordinatedResources: coordinatedResources}
+	detectCtx, cancelDetect := context.WithTimeout(context.Background(), time.Minute)
+	err = controller.DetectVPA(detectCtx, mgr.GetRESTMapper(), mgr.GetAPIReader(), &autoscalerCapabilities)
+	cancelDetect()
+	if err != nil {
+		if !autoscalerCapabilities.VPAInstalled {
+			setupLog.Error(err, "Failed to detect the VerticalPodAutoscaler")
+			os.Exit(1)
+		}
+		setupLog.Error(err, "Failed to detect VerticalPodAutoscaler capabilities")
+	}
+	setupLog.Info("Detected autoscaler capabilities",
+		"vpaInstalled", autoscalerCapabilities.VPAInstalled,
+		"inPlaceOrRecreate", autoscalerCapabilities.InPlaceOrRecreate,
+		"coordinatedResources", autoscalerCapabilities.CoordinatedResources)
+
 	// The disruption webhook queues Per-Pod PDB lease requests for subjects allowed to disrupt outside of a
 	// disruption window, and the WorkloadClass controller applies them. Both run in this process, so they share
 	// an in-memory tracker. This requires the webhook and the controller to run in the same replica: with
@@ -251,6 +297,7 @@ func main() {
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorder("workloadclass-controller"),
 		LeaseTracker: leaseTracker,
+		VPAInstalled: autoscalerCapabilities.VPAInstalled,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadClass")
 		os.Exit(1)
@@ -298,7 +345,7 @@ func main() {
 		os.Exit(1)
 	}
 	if enableResourceManagement {
-		if err := controller.SetupWorkloadAutoscalingControllers(mgr); err != nil {
+		if err := controller.SetupWorkloadAutoscalingControllers(mgr, autoscalerCapabilities); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "workloadautoscaling")
 			os.Exit(1)
 		}
