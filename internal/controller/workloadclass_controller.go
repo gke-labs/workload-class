@@ -115,6 +115,11 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	baseValidationCond := validatedCondition(ctx, wc, guardrails, overlapping)
 	disruptionCond := disruptionValidatedCondition(wc, guardrails, overlapping)
 
+	// Resource management is validated independently of the other pillars: a violation never drops disruption
+	// protection or disables valid placement configuration, and the other pillars never disable resource
+	// management. The condition only depends on the spec, the guardrails and the overlapping WorkloadClasses.
+	rmCond := resourceManagementValidatedCondition(wc, guardrails, overlapping)
+
 	// 2. Calculate Readiness
 	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
 	if err != nil {
@@ -146,6 +151,11 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			changed = meta.SetStatusCondition(&latest.Status.Conditions, *placementCond) || changed
 		} else {
 			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypePlacementValidated) || changed
+		}
+		if rmCond != nil {
+			changed = meta.SetStatusCondition(&latest.Status.Conditions, *rmCond) || changed
+		} else {
+			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypeResourceManagementValidated) || changed
 		}
 		changed = meta.SetStatusCondition(&latest.Status.Conditions, cond) || changed
 		if latest.Status.MaintenanceReadiness != readiness {
@@ -762,6 +772,7 @@ func validatedCondition(
 	violations := validateSpec(wc)
 	violations = append(violations, validateAgainstGuardrails(wc, guardrails.Items)...)
 	violations = append(violations, validateCapacityStrategy(ctx, wc, guardrails)...)
+	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
 	return buildValidationCondition(workloadsv1.ConditionTypeValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
 }
 
@@ -795,6 +806,38 @@ func placementValidatedCondition(
 	cond := buildValidationCondition(workloadsv1.ConditionTypePlacementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
 	reconcileConditions(&cond, pluginCond)
 	return &cond
+}
+
+// resourceManagementValidatedCondition builds the ResourceManagementValidated condition for the WorkloadClass,
+// independently of disruption and placement validation.
+//
+// It returns nil when the WorkloadClass does not set resourceManagement and no guardrail requires initial
+// resources, so that the condition is only present on WorkloadClasses that the pillar applies to.
+func resourceManagementValidatedCondition(
+	wc *workloadsv1.WorkloadClass,
+	guardrails *workloadsv1.WorkloadClassGuardrailList,
+	overlapping []workloadsv1.WorkloadClass,
+) *metav1.Condition {
+	if wc.Spec.ResourceManagement == nil &&
+		!utils.EffectiveResourceManagementConstraints(guardrails.Items).RequireInitialResources {
+		return nil
+	}
+	var violations []string
+	if wc.Spec.PodSelector != nil {
+		if _, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
+			violations = append(violations, fmt.Sprintf("`podSelector` must be a valid label selector: %v", err))
+		}
+	}
+	violations = append(violations, validateResourceManagement(wc, guardrails.Items)...)
+	cond := buildValidationCondition(workloadsv1.ConditionTypeResourceManagementValidated, wc.Generation, violations, overlapping, len(guardrails.Items) > 0)
+	return &cond
+}
+
+// validateResourceManagement returns the spec rules and the effective (strictest) guardrail constraints that
+// the resourceManagement of the WorkloadClass violates.
+func validateResourceManagement(wc *workloadsv1.WorkloadClass, guardrails []workloadsv1.WorkloadClassGuardrail) []string {
+	violations := utils.ResourceManagementSpecViolations(wc.Spec.ResourceManagement)
+	return append(violations, utils.ResourceManagementViolations(wc, utils.EffectiveResourceManagementConstraints(guardrails))...)
 }
 
 func buildValidationCondition(

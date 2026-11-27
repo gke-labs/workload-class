@@ -87,6 +87,11 @@ func validateGuardrailSpec(g *workloadsv1.WorkloadClassGuardrail) (admission.War
 		return []string{err.Error()}, err
 	}
 
+	if violations := utils.ResourceManagementConstraintsViolations(g.Spec.Constraints.ResourceManagement); len(violations) > 0 {
+		err := fmt.Errorf("invalid resourceManagement constraints: %s", strings.Join(violations, "; "))
+		return []string{err.Error()}, err
+	}
+
 	return nil, nil
 }
 
@@ -110,9 +115,14 @@ func (v *WorkloadClassGuardrailCustomValidator) validateAgainstWorkloadClasses(c
 		return []string{fmt.Sprintf("failed to list WorkloadClasses: %v", err)}, err
 	}
 
+	// Resource management constraints are checked on their own, as if this were the only guardrail.
+	effective := utils.EffectiveResourceManagementConstraints([]workloadsv1.WorkloadClassGuardrail{*g})
+
 	var warnings admission.Warnings
 	for _, wc := range wcs.Items {
-		if violations := utils.GuardrailViolations(&wc, g); len(violations) > 0 {
+		violations := utils.GuardrailViolations(&wc, g)
+		violations = append(violations, utils.ResourceManagementViolations(&wc, effective)...)
+		if len(violations) > 0 {
 			workloadclassguardraillog.Info("Existing WorkloadClass violates guardrail", "violations", violations, "workloadclass", wc.Name, "namespace", wc.Namespace)
 			warnings = append(warnings, fmt.Sprintf("existing WorkloadClass '%s/%s' does not comply with this guardrail: %s",
 				wc.Namespace, wc.Name, strings.Join(violations, "; ")))

@@ -268,3 +268,24 @@ func PlacementValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Conditio
 	}
 	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeValidated)
 }
+
+// ResourceManagementValidatedCondition returns the WorkloadClass's ResourceManagementValidated condition, or
+// nil if it is not set. The condition is absent when the WorkloadClass does not set resourceManagement and
+// no guardrail requires it.
+func ResourceManagementValidatedCondition(wc *workloadsv1.WorkloadClass) *metav1.Condition {
+	if wc == nil {
+		return nil
+	}
+	return meta.FindStatusCondition(wc.Status.Conditions, workloadsv1.ConditionTypeResourceManagementValidated)
+}
+
+// IsResourceManagementReady reports whether the resourceManagement of the WorkloadClass may be applied to the
+// workloads and Pods it governs: its ResourceManagementValidated condition allows it (see IsValidated) and was
+// observed for the current generation of the WorkloadClass. Missing or stale conditions are treated as not ready.
+func IsResourceManagementReady(wc *workloadsv1.WorkloadClass) bool {
+	cond := ResourceManagementValidatedCondition(wc)
+	if cond == nil || !IsValidated(cond) {
+		return false
+	}
+	return wc.Generation == 0 || cond.ObservedGeneration == wc.Generation
+}
