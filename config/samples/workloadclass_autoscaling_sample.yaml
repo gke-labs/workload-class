@@ -1,0 +1,42 @@
+# Dedicated namespace without workloads.gke.io/enforced-class so podSelector governs matching Pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoscaling-sample
+---
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: web-autoscaling
+  namespace: autoscaling-sample
+spec:
+  podSelector:
+    matchLabels:
+      tier: web
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      # Matches the Saturday/Sunday window constraint in config/samples/workloads_v1_workloadclassguardrail.yaml.
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+        startTime: "02:00"
+        endTime: "06:00"
+        timeZone: "UTC"
+    maxNonDisruptionDurationDays: 14
+  # Horizontal scaling only: one HorizontalPodAutoscaler per governed Deployment or StatefulSet.
+  resourceManagement:
+    autoscaling:
+      replicas:
+        min: 2
+        max: 20
+      # The upstream autoscaling/v2 metric list, copied into each HorizontalPodAutoscaler as written.
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+      # How quickly to scale up and down: Responsive, Balanced (default), or Conservative.
+      profile: Balanced

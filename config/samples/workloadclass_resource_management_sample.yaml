@@ -1,0 +1,60 @@
+# Dedicated namespace without workloads.gke.io/enforced-class so podSelector governs matching Pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: resource-management-sample
+---
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: web-services
+  namespace: resource-management-sample
+spec:
+  podSelector:
+    matchLabels:
+      tier: web
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      # Matches the Saturday/Sunday window constraint in config/samples/workloads_v1_workloadclassguardrail.yaml.
+      # VerticalPodAutoscaler evictions (Recreate, and the fallback of InPlacePreferred) wait for this window.
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+        startTime: "02:00"
+        endTime: "06:00"
+        timeZone: "UTC"
+    maxNonDisruptionDurationDays: 14
+  resourceManagement:
+    # Horizontal scaling: one HorizontalPodAutoscaler per governed workload.
+    autoscaling:
+      replicas:
+        min: 2
+        max: 20
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+      profile: Balanced
+    # Rightsizing: one VerticalPodAutoscaler per governed workload. Requires the VerticalPodAutoscaler.
+    rightsizing:
+      # "Off", Recommend (default), OnCreate, or Auto. Quote "Off": unquoted, YAML reads it as a boolean.
+      mode: Recommend
+      # Autoscaling targets CPU utilization, so CPU is left out of rightsizing unless the controller runs with
+      # --coordinated-hpa-vpa-resources=cpu (for example on GKE). Memory is always rightsized.
+      resources: [cpu, memory]
+      # How Auto applies a new size to a running Pod: InPlacePreferred (default) or Recreate.
+      updateStrategy: InPlacePreferred
+      # Containers that rightsizing leaves alone, such as sidecars.
+      excludeContainers: [istio-proxy]
+      # Per-container floor and ceiling.
+      bounds:
+        min:
+          cpu: 100m
+          memory: 128Mi
+        max:
+          cpu: "4"
+          memory: 8Gi

@@ -17,6 +17,8 @@ limitations under the License.
 package v1
 
 import (
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -207,6 +209,174 @@ type WorkloadClassSpec struct {
 	// (such as GKESpotPlacementPolicy) managed by Platform/SRE.
 	// +optional
 	InfrastructureProfileRef *InfrastructureProfileReference `json:"infrastructureProfileRef,omitempty"`
+
+	// ResourceManagement configures autoscaling and rightsizing for the Deployments and StatefulSets that the
+	// WorkloadClass governs. For each governed workload, the controller creates and owns one HorizontalPodAutoscaler
+	// (from autoscaling) and one VerticalPodAutoscaler (from rightsizing).
+	// +optional
+	ResourceManagement *ResourceManagement `json:"resourceManagement,omitempty"`
+}
+
+// AutoscalingProfile selects how quickly autoscaled workloads scale up and down.
+// +kubebuilder:validation:Enum=Responsive;Balanced;Conservative
+type AutoscalingProfile string
+
+const (
+	// AutoscalingProfileResponsive scales down sooner than Balanced, for workloads whose load changes quickly.
+	AutoscalingProfileResponsive AutoscalingProfile = "Responsive"
+
+	// AutoscalingProfileBalanced uses the upstream HorizontalPodAutoscaler default behavior (default).
+	AutoscalingProfileBalanced AutoscalingProfile = "Balanced"
+
+	// AutoscalingProfileConservative scales up and down more slowly than Balanced, for workloads that are
+	// expensive to start or stop.
+	AutoscalingProfileConservative AutoscalingProfile = "Conservative"
+)
+
+// RightsizingMode selects whether and when rightsizing applies new container sizes.
+// +kubebuilder:validation:Enum=Off;Recommend;OnCreate;Auto
+type RightsizingMode string
+
+const (
+	// RightsizingModeOff disables rightsizing: no VerticalPodAutoscaler is created.
+	RightsizingModeOff RightsizingMode = "Off"
+
+	// RightsizingModeRecommend only computes size recommendations, without applying them (default).
+	RightsizingModeRecommend RightsizingMode = "Recommend"
+
+	// RightsizingModeOnCreate applies sizes only when Pods are created.
+	RightsizingModeOnCreate RightsizingMode = "OnCreate"
+
+	// RightsizingModeAuto applies sizes when Pods are created and to running Pods, as set by the update strategy.
+	RightsizingModeAuto RightsizingMode = "Auto"
+)
+
+// RightsizingUpdateStrategy selects how the Auto rightsizing mode applies a new size to a running Pod.
+// +kubebuilder:validation:Enum=InPlacePreferred;Recreate
+type RightsizingUpdateStrategy string
+
+const (
+	// RightsizingUpdateStrategyInPlacePreferred resizes the Pod in place when it can, and recreates it when it
+	// can't (default).
+	RightsizingUpdateStrategyInPlacePreferred RightsizingUpdateStrategy = "InPlacePreferred"
+
+	// RightsizingUpdateStrategyRecreate always recreates the Pod.
+	RightsizingUpdateStrategyRecreate RightsizingUpdateStrategy = "Recreate"
+)
+
+// RightsizedResource is a container resource that rightsizing can size.
+// +kubebuilder:validation:Enum=cpu;memory
+type RightsizedResource string
+
+const (
+	// RightsizedResourceCPU is the container CPU request.
+	RightsizedResourceCPU RightsizedResource = "cpu"
+
+	// RightsizedResourceMemory is the container memory request.
+	RightsizedResourceMemory RightsizedResource = "memory"
+)
+
+// ResourceManagement configures how the workloads that a WorkloadClass governs scale horizontally (autoscaling)
+// and how their containers are sized (rightsizing). Either part can be set on its own.
+// +kubebuilder:validation:XValidation:rule="has(self.autoscaling) || has(self.rightsizing)",message="set autoscaling, rightsizing, or both"
+type ResourceManagement struct {
+	// Autoscaling configures horizontal scaling: one HorizontalPodAutoscaler per governed workload.
+	// +optional
+	Autoscaling *Autoscaling `json:"autoscaling,omitempty"`
+
+	// Rightsizing configures vertical sizing: one VerticalPodAutoscaler per governed workload.
+	// Rightsizing needs the VerticalPodAutoscaler to be installed on the cluster.
+	// +optional
+	Rightsizing *Rightsizing `json:"rightsizing,omitempty"`
+}
+
+// Autoscaling configures horizontal scaling for the workloads that a WorkloadClass governs.
+// +kubebuilder:validation:XValidation:rule="!has(self.replicas.min) || self.replicas.min <= self.replicas.max",message="replicas.min must not exceed replicas.max"
+// +kubebuilder:validation:XValidation:rule="self.metrics.all(m, m.type != 'Object')",message="Object metrics are not allowed"
+type Autoscaling struct {
+	// Replicas bounds the number of replicas of every governed workload.
+	// +required
+	Replicas ReplicaBounds `json:"replicas"`
+
+	// Metrics lists what to scale on. It is the upstream autoscaling/v2 metric list, and it is copied into each
+	// HorizontalPodAutoscaler as written. Object metrics are not allowed, because they name one specific object.
+	// +required
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	Metrics []autoscalingv2.MetricSpec `json:"metrics"`
+
+	// Profile selects how quickly governed workloads scale up and down: Responsive, Balanced (default),
+	// or Conservative.
+	// +optional
+	// +kubebuilder:default=Balanced
+	Profile AutoscalingProfile `json:"profile,omitempty"`
+}
+
+// ReplicaBounds bounds the number of replicas of a workload.
+type ReplicaBounds struct {
+	// Min is the minimum number of replicas for each governed workload. Defaults to 1.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	Min *int32 `json:"min,omitempty"`
+
+	// Max is the maximum number of replicas for each governed workload.
+	// +required
+	// +kubebuilder:validation:Minimum=1
+	Max int32 `json:"max"`
+}
+
+// Rightsizing configures vertical sizing for the workloads that a WorkloadClass governs.
+type Rightsizing struct {
+	// Mode selects whether and when rightsizing applies new container sizes: Off (no rightsizing), Recommend
+	// (default, recommendations only), OnCreate (apply sizes only when Pods are created), or Auto (also apply
+	// sizes to running Pods). Quote "Off" in YAML, where an unquoted Off is read as a boolean.
+	// +optional
+	// +kubebuilder:default=Recommend
+	Mode RightsizingMode `json:"mode,omitempty"`
+
+	// Resources lists the container resources to rightsize: cpu, memory, or both (default).
+	// When autoscaling targets the utilization of a resource, that resource is left out of rightsizing.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:default={cpu,memory}
+	Resources []RightsizedResource `json:"resources,omitempty"`
+
+	// UpdateStrategy selects how the Auto mode applies a new size to a running Pod. InPlacePreferred (default)
+	// resizes the Pod in place when it can, and recreates it when it can't. Recreate always recreates the Pod.
+	// +optional
+	// +kubebuilder:default=InPlacePreferred
+	UpdateStrategy RightsizingUpdateStrategy `json:"updateStrategy,omitempty"`
+
+	// ExcludeContainers lists the containers that rightsizing leaves alone, such as sidecars.
+	// +optional
+	// +listType=set
+	ExcludeContainers []string `json:"excludeContainers,omitempty"`
+
+	// Bounds sets the per-container floor and ceiling for the sizes that rightsizing sets. Where unset, the
+	// guardrail containerBounds apply.
+	// +optional
+	Bounds *ContainerBounds `json:"bounds,omitempty"`
+}
+
+// ContainerBounds sets a per-container floor (min) and ceiling (max) for the cpu and memory sizes that
+// rightsizing sets.
+// +kubebuilder:validation:XValidation:rule="!has(self.min) || !has(self.max) || self.min.all(r, !(r in self.max) || quantity(string(self.min[r])).compareTo(quantity(string(self.max[r]))) <= 0)",message="min must not exceed max for any resource"
+type ContainerBounds struct {
+	// Min is the per-container floor, by resource.
+	// +optional
+	// +kubebuilder:validation:Type=object
+	// +kubebuilder:validation:MaxProperties=2
+	// +kubebuilder:validation:XValidation:rule="self.all(r, r == 'cpu' || r == 'memory')",message="only cpu and memory are supported"
+	Min corev1.ResourceList `json:"min,omitempty"`
+
+	// Max is the per-container ceiling, by resource.
+	// +optional
+	// +kubebuilder:validation:Type=object
+	// +kubebuilder:validation:MaxProperties=2
+	// +kubebuilder:validation:XValidation:rule="self.all(r, r == 'cpu' || r == 'memory')",message="only cpu and memory are supported"
+	Max corev1.ResourceList `json:"max,omitempty"`
 }
 
 // CapacityStrategy defines cloud-agnostic Spot/Preemptible capacity preferences.
@@ -285,6 +455,11 @@ const (
 	// (capacityStrategy and infrastructureProfileRef) passed guardrail validation and plugin attachment
 	// independently of disruption validation.
 	ConditionTypePlacementValidated = "PlacementValidated"
+
+	// ConditionTypeResourceManagementValidated indicates whether the WorkloadClass resourceManagement passed spec
+	// and guardrail validation, independently of the disruption and placement pillars. It is set only when
+	// resourceManagement is configured.
+	ConditionTypeResourceManagementValidated = "ResourceManagementValidated"
 
 	// ReasonValidationPassed indicates that the WorkloadClass passed all Guardrail checks.
 	ReasonValidationPassed = "ValidationPassed"
