@@ -96,6 +96,7 @@ func main() {
 	var enableHTTP2 bool
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
+	var enableResourceManagement bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -122,6 +123,10 @@ func main() {
 		"Burst limit when talking to the Kubernetes API server. 0 keeps controller-runtime's default "+
 			"(client-side limiting disabled); a positive value sets the client-side burst; "+
 			"a negative value (e.g. -1) is passed through.")
+	flag.BoolVar(&enableResourceManagement, "enable-resource-management", true,
+		"If set, the controller creates and manages a HorizontalPodAutoscaler for each Deployment and StatefulSet "+
+			"governed by a WorkloadClass with resourceManagement. Set to false to turn the feature off without a "+
+			"rollback; existing managed autoscalers are then left in place.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -291,6 +296,12 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "gkespotplacement")
 		os.Exit(1)
+	}
+	if enableResourceManagement {
+		if err := controller.SetupWorkloadAutoscalingControllers(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "workloadautoscaling")
+			os.Exit(1)
+		}
 	}
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
