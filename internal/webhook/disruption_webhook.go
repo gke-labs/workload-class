@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"sync"
 	"time"
 
 	authv1 "k8s.io/api/authentication/v1"
@@ -28,8 +29,8 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -38,6 +39,11 @@ import (
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 	"github.com/gke-labs/workload-class/internal/utils"
 )
+
+// recentEvictionTTL bounds how long a recently allowed eviction remains tracked against the
+// in-memory pacing budget before assuming it either took effect (pod left cache / became unready)
+// or was dropped upstream (e.g., rejected by a closed Per-Pod PDB or client cancellation).
+const recentEvictionTTL = 2 * time.Minute
 
 // DisruptionWebhook handles Pod eviction requests.
 type DisruptionWebhook struct {
@@ -48,6 +54,19 @@ type DisruptionWebhook struct {
 	// LeaseTracker receives Per-Pod PDB lease requests for authorized subjects, which are applied
 	// asynchronously by the WorkloadClass controller. If nil, no leases are requested.
 	LeaseTracker *utils.PendingLeaseTracker
+
+	// BlockedTracker tracks first-blocked/last-seen timestamps and per-class break-glass cooldowns
+	// for pods denied by in-window disruption pacing without mutating Pods.
+	// Note: state is in-memory per webhook replica and not shared across manager replicas.
+	BlockedTracker *utils.BlockedPodTracker
+
+	// pacingMu serializes checkDisruptionPacing budget evaluations and allowedEvictions updates
+	// so concurrent eviction requests against a stale informer cache cannot both claim the last slot.
+	pacingMu         sync.Mutex
+	allowedEvictions map[types.NamespacedName]map[types.UID]time.Time
+
+	// nowFunc overrides the clock in unit tests; defaults to time.Now().UTC().
+	nowFunc func() time.Time
 }
 
 // +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods/eviction,verbs=create,versions=v1,name=vpoddisruption.gke.io,admissionReviewVersions=v1
@@ -81,19 +100,37 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	log = log.WithValues("workloadClass", bestWC.Name)
 
-	// Check Guardrail validation (if it fails, we don't enforce constraints). A WorkloadClass that is only
-	// flagged for an overlapping PodSelector (SelectorOverlap) still complies with the guardrails, and this Pod
-	// resolved to it as its best match, so its constraints are still enforced.
-	if cond := meta.FindStatusCondition(bestWC.Status.Conditions, workloadsv1.ConditionTypeValidated); cond != nil &&
+	// Check Disruption validation (if it fails, we don't enforce disruption constraints). Using the per-pillar
+	// DisruptionValidated condition (falling back to Validated) ensures placement/plugin validation failures
+	// never drop disruption protection. A WorkloadClass only flagged for SelectorOverlap still complies with
+	// guardrails and keeps enforcing its constraints.
+	if cond := utils.DisruptionValidatedCondition(bestWC); cond != nil &&
 		cond.Status == metav1.ConditionFalse && !utils.IsValidated(cond) {
 		log.Info("WorkloadClass failed Guardrail validation, ignoring constraints")
 		return admission.Allowed("WorkloadClass failed Guardrail validation")
 	}
 
-	// Emergency Override
+	// Emergency Override (per-WorkloadClass or cluster-wide via WorkloadClassGuardrail)
 	if bestWC.Spec.DisruptionPolicy.EmergencyOverride {
 		return admission.Allowed("Emergency override active")
 	}
+	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
+	if err := v.Client.List(ctx, guardrails); err != nil {
+		log.Error(err, "Failed to list WorkloadClassGuardrails for emergency override check")
+	} else if utils.HasGuardrailEmergencyOverride(guardrails.Items) {
+		log.Info("Cluster-wide guardrail emergency override active, allowing eviction")
+		return admission.Allowed("Cluster-wide guardrail emergency override active")
+	}
+
+	// Maintenance Starvation (Override on Overdue) takes precedence for both normal and authorized subjects.
+	if bestWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
+		return admission.Allowed("Workload class is overdue for maintenance, bypassing constraints")
+	}
+
+	// Temporal window check
+	now := v.now()
+	dryRun := req.DryRun != nil && *req.DryRun
+	inWindow, _ := utils.IsTimeInWindows(ctx, now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
 
 	// Identity-Based Filtering
 	var matchingSubjects []workloadsv1.Subject
@@ -107,16 +144,19 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 	if len(matchingSubjects) > 0 {
-		return v.handleAuthorizedSubject(ctx, bestWC, pod, matchingSubjects)
-	}
-
-	// Temporal Enforcement
-	now := time.Now().UTC()
-	inWindow, _ := utils.IsTimeInWindows(ctx, now, bestWC.Spec.DisruptionPolicy.AllowedDisruptionWindows)
-
-	// Maintenance Starvation (Override on Overdue)
-	if bestWC.Status.MaintenanceReadiness == workloadsv1.ReadinessOverdue {
-		return admission.Allowed("Workload class is overdue for maintenance, bypassing constraints")
+		// Outside an allowed window, authorized actors are strictly paced (no break-glass).
+		// Inside a window, fall through to in-window pacing (with break-glass) so an authorized
+		// actor is never more restricted than an unlisted caller, while still issuing a lease if needed.
+		allowBreakGlass := inWindow
+		allowed, denyMsg, recorded := v.checkDisruptionPacing(ctx, bestWC, pod, now, allowBreakGlass, dryRun)
+		if !allowed {
+			return admission.Denied(denyMsg)
+		}
+		resp := v.handleAuthorizedSubject(ctx, bestWC, pod, matchingSubjects)
+		if !resp.Allowed && recorded {
+			v.clearAllowedEviction(client.ObjectKeyFromObject(bestWC), pod.UID)
+		}
+		return resp
 	}
 
 	if !inWindow {
@@ -132,7 +172,215 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 
+	// In-Window Concurrent Disruption Pacing (with break-glass after DisruptionStuckThresholdSeconds)
+	if allowed, denyMsg, _ := v.checkDisruptionPacing(ctx, bestWC, pod, now, true, dryRun); !allowed {
+		return admission.Denied(denyMsg)
+	}
+
 	return admission.Allowed("Eviction allowed by WorkloadClass policy")
+}
+
+func (v *DisruptionWebhook) now() time.Time {
+	if v.nowFunc != nil {
+		return v.nowFunc()
+	}
+	return time.Now().UTC()
+}
+
+func (v *DisruptionWebhook) clearAllowedEviction(wcKey types.NamespacedName, uid types.UID) {
+	if uid == "" {
+		return
+	}
+	v.pacingMu.Lock()
+	if entries := v.allowedEvictions[wcKey]; entries != nil {
+		delete(entries, uid)
+		if len(entries) == 0 {
+			delete(v.allowedEvictions, wcKey)
+		}
+	}
+	v.pacingMu.Unlock()
+}
+
+// checkDisruptionPacing enforces MaxUnavailable / MinAvailable across governed Pods belonging to wc.
+// Terminating Pods (deletionTimestamp set) count toward total and as unavailable (IsPodReady returns false).
+// Evicting a Pod that is not Ready is always allowed, matching upstream AlwaysAllow unhealthy-pod handling.
+// Single-replica workloads (total <= 1) bypass pacing. A short-lived in-memory ledger tracks recently
+// allowed eviction UIDs (per webhook replica) so rapid or concurrent drains do not overshoot budget before
+// informer caches reflect Pod termination or unready transitions.
+//
+// Returns (allowed, denyMessage, recordedInLedger).
+func (v *DisruptionWebhook) checkDisruptionPacing(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	pod *corev1.Pod,
+	now time.Time,
+	allowStuckBreakGlass bool,
+	dryRun bool,
+) (bool, string, bool) {
+	if !utils.HasPacingPolicy(wc.Spec.DisruptionPolicy) {
+		return true, "", false
+	}
+	// Always allow evicting a Pod that is not Ready (or already terminating), since removing it
+	// does not reduce healthy availability.
+	if !utils.IsPodReady(pod) {
+		if !dryRun {
+			v.BlockedTracker.Clear(pod.UID)
+		}
+		return true, "", false
+	}
+	log := logf.FromContext(ctx).WithValues("workloadClass", wc.Name, "pod", pod.Name, "namespace", pod.Namespace)
+
+	total, ready, liveUIDs, readyUIDs, ok := v.countGovernedPods(ctx, wc, pod.Namespace)
+	if !ok || total <= 1 {
+		if ok && !dryRun {
+			v.BlockedTracker.Clear(pod.UID)
+		}
+		return true, "", false
+	}
+
+	wcKey := client.ObjectKeyFromObject(wc)
+	v.pacingMu.Lock()
+	defer v.pacingMu.Unlock()
+
+	effectiveReady := v.effectiveReadyCountLocked(wcKey, pod.UID, now, ready, liveUIDs, readyUIDs)
+	budget, err := utils.CalculateDisruptionBudget(wc.Spec.DisruptionPolicy, total, max(0, effectiveReady))
+	if err != nil {
+		log.Error(err, "Failed to calculate disruption pacing budget; allowing eviction")
+		return true, "", false
+	}
+	if budget > 0 {
+		if !dryRun {
+			v.BlockedTracker.Clear(pod.UID)
+		}
+		return true, "", v.recordAllowedEvictionLocked(wcKey, pod.UID, now, dryRun)
+	}
+
+	if !allowStuckBreakGlass {
+		return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s",
+			effectiveReady, total, wc.Name), false
+	}
+
+	threshold, breakGlassEnabled := utils.StuckThreshold(wc.Spec.DisruptionPolicy)
+	if !breakGlassEnabled {
+		return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s (break-glass disabled)",
+			effectiveReady, total, wc.Name), false
+	}
+	if dryRun {
+		return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s (dry-run)",
+			effectiveReady, total, wc.Name), false
+	}
+
+	v.BlockedTracker.Prune(now.Add(-24 * time.Hour))
+	elapsed := v.BlockedTracker.RecordOrElapsed(pod.UID, now, threshold)
+	if elapsed >= threshold {
+		if v.BlockedTracker.TryBreakGlass(wcKey, pod.UID, now, threshold) {
+			log.Info("Disruption pacing stuck threshold exceeded, allowing break-glass eviction",
+				"elapsed", elapsed.Round(time.Second), "threshold", threshold)
+			return true, "", v.recordAllowedEvictionLocked(wcKey, pod.UID, now, dryRun)
+		}
+		return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s (waiting for break-glass cooldown %v)",
+			effectiveReady, total, wc.Name, threshold), false
+	}
+
+	return false, fmt.Sprintf("Eviction blocked: disruption pacing budget exhausted (%d/%d pods ready) for WorkloadClass %s (blocked for %v, break-glass after %v)",
+		effectiveReady, total, wc.Name, elapsed.Round(time.Second), threshold), false
+}
+
+func (v *DisruptionWebhook) countGovernedPods(
+	ctx context.Context,
+	wc *workloadsv1.WorkloadClass,
+	namespace string,
+) (total, ready int, liveUIDs, readyUIDs map[types.UID]struct{}, ok bool) {
+	log := logf.FromContext(ctx).WithValues("workloadClass", wc.Name, "namespace", namespace)
+	selector, err := utils.WorkloadClassPodSelector(ctx, v.Client, wc)
+	if err != nil {
+		log.Error(err, "Failed to resolve PodSelector for disruption pacing; allowing eviction")
+		return 0, 0, nil, nil, false
+	}
+	podList := &corev1.PodList{}
+	if err := v.Client.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		log.Error(err, "Failed to list Pods for disruption pacing; allowing eviction")
+		return 0, 0, nil, nil, false
+	}
+	enforcedWC, err := utils.NamespaceEnforcedWorkloadClass(ctx, v.Client, namespace)
+	if err != nil {
+		log.Error(err, "Failed to check namespace enforced WorkloadClass for pacing; allowing eviction")
+		return 0, 0, nil, nil, false
+	}
+	wcList := &workloadsv1.WorkloadClassList{}
+	if err := v.Client.List(ctx, wcList, client.InNamespace(namespace)); err != nil {
+		log.Error(err, "Failed to list WorkloadClasses for disruption pacing; allowing eviction")
+		return 0, 0, nil, nil, false
+	}
+
+	liveUIDs = make(map[types.UID]struct{}, len(podList.Items))
+	readyUIDs = make(map[types.UID]struct{}, len(podList.Items))
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if best := utils.BestMatchWorkloadClassForPod(p, enforcedWC, wcList.Items); best == nil || best.Name != wc.Name {
+			continue
+		}
+		total++
+		if p.UID != "" {
+			liveUIDs[p.UID] = struct{}{}
+		}
+		// IsPodReady returns false when DeletionTimestamp is set, so terminating Pods count as unavailable.
+		if utils.IsPodReady(p) {
+			ready++
+			if p.UID != "" {
+				readyUIDs[p.UID] = struct{}{}
+			}
+		}
+	}
+	return total, ready, liveUIDs, readyUIDs, true
+}
+
+func (v *DisruptionWebhook) effectiveReadyCountLocked(
+	wcKey types.NamespacedName,
+	targetUID types.UID,
+	now time.Time,
+	ready int,
+	liveUIDs, readyUIDs map[types.UID]struct{},
+) int {
+	entries := v.allowedEvictions[wcKey]
+	if entries == nil {
+		return ready
+	}
+	effectiveReady := ready
+	for uid, at := range entries {
+		if _, stillPresent := liveUIDs[uid]; !stillPresent || now.Sub(at) >= recentEvictionTTL {
+			delete(entries, uid)
+			continue
+		}
+		if uid == targetUID {
+			continue
+		}
+		if _, stillReady := readyUIDs[uid]; stillReady {
+			effectiveReady--
+		}
+	}
+	if len(entries) == 0 {
+		delete(v.allowedEvictions, wcKey)
+	}
+	return effectiveReady
+}
+
+func (v *DisruptionWebhook) recordAllowedEvictionLocked(wcKey types.NamespacedName, uid types.UID, now time.Time, dryRun bool) bool {
+	if dryRun || uid == "" {
+		return false
+	}
+	if v.allowedEvictions == nil {
+		v.allowedEvictions = map[types.NamespacedName]map[types.UID]time.Time{}
+	}
+	if v.allowedEvictions[wcKey] == nil {
+		v.allowedEvictions[wcKey] = map[types.UID]time.Time{}
+	}
+	_, alreadyRecorded := v.allowedEvictions[wcKey][uid]
+	v.allowedEvictions[wcKey][uid] = now
+	return !alreadyRecorded
 }
 
 // handleAuthorizedSubject handles an eviction request from a subject listed in the WorkloadClass'

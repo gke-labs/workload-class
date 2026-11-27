@@ -380,10 +380,13 @@ var _ = Describe("WorkloadClass Controller", func() {
 		})
 
 		It("should be overdue if time since last disruption exceeds max", func() {
-			By("updating WorkloadClass with old last disruption")
+			By("updating WorkloadClass with MaxNonDisruptionDurationDays and old last disruption")
 			wc := &workloadsv1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 2
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
 			wc.Status.LastDisruptionTime = &metav1.Time{
 				Time: time.Now().AddDate(0, 0, -4),
 			}
@@ -630,8 +633,43 @@ var _ = Describe("WorkloadClass Controller", func() {
 
 			Expect(pdb.Spec.Selector.MatchLabels).To(Equal(map[string]string{utils.PodUIDLabel: string(pod.UID)}))
 			Expect(pdb.Spec.UnhealthyPodEvictionPolicy).NotTo(BeNil())
-			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.AlwaysAllow))
 			Expect(metav1.GetControllerOf(pdb).Name).To(Equal(workloadClassName))
+		})
+
+		It("should enforce IfHealthyBudget when NotReady and honor configured UnhealthyPodEvictionPolicy when Ready", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			alwaysAllow := policyv1.AlwaysAllow
+			ifHealthy := policyv1.IfHealthyBudget
+
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy = &alwaysAllow
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+			Expect(*pdb.Spec.UnhealthyPodEvictionPolicy).To(Equal(policyv1.IfHealthyBudget))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = nil
+			wc.Spec.DisruptionPolicy.UnhealthyPodEvictionPolicy = &ifHealthy
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			Eventually(func() (policyv1.UnhealthyPodEvictionPolicyType, error) {
+				if err := k8sClient.Get(ctx, podPDBKey, pdb); err != nil {
+					return "", err
+				}
+				return *pdb.Spec.UnhealthyPodEvictionPolicy, nil
+			}, "10s", "1s").Should(Equal(policyv1.IfHealthyBudget))
+			Expect(pdb.Spec.MaxUnavailable.StrVal).To(Equal("100%"))
 		})
 
 		It("should open the PDBs instead of deleting them if validation fails", func() {
@@ -752,6 +790,70 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
+		It("should keep disruption protection active when placement validation fails or plugin is pending", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
+				Group: "workloads.gke.io",
+				Kind:  "GKESpotPlacementPolicy",
+				Name:  "missing-spot-profile",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			disruptionCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated)
+			Expect(disruptionCond).NotTo(BeNil())
+			Expect(disruptionCond.Status).To(Equal(metav1.ConditionTrue))
+
+			placementCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementValidated)
+			Expect(placementCond).NotTo(BeNil())
+			Expect(placementCond.Status).To(Equal(metav1.ConditionFalse))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+
+			By("Verifying the Per-Pod PDB is still created and closed despite PlacementValidated=False")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+		})
+
+		It("should keep PlacementValidated=True when only disruption guardrail validation fails", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Exceeds guardrail limit
+			wc.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeSpot}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			disruptionCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated)
+			Expect(disruptionCond).NotTo(BeNil())
+			Expect(disruptionCond.Status).To(Equal(metav1.ConditionFalse))
+
+			placementCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementValidated)
+			Expect(placementCond).NotTo(BeNil())
+			Expect(placementCond.Status).To(Equal(metav1.ConditionTrue))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+		})
+
 		It("should preserve PlacementPluginAttached=True, mark Validated=True, and create PDB when plugin has attached for current generation", func() {
 			By("Updating WorkloadClass with an InfrastructureProfileRef and a PodSelector matching the Pod")
 			wc := &workloadsv1.WorkloadClass{}
@@ -866,97 +968,299 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationPassed))
 			Expect(validatedCond.Message).To(Equal("WorkloadClass adheres to all Guardrail constraints"))
 		})
+
+		It("should mark WorkloadClass Ready and open its Per-Pod PDB when a Guardrail enables cluster-wide EmergencyOverride", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+
+			By("Enabling cluster-wide EmergencyOverride on the WorkloadClassGuardrail")
+			guardrail := &workloadsv1.WorkloadClassGuardrail{}
+			Expect(k8sClient.Get(ctx, typeNamespacedNameGuardrail, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Disruption.EmergencyOverride = true
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessReady))
+
+			Eventually(func() (string, error) {
+				if err := k8sClient.Get(ctx, podPDBKey, pdb); err != nil {
+					return "", err
+				}
+				return pdb.Spec.MaxUnavailable.StrVal, nil
+			}, "10s", "1s").Should(Equal("100%"))
+		})
+
+		It("should use cache in steady state and retry real envtest 409 conflicts on status and PDB via APIReader", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassReconciler{
+				Client: k8sClient, APIReader: liveReader, Scheme: k8sClient.Scheme(), Recorder: events.NewFakeRecorder(10),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(BeZero())
+
+			staleWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, staleWC)).To(Succeed())
+			staleWC.Spec.DisruptionPolicy.MinInitialRunDurationDays = 1
+			Expect(k8sClient.Update(ctx, staleWC)).To(Succeed())
+			stalePDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, stalePDB)).To(Succeed())
+
+			liveWC := staleWC.DeepCopy()
+			meta.SetStatusCondition(&liveWC.Status.Conditions, metav1.Condition{
+				Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonFallbackActive, Message: "concurrent update",
+				ObservedGeneration: liveWC.Generation, LastTransitionTime: metav1.Now(),
+			})
+			Expect(k8sClient.Status().Update(ctx, liveWC)).To(Succeed())
+			livePDB := stalePDB.DeepCopy()
+			livePDB.Annotations = map[string]string{"test/concurrent": "1"}
+			Expect(k8sClient.Update(ctx, livePDB)).To(Succeed())
+
+			r.Client = &staleCacheClient{Client: k8sClient, stale: []client.Object{staleWC, stalePDB}}
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(2))
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(updatedWC.Status.Conditions, workloadsv1.ConditionTypeInFallback)).To(BeTrue())
+			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessNotReady))
+
+			updatedPDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, updatedPDB)).To(Succeed())
+			Expect(updatedPDB.Annotations).To(HaveKeyWithValue("test/concurrent", "1"))
+			Expect(updatedPDB.Spec.MaxUnavailable.IntVal).To(BeZero())
+		})
+
+		It("should skip stale status update when spec generation changes concurrently", func() {
+			stale := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stale)).To(Succeed())
+			live := stale.DeepCopy()
+			live.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 2
+			Expect(k8sClient.Update(ctx, live)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassReconciler{
+				Client:    &staleCacheClient{Client: k8sClient, stale: []client.Object{stale}},
+				APIReader: liveReader, Scheme: k8sClient.Scheme(), Recorder: events.NewFakeRecorder(10),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(1))
+
+			updated := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(meta.FindStatusCondition(updated.Status.Conditions, workloadsv1.ConditionTypeValidated)).To(BeNil())
+		})
+
+		It("should reject a WorkloadClass that specifies both maxUnavailable and minAvailable", func() {
+			one := intstr.FromInt32(1)
+			two := intstr.FromInt32(2)
+			invalid := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "invalid-both-pacing-fields",
+					Namespace: defaultNamespace,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxUnavailable: &one,
+						MinAvailable:   &two,
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, invalid)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("maxUnavailable and minAvailable are mutually exclusive"))
+		})
+
+		It("should reject malformed or negative maxUnavailable/minAvailable via CEL validation", func() {
+			cases := []struct {
+				name string
+				val  intstr.IntOrString
+			}{
+				{name: "neg-int", val: intstr.FromInt32(-1)},
+				{name: "bare-string", val: intstr.FromString("25")},
+				{name: "alpha-pct", val: intstr.FromString("abc%")},
+				{name: "over-100-pct", val: intstr.FromString("150%")},
+			}
+			for _, tc := range cases {
+				v := tc.val
+				wcMax := &workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-max-" + tc.name, Namespace: defaultNamespace},
+					Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxUnavailable: &v}},
+				}
+				Expect(k8sClient.Create(ctx, wcMax)).To(MatchError(ContainSubstring("maxUnavailable must be a non-negative integer or a percentage string")))
+
+				wcMin := &workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-min-" + tc.name, Namespace: defaultNamespace},
+					Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MinAvailable: &v}},
+				}
+				Expect(k8sClient.Create(ctx, wcMin)).To(MatchError(ContainSubstring("minAvailable must be a non-negative integer or a percentage string")))
+			}
+		})
 	})
 })
 
-func TestOverdue(t *testing.T) {
-	wc := &workloadsv1.WorkloadClass{
-		Spec: workloadsv1.WorkloadClassSpec{
-			DisruptionPolicy: workloadsv1.DisruptionPolicy{},
-		},
-		Status: workloadsv1.WorkloadClassStatus{},
+type staleCacheClient struct {
+	client.Client
+	stale []client.Object
+}
+
+func (c *staleCacheClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	for _, s := range c.stale {
+		if reflect.TypeOf(s) == reflect.TypeOf(obj) && client.ObjectKeyFromObject(s) == key {
+			reflect.ValueOf(obj).Elem().Set(reflect.ValueOf(s.DeepCopyObject()).Elem())
+			return nil
+		}
 	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+type countingReader struct {
+	client.Reader
+	gets int
+}
+
+func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	r.gets++
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestOverdue(t *testing.T) {
+	now := time.Now().UTC()
+
 	testCases := []struct {
-		name                     string
-		desc                     string
-		wc                       *workloadsv1.WorkloadClass
-		setLastDisruption        bool
-		setMNDDD                 bool
-		maxNonDisruptionDuration int
-		lastDisruption           time.Time
-		want                     bool
+		name string
+		wc   *workloadsv1.WorkloadClass
+		want bool
 	}{
 		{
 			name: "wc_nil",
-			desc: "WorkloadClass is nil, want true",
+			wc:   nil,
+			want: false,
+		},
+		{
+			name: "max_non_disruption_days_unset_and_last_disruption_nil",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(-1, 0, 0)}},
+			},
+			want: false,
+		},
+		{
+			name: "max_non_disruption_days_unset_with_old_last_disruption",
+			wc: &workloadsv1.WorkloadClass{
+				Status: workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: now.AddDate(-1, 0, 0)},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "last_disruption_nil_created_recently_not_overdue",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(0, 0, -5)}},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "last_disruption_nil_created_before_max_duration_overdue",
+			wc: &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.AddDate(0, 0, -15)}},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+			},
 			want: true,
 		},
 		{
-			name:              "fields_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want true",
-			setLastDisruption: false,
-			setMNDDD:          false,
-			want:              true,
+			name: "diff_greater_than_max_duration",
+			wc: &workloadsv1.WorkloadClass{
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: now.AddDate(0, -1, 0)},
+				},
+			},
+			want: true,
 		},
 		{
-			name:              "max_non_disruption_days_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set but LastDisrupt ionTime is set, want true",
-			setLastDisruption: true,
-			setMNDDD:          false,
-			want:              true,
-		},
-		{
-			name:              "last_disruption_time_not_set",
-			desc:              "MaxNonDisruptionDurationDays is set but LastDisruptionTime is nil, want ",
-			setLastDisruption: true,
-			setMNDDD:          false,
-			want:              true,
-		},
-		{
-			name:              "fields_not_set",
-			desc:              "MaxNonDisruptionDurationDays not set and LastDisruptionTime nil, want true",
-			setLastDisruption: false,
-			setMNDDD:          false,
-			want:              true,
-		},
-		{
-			name:                     "diff_greater_than_max_duration",
-			desc:                     "Overdue",
-			setLastDisruption:        true,
-			setMNDDD:                 true,
-			maxNonDisruptionDuration: 10,
-			lastDisruption:           time.Now().AddDate(0, -1, 0),
-			want:                     true,
-		},
-		{
-			name:                     "diff_less_than_max_duration",
-			desc:                     "Not overdue",
-			setLastDisruption:        true,
-			setMNDDD:                 true,
-			maxNonDisruptionDuration: 10,
-			lastDisruption:           time.Now().AddDate(0, 0, -5),
-			want:                     false,
+			name: "diff_less_than_max_duration",
+			wc: &workloadsv1.WorkloadClass{
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+				},
+				Status: workloadsv1.WorkloadClassStatus{
+					LastDisruptionTime: &metav1.Time{Time: now.AddDate(0, 0, -5)},
+				},
+			},
+			want: false,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			now := time.Now()
-			if tc.setLastDisruption {
-				wc.Status.LastDisruptionTime = &metav1.Time{Time: tc.lastDisruption}
-			}
-			if tc.setMNDDD {
-				wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = int32(tc.maxNonDisruptionDuration)
-			}
-			defer func() {
-				wc.Status.LastDisruptionTime = nil
-				wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 0
-			}()
-
-			if got := overdue(wc, now); got != tc.want {
-				t.Errorf("overdue() returned an unexpected result, got %v, want %v", got, tc.want)
+			if got := overdue(tc.wc, now); got != tc.want {
+				t.Errorf("overdue() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCalculateReadiness_UnsetMaxNonDisruptionDurationRespectsWindow(t *testing.T) {
+	scheme := newTestScheme(t)
+	notToday := time.Now().UTC().AddDate(0, 0, 2).Weekday().String()
+	wc := &workloadsv1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "no-max-duration",
+			Namespace:         "default",
+			CreationTimestamp: metav1.Time{Time: time.Now().UTC().AddDate(-1, 0, 0)},
+		},
+		Spec: workloadsv1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1.DisruptionPolicy{
+				AllowedDisruptionWindows: []workloadsv1.DisruptionWindow{
+					{Name: "other-day", DaysOfWeek: []string{notToday}, StartTime: "00:00", EndTime: "23:59", TimeZone: "UTC"},
+				},
+				// MaxNonDisruptionDurationDays intentionally unset (0).
+			},
+		},
+	}
+
+	r := &WorkloadClassReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).Build(),
+		Scheme: scheme,
+	}
+
+	readiness, _, err := r.calculateReadiness(context.Background(), wc)
+	if err != nil {
+		t.Fatalf("calculateReadiness() unexpected error: %v", err)
+	}
+	if readiness != workloadsv1.ReadinessNotReady {
+		t.Errorf("calculateReadiness() = %v, want %v when maxNonDisruptionDurationDays is unset outside window", readiness, workloadsv1.ReadinessNotReady)
 	}
 }
 
@@ -2344,5 +2648,20 @@ func TestValidateCapacityStrategy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateSpec_ExcludedSystemNamespaces(t *testing.T) {
+	for _, ns := range []string{"kube-system", "cert-manager", "workload-class-system"} {
+		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: ns}}
+		if got := validateSpec(wc); len(got) == 0 {
+			t.Errorf("validateSpec(namespace=%q) returned no violation, want excluded-namespace violation", ns)
+		}
+	}
+	for _, ns := range []string{"", "default", "sample"} {
+		wc := &workloadsv1.WorkloadClass{ObjectMeta: metav1.ObjectMeta{Name: "test-wc", Namespace: ns}}
+		if got := validateSpec(wc); len(got) != 0 {
+			t.Errorf("validateSpec(namespace=%q) = %v, want no violation", ns, got)
+		}
 	}
 }

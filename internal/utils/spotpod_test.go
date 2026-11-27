@@ -36,6 +36,28 @@ func TestIsPodTargetedForSpot(t *testing.T) {
 		{name: "no Spot targeting", pod: corev1.Pod{}, want: false},
 		{name: "Spot nodeSelector", pod: corev1.Pod{Spec: corev1.PodSpec{NodeSelector: map[string]string{SpotLabelKey: SpotLabelValue}}}, want: true},
 		{name: "Spot toleration", pod: corev1.Pod{Spec: corev1.PodSpec{Tolerations: []corev1.Toleration{spotToleration()}}}, want: true},
+		{name: "Spot provisioning required affinity", pod: corev1.Pod{Spec: corev1.PodSpec{Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key: ProvisioningLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{ProvisioningSpotValue},
+						}},
+					}},
+				},
+			},
+		}}}, want: true},
+		{name: "OnDemand provisioning NotIn spot affinity", pod: corev1.Pod{Spec: corev1.PodSpec{Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key: ProvisioningLabelKey, Operator: corev1.NodeSelectorOpNotIn, Values: []string{ProvisioningSpotValue},
+						}},
+					}},
+				},
+			},
+		}}}, want: false},
 		{name: "Spot toleration with empty operator", pod: corev1.Pod{Spec: corev1.PodSpec{Tolerations: []corev1.Toleration{{Key: SpotLabelKey, Value: SpotLabelValue, Effect: corev1.TaintEffectNoSchedule}}}}, want: true},
 		{name: "other toleration", pod: corev1.Pod{Spec: corev1.PodSpec{Tolerations: []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}}}}, want: false},
 		{name: "Spot key with NoExecute effect", pod: corev1.Pod{Spec: corev1.PodSpec{Tolerations: []corev1.Toleration{{Key: SpotLabelKey, Operator: corev1.TolerationOpEqual, Value: SpotLabelValue, Effect: corev1.TaintEffectNoExecute}}}}, want: false},

@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,7 +40,9 @@ import (
 // GKESpotPlacementPolicyReconciler reconciles a GKESpotPlacementPolicy object
 type GKESpotPlacementPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader bypasses the informer cache for conflict-retry reads (e.g. mgr.GetAPIReader()).
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=gkespotplacementpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -75,10 +76,26 @@ func (r *GKESpotPlacementPolicyReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
-	if meta.SetStatusCondition(&spotPolicy.Status.Conditions, validationCond) {
-		if err := r.Status().Update(ctx, spotPolicy); err != nil {
-			return ctrl.Result{}, err
+	staleGeneration := false
+	if err := utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
+		latest := &workloadsv1.GKESpotPlacementPolicy{}
+		if getErr := rc.Get(ctx, req.NamespacedName, latest); getErr != nil {
+			return client.IgnoreNotFound(getErr)
 		}
+		if latest.Generation != spotPolicy.Generation {
+			staleGeneration = true
+			return nil
+		}
+		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCond) {
+			return nil
+		}
+		return rc.Status().Update(ctx, latest)
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	if staleGeneration {
+		log.V(1).Info("GKESpotPlacementPolicy spec generation changed concurrently, skipping stale status update", "generation", spotPolicy.Generation)
+		return ctrl.Result{}, nil
 	}
 
 	wcStatusOpts := statusOptions{
@@ -105,6 +122,15 @@ func (r *GKESpotPlacementPolicyReconciler) validateAgainstGuardrails(ctx context
 	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
 	if err := r.List(ctx, guardrails); err != nil {
 		return metav1.Condition{}, err
+	}
+
+	if spotPolicy.Spec.CustomComputeClass != "" && len(spotPolicy.Spec.FallbackAllowedMachineFamilies) > 0 {
+		// Surface incompatible legacy policies persisted before the CEL rule took effect.
+		guardrailViolations := validateSpotPolicyAgainstGuardrails(spotPolicy, guardrails.Items)
+		violations := make([]string, 0, 1+len(guardrailViolations))
+		violations = append(violations, "fallbackAllowedMachineFamilies cannot be used with customComputeClass")
+		violations = append(violations, guardrailViolations...)
+		return condition(spotPolicy.Generation, violations), nil
 	}
 
 	if len(guardrails.Items) == 0 {
@@ -224,10 +250,17 @@ func (r *GKESpotPlacementPolicyReconciler) updateReferencingWorkloadClasses(ctx 
 
 func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context.Context, wc *workloadsv1.WorkloadClass, options statusOptions) error {
 	key := client.ObjectKeyFromObject(wc)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	policyName := ""
+	if wc.Spec.InfrastructureProfileRef != nil {
+		policyName = wc.Spec.InfrastructureProfileRef.Name
+	}
+	return utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
 		latest := &workloadsv1.WorkloadClass{}
-		if err := r.Get(ctx, key, latest); err != nil {
+		if err := rc.Get(ctx, key, latest); err != nil {
 			return client.IgnoreNotFound(err)
+		}
+		if policyName != "" && (!utils.ReferencesGKESpotPlacementPolicy(latest.Spec.InfrastructureProfileRef) || latest.Spec.InfrastructureProfileRef.Name != policyName) {
+			return nil
 		}
 		cond := metav1.Condition{
 			Type:               workloadsv1.ConditionTypePlacementPluginAttached,
@@ -238,7 +271,7 @@ func (r *GKESpotPlacementPolicyReconciler) updateWorkloadClassStatus(ctx context
 			LastTransitionTime: metav1.Now(),
 		}
 		if meta.SetStatusCondition(&latest.Status.Conditions, cond) {
-			return r.Status().Update(ctx, latest)
+			return rc.Status().Update(ctx, latest)
 		}
 		return nil
 	})

@@ -33,7 +33,9 @@ import (
 // WorkloadClassGuardrailReconciler reconciles a WorkloadClassGuardrail object
 type WorkloadClassGuardrailReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader bypasses the informer cache for conflict-retry reads (e.g. mgr.GetAPIReader()).
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclassguardrails,verbs=get;list;watch;create;update;patch;delete
@@ -52,11 +54,30 @@ func (r *WorkloadClassGuardrailReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	validationCondition := r.validate(ctx, g)
-	if meta.SetStatusCondition(&g.Status.Conditions, validationCondition) {
-		err = r.Status().Update(ctx, g)
+	staleGeneration := false
+	err = utils.RetryOnConflictWithReader(r.Client, r.APIReader, func(rc client.Client) error {
+		latest := &workloadsv1.WorkloadClassGuardrail{}
+		if getErr := rc.Get(ctx, req.NamespacedName, latest); getErr != nil {
+			return client.IgnoreNotFound(getErr)
+		}
+		if latest.Generation != g.Generation {
+			staleGeneration = true
+			return nil
+		}
+		if !meta.SetStatusCondition(&latest.Status.Conditions, validationCondition) {
+			return nil
+		}
+		return rc.Status().Update(ctx, latest)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if staleGeneration {
+		logf.FromContext(ctx).V(1).Info("WorkloadClassGuardrail spec generation changed concurrently, skipping stale status update", "generation", g.Generation)
+		return ctrl.Result{}, nil
 	}
 
-	return ctrl.Result{}, err
+	return ctrl.Result{}, nil
 }
 
 func (r *WorkloadClassGuardrailReconciler) validate(ctx context.Context, g *workloadsv1.WorkloadClassGuardrail) metav1.Condition {

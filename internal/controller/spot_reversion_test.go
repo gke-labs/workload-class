@@ -512,3 +512,63 @@ func TestFindWorkloadClassesForGuardrail(t *testing.T) {
 		t.Errorf("expected 0 reconcile requests for nil object, got %d", len(reqs))
 	}
 }
+
+func TestReconcile_TracksFallbackButSkipsReversionWhenDisruptionInvalid(t *testing.T) {
+	scheme := newGKESpotScheme()
+	utilruntime.Must(policyv1.AddToScheme(scheme))
+
+	wc := newManagedWC(fallbackCS("100%"))
+	wc.Spec.InfrastructureProfileRef = gkePolicyRef()
+	wc.Status.Conditions = []metav1.Condition{
+		{Type: workloadsv1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+		{Type: workloadsv1.ConditionTypeDisruptionValidated, Status: metav1.ConditionFalse, Reason: workloadsv1.ReasonValidationFailed},
+		trueCondition(workloadsv1.ConditionTypePlacementValidated),
+		trueCondition(workloadsv1.ConditionTypePlacementPluginAttached),
+	}
+	policy := &workloadsv1.GKESpotPlacementPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "spot-policy"},
+		Spec: workloadsv1.GKESpotPlacementPolicySpec{
+			Reversion: workloadsv1.SpotReversionPolicy{
+				Action:                workloadsv1.ActiveReversionAction,
+				MinDurationOnFallback: &metav1.Duration{Duration: 0},
+			},
+		},
+	}
+	spotNode := spotNodeObj.DeepCopy()
+	spotNode.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+	odNode := onDemandNodeObj.DeepCopy()
+	fbPod := fallbackPodAt("fallback-1", time.Now().UTC().Add(-time.Hour))
+	var evictAttempts int
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&workloadsv1.WorkloadClass{}).
+		WithObjects(wc, policy, spotNode, odNode, fbPod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceCreate: func(ctx context.Context, c client.Client, sub string, obj client.Object, subObj client.Object, opts ...client.SubResourceCreateOption) error {
+				if sub == "eviction" {
+					evictAttempts++
+				}
+				return nil
+			},
+		}).Build()
+
+	r := &GKESpotPlacementReconciler{Client: fc, Scheme: scheme}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(wc)}); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if evictAttempts != 0 {
+		t.Errorf("evictAttempts = %d, want 0 when DisruptionValidated=False", evictAttempts)
+	}
+	gotWC := &workloadsv1.WorkloadClass{}
+	if err := fc.Get(t.Context(), client.ObjectKeyFromObject(wc), gotWC); err != nil {
+		t.Fatalf("Get(wc) error = %v", err)
+	}
+	condFound := false
+	for _, c := range gotWC.Status.Conditions {
+		if c.Type == workloadsv1.ConditionTypeInFallback && c.Status == metav1.ConditionTrue {
+			condFound = true
+		}
+	}
+	if !condFound {
+		t.Errorf("expected InFallback=True to remain tracked while DisruptionValidated=False, got conditions %+v", gotWC.Status.Conditions)
+	}
+}
