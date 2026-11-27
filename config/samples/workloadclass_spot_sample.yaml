@@ -1,0 +1,34 @@
+# Dedicated namespace without workloads.gke.io/enforced-class so podSelector governs matching Pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spot-sample
+---
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: spot-batch-workload
+  namespace: spot-sample
+spec:
+  podSelector:
+    matchLabels:
+      app: spot-batch
+  disruptionPolicy:
+    allowedDisruptionWindows:
+      # Matches the Saturday/Sunday window constraint in config/samples/workloads_v1_workloadclassguardrail.yaml.
+      - name: "weekend-maintenance"
+        daysOfWeek:
+          - Saturday
+          - Sunday
+        startTime: "02:00"
+        endTime: "06:00"
+        timeZone: "UTC"
+    maxNonDisruptionDurationDays: 14
+  capacityStrategy:
+    type: Spot
+    spotRatio: "80%"
+    action: FallbackToOnDemand
+  infrastructureProfileRef:
+    group: workloads.gke.io
+    kind: GKESpotPlacementPolicy
+    name: gke-spot-balanced
