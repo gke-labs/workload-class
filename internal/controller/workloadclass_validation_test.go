@@ -548,7 +548,7 @@ func TestResourceManagementValidatedCondition(t *testing.T) {
 			if tc.mutate != nil {
 				tc.mutate(wc)
 			}
-			got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{Items: tc.guardrails}, tc.overlapping)
+			got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{Items: tc.guardrails}, tc.overlapping, true)
 			if got == nil {
 				t.Fatal("resourceManagementValidatedCondition() = nil, want a condition")
 			}
@@ -570,7 +570,7 @@ func TestResourceManagementValidatedCondition(t *testing.T) {
 
 func TestResourceManagementValidatedConditionUnset(t *testing.T) {
 	wc := testWorkloadClass("wc", "ns", map[string]string{"app": "nginx"})
-	if got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{}, nil); got != nil {
+	if got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{}, nil, true); got != nil {
 		t.Errorf("resourceManagementValidatedCondition() = %+v, want nil when resourceManagement is unset", got)
 	}
 }
@@ -595,5 +595,42 @@ func TestResourceManagementViolationIsIsolatedFromDisruption(t *testing.T) {
 	}
 	if want := "`resourceManagement.autoscaling.replicas.max` must be at most 5"; !strings.Contains(validated.Message, want) {
 		t.Errorf("Validated message = %q, want it to contain %q", validated.Message, want)
+	}
+}
+
+// Without the VPA, a WorkloadClass that enables rightsizing stays valid, because autoscaling only needs the core
+// HorizontalPodAutoscaler API, but its message says that rightsizing is not applied.
+func TestResourceManagementValidatedConditionWithoutVPA(t *testing.T) {
+	testCases := []struct {
+		name        string
+		mutate      func(*workloadsv1.WorkloadClass)
+		wantMessage bool
+	}{
+		{name: "rightsizing", wantMessage: true},
+		{
+			name: "rightsizing_off",
+			mutate: func(wc *workloadsv1.WorkloadClass) {
+				wc.Spec.ResourceManagement.Rightsizing.Mode = workloadsv1.RightsizingModeOff
+			},
+		},
+		{
+			name:   "autoscaling_only",
+			mutate: func(wc *workloadsv1.WorkloadClass) { wc.Spec.ResourceManagement.Rightsizing = nil },
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := testResourceManagementWC()
+			if tc.mutate != nil {
+				tc.mutate(wc)
+			}
+			got := resourceManagementValidatedCondition(wc, &workloadsv1.WorkloadClassGuardrailList{}, nil, false)
+			if got.Status != metav1.ConditionTrue || got.Reason != workloadsv1.ReasonNoGuardrails {
+				t.Errorf("got (%s, %s), want (True, %s)", got.Status, got.Reason, workloadsv1.ReasonNoGuardrails)
+			}
+			if has := strings.Contains(got.Message, "VPA is not installed; rightsizing is not applied"); has != tc.wantMessage {
+				t.Errorf("Message = %q, want the VPA message: %t", got.Message, tc.wantMessage)
+			}
+		})
 	}
 }

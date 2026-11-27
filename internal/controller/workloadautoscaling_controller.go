@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	vpav1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -51,6 +53,18 @@ const (
 	// EventReasonUserAutoscalerPresent is recorded on a workload when a user-created autoscaler targets it, so the
 	// controller does not create its own autoscaler of that kind.
 	EventReasonUserAutoscalerPresent = "UserAutoscalerPresent"
+
+	// EventReasonRightsizingSkipped is recorded on a WorkloadClass when no resource is left to rightsize, because
+	// autoscaling targets the utilization of every rightsized resource and the platform does not coordinate them.
+	EventReasonRightsizingSkipped = "RightsizingSkipped"
+
+	// EventReasonInPlaceUnsupported is recorded on a WorkloadClass when the installed VerticalPodAutoscaler does not
+	// support the InPlaceOrRecreate update mode, so the InPlacePreferred update strategy falls back to Recreate.
+	EventReasonInPlaceUnsupported = "InPlaceUnsupported"
+
+	// EventReasonVPANotInstalled is recorded on a WorkloadClass that enables rightsizing when the
+	// VerticalPodAutoscaler is not installed.
+	EventReasonVPANotInstalled = "VPANotInstalled"
 
 	eventActionReconcileAutoscaler = "ReconcileAutoscaler"
 )
@@ -82,8 +96,9 @@ var (
 	WorkloadKinds = []WorkloadKind{DeploymentWorkload, StatefulSetWorkload}
 )
 
-// WorkloadAutoscalingReconciler creates, updates, and deletes the HorizontalPodAutoscaler of each workload of one
-// kind (Deployment or StatefulSet), following the resourceManagement of the workload's best-match WorkloadClass.
+// WorkloadAutoscalingReconciler creates, updates, and deletes the HorizontalPodAutoscaler and the
+// VerticalPodAutoscaler of each workload of one kind (Deployment or StatefulSet), following the resourceManagement of
+// the workload's best-match WorkloadClass.
 //
 // It is keyed by workload rather than by WorkloadClass: each workload has exactly one best-match WorkloadClass and
 // owns at most one managed autoscaler of each kind, so a workload that moves to another WorkloadClass is handled
@@ -96,16 +111,22 @@ type WorkloadAutoscalingReconciler struct {
 
 	// Workload is the kind of workload that the reconciler handles.
 	Workload WorkloadKind
+
+	// Capabilities describes what the cluster's autoscalers support. VerticalPodAutoscalers are only watched and
+	// reconciled when Capabilities.VPAInstalled is true.
+	Capabilities utils.AutoscalerCapabilities
 }
 
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments/finalizers;statefulsets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses;workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile brings the managed HorizontalPodAutoscaler of a workload in line with its best-match WorkloadClass:
+// Reconcile brings the managed HorizontalPodAutoscaler and VerticalPodAutoscaler of a workload in line with its
+// best-match WorkloadClass:
 //
 //  1. If the workload is gone, nothing is left to do: owner references garbage-collect its autoscalers.
 //  2. If no WorkloadClass governs the workload, the WorkloadClass has no resourceManagement, or its
@@ -140,14 +161,16 @@ func (r *WorkloadAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.
 	switch gate {
 	case autoscalingRemove:
 		log.V(1).Info("Removing managed autoscalers", "reason", reason)
-		return ctrl.Result{}, r.deleteManagedHPA(ctx, obj, workload)
+		return ctrl.Result{}, errors.Join(r.deleteManagedHPA(ctx, obj, workload), r.deleteManagedVPA(ctx, obj, workload))
 	case autoscalingPending:
 		log.V(1).Info("Waiting for the WorkloadClass to be validated", "workloadClass", wc.Name, "reason", reason)
 		return ctrl.Result{}, nil
 	}
 
-	log = log.WithValues("workloadClass", wc.Name)
-	return ctrl.Result{}, r.reconcileHPA(logf.IntoContext(ctx, log), obj, workload, utils.BuildHPA(wc, workload))
+	ctx = logf.IntoContext(ctx, log.WithValues("workloadClass", wc.Name))
+	hpaErr := r.reconcileHPA(ctx, obj, workload, utils.BuildHPA(wc, workload))
+	vpaErr := r.reconcileVPA(ctx, obj, wc, workload)
+	return ctrl.Result{}, errors.Join(hpaErr, vpaErr)
 }
 
 // governingWorkloadClass returns the best-match WorkloadClass of the workload's Pod template, or nil if none matches.
@@ -243,6 +266,87 @@ func (r *WorkloadAutoscalingReconciler) deleteManagedHPA(ctx context.Context, ow
 	return r.deleteManagedAutoscaler(ctx, owner, workload, hpa, "HorizontalPodAutoscaler")
 }
 
+// reconcileVPA creates or updates the managed VerticalPodAutoscaler of the workload, or deletes it if the
+// WorkloadClass describes none (see utils.BuildVPA) or a user-created VerticalPodAutoscaler targets the workload.
+// When the VerticalPodAutoscaler is not installed, it does nothing: the WorkloadClass controller reports that
+// rightsizing is not applied.
+func (r *WorkloadAutoscalingReconciler) reconcileVPA(ctx context.Context, owner client.Object, wc *workloadsv1.WorkloadClass, workload utils.WorkloadRef) error {
+	if !r.Capabilities.VPAInstalled {
+		return nil
+	}
+
+	var desired *vpav1.VerticalPodAutoscaler
+	var outcome utils.VPAOutcome
+	if wc.Spec.ResourceManagement.Rightsizing != nil {
+		guardrails := &workloadsv1.WorkloadClassGuardrailList{}
+		if err := r.List(ctx, guardrails); err != nil {
+			return fmt.Errorf("failed to list WorkloadClassGuardrails: %w", err)
+		}
+		desired, outcome = utils.BuildVPA(wc, workload, utils.EffectiveResourceManagementConstraints(guardrails.Items), r.Capabilities)
+	}
+
+	vpas := &vpav1.VerticalPodAutoscalerList{}
+	if err := r.List(ctx, vpas, client.InNamespace(workload.Namespace)); err != nil {
+		return fmt.Errorf("failed to list VerticalPodAutoscalers: %w", err)
+	}
+	for i := range vpas.Items {
+		vpa := &vpas.Items[i]
+		if ref := vpa.Spec.TargetRef; ref != nil && !utils.IsWorkloadClassManagedAutoscaler(vpa) && targetsWorkload(ref.APIVersion, ref.Kind, ref.Name, workload) {
+			if desired != nil {
+				r.recordUserAutoscalerPresent(owner, workload, "VerticalPodAutoscaler", vpa.Name)
+			}
+			return r.deleteManagedVPA(ctx, owner, workload)
+		}
+	}
+
+	if desired == nil {
+		if len(outcome.ExcludedResources) > 0 && r.Recorder != nil {
+			r.Recorder.Eventf(wc, nil, corev1.EventTypeNormal, EventReasonRightsizingSkipped, eventActionReconcileAutoscaler,
+				"Autoscaling targets the utilization of %s, so no resource is left to rightsize and no VerticalPodAutoscaler is created for %s %s",
+				utils.QuotedList(resourceNames(outcome.ExcludedResources)), workload.Kind, workload.Name)
+		}
+		return r.deleteManagedVPA(ctx, owner, workload)
+	}
+	if outcome.InPlaceFallback && r.Recorder != nil {
+		r.Recorder.Eventf(wc, nil, corev1.EventTypeWarning, EventReasonInPlaceUnsupported, eventActionReconcileAutoscaler,
+			"The installed VerticalPodAutoscaler does not support the InPlaceOrRecreate update mode, so the InPlacePreferred "+
+				"update strategy falls back to Recreate for %s %s", workload.Kind, workload.Name)
+	}
+
+	vpa := &vpav1.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, vpa, func() error {
+		if err := r.claimAutoscaler(owner, vpa, "VerticalPodAutoscaler"); err != nil {
+			return err
+		}
+		vpa.Labels = withLabels(vpa.Labels, desired.Labels)
+		vpa.Spec = desired.Spec
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reconcile VerticalPodAutoscaler %s: %w", desired.Name, err)
+	}
+	if op != controllerutil.OperationResultNone {
+		logf.FromContext(ctx).Info("Reconciled VerticalPodAutoscaler", "verticalPodAutoscaler", vpa.Name, "operation", op)
+	}
+	return nil
+}
+
+func (r *WorkloadAutoscalingReconciler) deleteManagedVPA(ctx context.Context, owner client.Object, workload utils.WorkloadRef) error {
+	if !r.Capabilities.VPAInstalled {
+		return nil
+	}
+	vpa := &vpav1.VerticalPodAutoscaler{}
+	return r.deleteManagedAutoscaler(ctx, owner, workload, vpa, "VerticalPodAutoscaler")
+}
+
+func resourceNames(names []corev1.ResourceName) []string {
+	strs := make([]string, 0, len(names))
+	for _, name := range names {
+		strs = append(strs, string(name))
+	}
+	return strs
+}
+
 // deleteManagedAutoscaler deletes the managed autoscaler of the workload into which obj is read, if it exists, is
 // managed by a WorkloadClass, and is controlled by the workload. The UID and resourceVersion preconditions keep it
 // from deleting an object that changed after it was read.
@@ -301,9 +405,10 @@ func withLabels(existing, labels map[string]string) map[string]string {
 	return existing
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager sets up the controller with the Manager. VerticalPodAutoscalers are only watched when they are
+// installed, because watching a type that isn't served would stop the manager from starting.
 func (r *WorkloadAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		// The best-match WorkloadClass depends only on the workload's namespace and Pod template labels.
 		For(r.Workload.NewObject(), builder.WithPredicates(workloadTemplateLabelsPredicate())).
 		// Revert changes to, and recreate, the managed autoscalers.
@@ -327,9 +432,24 @@ func (r *WorkloadAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error
 			&autoscalingv2.HorizontalPodAutoscaler{},
 			handler.EnqueueRequestsFromMapFunc(r.hpaTarget),
 			builder.WithPredicates(userAutoscalerPredicate()),
-		).
-		Named("workloadautoscaling-" + strings.ToLower(r.Workload.Kind)).
-		Complete(r)
+		)
+	if r.Capabilities.VPAInstalled {
+		b = b.
+			Owns(&vpav1.VerticalPodAutoscaler{}, builder.WithPredicates(managedVPAPredicate())).
+			Watches(
+				&vpav1.VerticalPodAutoscaler{},
+				handler.EnqueueRequestsFromMapFunc(r.vpaTarget),
+				builder.WithPredicates(userAutoscalerPredicate()),
+			).
+			// The effective guardrail containerBounds apply to VerticalPodAutoscalers whose WorkloadClass sets no
+			// bounds. Guardrail status updates are ignored.
+			Watches(
+				&workloadsv1.WorkloadClassGuardrail{},
+				handler.EnqueueRequestsFromMapFunc(r.allWorkloads),
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+	}
+	return b.Named("workloadautoscaling-" + strings.ToLower(r.Workload.Kind)).Complete(r)
 }
 
 // workloadsInObjectNamespace enqueues every workload of the reconciler's kind in the object's namespace.
@@ -340,6 +460,11 @@ func (r *WorkloadAutoscalingReconciler) workloadsInObjectNamespace(ctx context.C
 // workloadsInNamespace enqueues every workload of the reconciler's kind in the Namespace.
 func (r *WorkloadAutoscalingReconciler) workloadsInNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
 	return r.workloadRequests(ctx, obj.GetName())
+}
+
+// allWorkloads enqueues every workload of the reconciler's kind in the cluster.
+func (r *WorkloadAutoscalingReconciler) allWorkloads(ctx context.Context, _ client.Object) []reconcile.Request {
+	return r.workloadRequests(ctx, metav1.NamespaceAll)
 }
 
 func (r *WorkloadAutoscalingReconciler) workloadRequests(ctx context.Context, namespace string) []reconcile.Request {
@@ -369,6 +494,16 @@ func (r *WorkloadAutoscalingReconciler) hpaTarget(_ context.Context, obj client.
 	}
 	ref := hpa.Spec.ScaleTargetRef
 	return r.targetRequests(hpa.Namespace, ref.APIVersion, ref.Kind, ref.Name)
+}
+
+// vpaTarget enqueues the workload that a VerticalPodAutoscaler targets, if it is of the reconciler's kind.
+func (r *WorkloadAutoscalingReconciler) vpaTarget(_ context.Context, obj client.Object) []reconcile.Request {
+	vpa, ok := obj.(*vpav1.VerticalPodAutoscaler)
+	if !ok || vpa.Spec.TargetRef == nil {
+		return nil
+	}
+	ref := vpa.Spec.TargetRef
+	return r.targetRequests(vpa.Namespace, ref.APIVersion, ref.Kind, ref.Name)
 }
 
 func (r *WorkloadAutoscalingReconciler) targetRequests(namespace, apiVersion, kind, name string) []reconcile.Request {
@@ -416,6 +551,24 @@ func managedHPAPredicate() predicate.Funcs {
 	}
 }
 
+// managedVPAPredicate passes managed VerticalPodAutoscaler deletions and changes to their spec, labels, or owner
+// references, but not the recommendations that the VerticalPodAutoscaler writes to its status.
+func managedVPAPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldVPA, okOld := e.ObjectOld.(*vpav1.VerticalPodAutoscaler)
+			newVPA, okNew := e.ObjectNew.(*vpav1.VerticalPodAutoscaler)
+			if !okOld || !okNew {
+				return false
+			}
+			return !equality.Semantic.DeepEqual(oldVPA.Spec, newVPA.Spec) || metadataChanged(oldVPA, newVPA)
+		},
+	}
+}
+
 // metadataChanged reports whether the labels or owner references of an object changed.
 func metadataChanged(oldObj, newObj client.Object) bool {
 	return !maps.Equal(oldObj.GetLabels(), newObj.GetLabels()) ||
@@ -457,13 +610,14 @@ func workloadClassAutoscalingPredicate() predicate.Funcs {
 
 // SetupWorkloadAutoscalingControllers registers a WorkloadAutoscalingReconciler for each kind of workload that
 // resourceManagement applies to.
-func SetupWorkloadAutoscalingControllers(mgr ctrl.Manager) error {
+func SetupWorkloadAutoscalingControllers(mgr ctrl.Manager, caps utils.AutoscalerCapabilities) error {
 	for _, kind := range WorkloadKinds {
 		r := &WorkloadAutoscalingReconciler{
-			Client:   mgr.GetClient(),
-			Scheme:   mgr.GetScheme(),
-			Recorder: mgr.GetEventRecorder("workloadautoscaling-controller"),
-			Workload: kind,
+			Client:       mgr.GetClient(),
+			Scheme:       mgr.GetScheme(),
+			Recorder:     mgr.GetEventRecorder("workloadautoscaling-controller"),
+			Workload:     kind,
+			Capabilities: caps,
 		}
 		if err := r.SetupWithManager(mgr); err != nil {
 			return fmt.Errorf("failed to set up the %s autoscaling controller: %w", kind.Kind, err)
