@@ -26,6 +26,12 @@ manager:
   ##
   args:
     - --leader-elect
+    ## Resource management (HorizontalPodAutoscalers and VerticalPodAutoscalers for governed workloads) is on by
+    ## default. Uncomment to turn it off without a rollback; existing managed autoscalers are left in place.
+    # - --enable-resource-management=false
+    ## Resources for which the platform coordinates the HorizontalPodAutoscaler and the VerticalPodAutoscaler, so
+    ## rightsizing keeps them even when autoscaling targets their utilization. On GKE (HPA Rightsizing), use cpu.
+    # - --coordinated-hpa-vpa-resources=cpu
 
   ## Image pull secrets
   ##
