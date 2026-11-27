@@ -75,7 +75,8 @@ func (r *WorkloadAutoscalingReconciler) vpaCapabilities() utils.VPACapabilities 
 // reconcileVPA makes the managed VerticalPodAutoscaler of the workload match the rightsizing of the
 // WorkloadClass (wc may be nil). It follows the same rules as reconcileHPA: a user-created VPA that targets
 // the workload takes precedence, the managed VPA is deleted when the WorkloadClass does not ask for one, and
-// an object that uses the managed name but is not managed by a WorkloadClass is never modified.
+// an object that uses the managed name but does not belong to the workload is never modified, and a managed
+// VPA left behind by a previous workload with the same name is replaced.
 //
 // If the VPA installation rejects the InPlaceOrRecreate update mode, the VPA is applied with the Recreate
 // update mode instead, and an InPlaceUnsupported event is recorded.
@@ -116,7 +117,7 @@ func (r *WorkloadAutoscalingReconciler) reconcileVPA(ctx context.Context, worklo
 		return r.deleteManagedVPA(ctx, workload, name)
 	}
 
-	vpa, op, conflict, err := r.applyVPA(ctx, workload, desired)
+	vpa, op, ownership, err := r.applyVPA(ctx, workload, ref, desired)
 	if err != nil && utils.VPAUpdateModeOf(desired) == utils.VPAUpdateModeInPlaceOrRecreate && isRejected(err) {
 		// Older VPA versions do not know the InPlaceOrRecreate update mode, and newer ones reject it unless
 		// in-place updates are enabled. Fall back to Recreate, and remember the outcome only if Recreate is
@@ -126,20 +127,23 @@ func (r *WorkloadAutoscalingReconciler) reconcileVPA(ctx context.Context, worklo
 		fallback := r.vpaCapabilities()
 		fallback.InPlaceUnsupported = true
 		desired = utils.BuildVPA(wc, ref, effective, fallback)
-		vpa, op, conflict, err = r.applyVPA(ctx, workload, desired)
-		if err == nil && !conflict {
+		vpa, op, ownership, err = r.applyVPA(ctx, workload, ref, desired)
+		if err == nil && ownership == ownedByWorkload {
 			r.inPlaceUnsupported.Store(true)
 		}
 	}
 	if err != nil {
 		return fmt.Errorf("failed to reconcile VerticalPodAutoscaler %s: %w", name, err)
 	}
-	if conflict {
-		log.Info("VerticalPodAutoscaler with the managed name is not managed by a WorkloadClass; it will not be modified",
+	if ownership == ownedByPreviousWorkload {
+		return r.deleteStaleAutoscaler(ctx, vpa, vpaKind)
+	}
+	if ownership == ownedByOther {
+		log.Info("VerticalPodAutoscaler with the managed name does not belong to the workload; it will not be modified",
 			"verticalPodAutoscaler", name)
 		r.Recorder.Eventf(workload, vpa, corev1.EventTypeWarning, reasonAutoscalerNameConflict, actionReconcileAutoscaler,
-			"VerticalPodAutoscaler %s already exists and is not managed by a WorkloadClass, so the rightsizing of WorkloadClass %s is not applied",
-			name, wc.Name)
+			"VerticalPodAutoscaler %s already exists and does not belong to this %s, so the rightsizing of WorkloadClass %s is not applied",
+			name, ref.Kind, wc.Name)
 		return nil
 	}
 	if op == controllerutil.OperationResultNone {
@@ -172,17 +176,16 @@ func isRejected(err error) bool {
 }
 
 // applyVPA creates or updates the managed VerticalPodAutoscaler so that the fields managed by utils.BuildVPA
-// match the desired VPA, with the workload as its controller owner. It reports a conflict, and changes
-// nothing, if a VPA with that name exists but is not managed by a WorkloadClass.
-func (r *WorkloadAutoscalingReconciler) applyVPA(ctx context.Context, workload client.Object, desired *unstructured.Unstructured) (*unstructured.Unstructured, controllerutil.OperationResult, bool, error) {
+// match the desired VPA, with the workload as its controller owner. It reports who an existing VPA with that
+// name belongs to, and changes nothing unless it belongs to the workload (see autoscalerOwnership).
+func (r *WorkloadAutoscalingReconciler) applyVPA(ctx context.Context, workload client.Object, ref utils.WorkloadRef, desired *unstructured.Unstructured) (*unstructured.Unstructured, controllerutil.OperationResult, autoscalerOwner, error) {
 	vpa := newVPA()
 	vpa.SetName(desired.GetName())
 	vpa.SetNamespace(desired.GetNamespace())
 
-	conflict := false
+	ownership := ownedByWorkload
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, vpa, func() error {
-		if vpa.GetResourceVersion() != "" && !utils.IsWorkloadClassManagedAutoscaler(vpa) {
-			conflict = true
+		if ownership = autoscalerOwnership(vpa, workload, ref); ownership != ownedByWorkload {
 			return nil
 		}
 		labels := vpa.GetLabels()
@@ -196,7 +199,7 @@ func (r *WorkloadAutoscalingReconciler) applyVPA(ctx context.Context, workload c
 		}
 		return controllerutil.SetControllerReference(workload, vpa, r.Scheme)
 	})
-	return vpa, op, conflict, err
+	return vpa, op, ownership, err
 }
 
 // userVPAForWorkload returns a user-created VerticalPodAutoscaler that targets the workload, or nil if there
