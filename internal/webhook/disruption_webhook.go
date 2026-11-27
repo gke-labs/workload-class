@@ -110,9 +110,16 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		return admission.Allowed("WorkloadClass failed Guardrail validation")
 	}
 
-	// Emergency Override
+	// Emergency Override (per-WorkloadClass or cluster-wide via WorkloadClassGuardrail)
 	if bestWC.Spec.DisruptionPolicy.EmergencyOverride {
 		return admission.Allowed("Emergency override active")
+	}
+	guardrails := &workloadsv1.WorkloadClassGuardrailList{}
+	if err := v.Client.List(ctx, guardrails); err != nil {
+		log.Error(err, "Failed to list WorkloadClassGuardrails for emergency override check")
+	} else if utils.HasGuardrailEmergencyOverride(guardrails.Items) {
+		log.Info("Cluster-wide guardrail emergency override active, allowing eviction")
+		return admission.Allowed("Cluster-wide guardrail emergency override active")
 	}
 
 	// Maintenance Starvation (Override on Overdue) takes precedence for both normal and authorized subjects.

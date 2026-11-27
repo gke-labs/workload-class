@@ -55,12 +55,19 @@ spec:
                           type: string
                         type: array
                       emergencyOverride:
-                        description: EmergencyOverride allows bypassing all constraints
-                          immediately.
+                        description: |-
+                          EmergencyOverride enables a cluster-wide emergency override that bypasses disruption
+                          constraints and opens Per-Pod PDBs for all WorkloadClasses immediately.
+                          Note: because the admission webhooks run with failurePolicy: Fail, this flag can only be
+                          toggled while the controller-manager is healthy; if it is unavailable, delete the
+                          ValidatingWebhookConfiguration and any closed managed PodDisruptionBudgets directly.
                         type: boolean
                       enforcedDisruptionTimeoutSeconds:
-                        description: EnforcedDisruptionTimeoutSeconds is the maximum
-                          time in seconds before a disruption is forced.
+                        description: |-
+                          EnforcedDisruptionTimeoutSeconds is deprecated and currently a no-op.
+                          It is kept for v1 CRD compatibility with existing manifests and will be removed in a future API version.
+
+                          Deprecated: This field is unused and has no effect.
                         format: int32
                         maximum: 3600
                         type: integer

@@ -79,12 +79,19 @@ type Disruption struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays"`
 
-	// EnforcedDisruptionTimeoutSeconds is the maximum time in seconds before a disruption is forced.
+	// EnforcedDisruptionTimeoutSeconds is deprecated and currently a no-op.
+	// It is kept for v1 CRD compatibility with existing manifests and will be removed in a future API version.
+	//
+	// Deprecated: This field is unused and has no effect.
 	// +optional
 	// +kubebuilder:validation:Maximum=3600
 	EnforcedDisruptionTimeoutSeconds int32 `json:"enforcedDisruptionTimeoutSeconds,omitempty"`
 
-	// EmergencyOverride allows bypassing all constraints immediately.
+	// EmergencyOverride enables a cluster-wide emergency override that bypasses disruption
+	// constraints and opens Per-Pod PDBs for all WorkloadClasses immediately.
+	// Note: because the admission webhooks run with failurePolicy: Fail, this flag can only be
+	// toggled while the controller-manager is healthy; if it is unavailable, delete the
+	// ValidatingWebhookConfiguration and any closed managed PodDisruptionBudgets directly.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
 

@@ -115,11 +115,19 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	baseValidationCond := validatedCondition(ctx, wc, guardrails, overlapping)
 	disruptionCond := disruptionValidatedCondition(wc, guardrails, overlapping)
 
-	// 2. Calculate Readiness
-	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
-	if err != nil {
-		log.Error(err, "Failed to calculate readiness")
-		return ctrl.Result{}, err
+	// 2. Calculate Readiness (cluster-wide guardrail EmergencyOverride immediately opens maintenance readiness)
+	var (
+		readiness     workloadsv1.MaintenanceReadiness
+		nextReconcile time.Duration
+	)
+	if utils.HasGuardrailEmergencyOverride(guardrails.Items) {
+		readiness = workloadsv1.ReadinessReady
+	} else {
+		readiness, nextReconcile, err = r.calculateReadiness(ctx, wc)
+		if err != nil {
+			log.Error(err, "Failed to calculate readiness")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 3. Update Status with RetryOnConflict so concurrent condition updates from plugin controllers
@@ -851,12 +859,28 @@ func truncateMessage(msg string, maxLen int) string {
 	return msg[:cut] + ellipsis
 }
 
+// isExcludedSystemNamespace reports whether ns is excluded from the disruption validating webhook's
+// namespaceSelector so evicting control-plane pods cannot deadlock node drains.
+func isExcludedSystemNamespace(ns string) bool {
+	switch ns {
+	case "kube-system", "cert-manager", "workload-class-system":
+		return true
+	default:
+		return false
+	}
+}
+
 // validateSpec validates the fields of the WorkloadClass spec that are not fully enforced by the
 // CRD OpenAPI/CEL schema (semantic LabelSelector validation, valid weekday names, and IANA time zone
 // database lookup), and acts as defense-in-depth for rules also checked at admission time (such as
 // rejecting the 'Local' time zone).
 func validateSpec(wc *workloadsv1.WorkloadClass) []string {
 	var violations []string
+	if isExcludedSystemNamespace(wc.Namespace) {
+		violations = append(violations, fmt.Sprintf(
+			"namespace %q is excluded from the disruption validating webhook; disruption policy cannot be enforced here",
+			wc.Namespace))
+	}
 	if wc.Spec.PodSelector != nil {
 		if _, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
 			violations = append(violations, fmt.Sprintf("`podSelector` must be a valid label selector: %v", err))
