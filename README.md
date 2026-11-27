@@ -75,6 +75,10 @@ spec:
       - kind: ServiceAccount
         name: vpa-updater
         namespace: kube-system
+      # Managed GKE Cluster Autoscaler authenticates as User "system:cluster-autoscaler".
+      - kind: User
+        name: system:cluster-autoscaler
+      # Self-hosted Cluster Autoscaler typically authenticates as a ServiceAccount in kube-system.
       - kind: ServiceAccount
         name: cluster-autoscaler
         namespace: kube-system
@@ -221,10 +225,10 @@ Each PDB is named `workload-<pod name>`. The controller labels the pod with `wor
 
 | `WorkloadClass` state | `maxUnavailable` |
 | --- | --- |
-| `Validated=True` and `MaintenanceReadiness: NotReady` (outside a window, or a pod hasn't met `minInitialRunDurationDays`) | `0`: evictions are blocked. |
+| `DisruptionValidated=True` and `MaintenanceReadiness: NotReady` (outside a window, or a pod hasn't met `minInitialRunDurationDays`) | `0`: evictions are blocked (even if `Validated=False` due to a placement/plugin failure). |
 | `MaintenanceReadiness: Ready` or `Overdue` | `100%`: evictions are allowed. |
-| `Validated=False` with reason `SelectorOverlap` only | Same as `Validated=True`: each pod is governed by its best match, so overlap doesn't open PDBs. |
-| `Validated=False` (fails guardrail validation) | `100%`: the controller opens existing PDBs instead of deleting them, and doesn't create new ones. |
+| `DisruptionValidated=False` with reason `SelectorOverlap` only | Same as `DisruptionValidated=True`: each pod is governed by its best match, so overlap doesn't open PDBs. |
+| `DisruptionValidated=False` (fails disruption guardrail validation) | `100%`: the controller opens existing PDBs instead of deleting them, and doesn't create new ones. |
 
 ```sh
 kubectl get pdb -n sample
@@ -294,7 +298,7 @@ flowchart LR
 
 | Step | Core WorkloadClass controller | Placement plugin |
 | --- | --- | --- |
-| Attach | Sees `infrastructureProfileRef`, sets `PlacementPluginAttached=False` (`PluginPending`), and holds `Validated=False` until a plugin attaches. | Resolves the referenced profile, validates it against its guardrail constraints, and sets `PlacementPluginAttached=True` (`ProfileResolved`) or `False` (`PluginResolutionFailed`). |
+| Attach | Sees `infrastructureProfileRef`, sets `PlacementPluginAttached=False` (`PluginPending`), and holds `PlacementValidated=False` (and the rollup `Validated=False`) until a plugin attaches. Disruption protection (`DisruptionValidated` and Per-Pod PDBs) remains active. | Resolves the referenced profile, validates it against its guardrail constraints, and sets `PlacementPluginAttached=True` (`ProfileResolved`) or `False` (`PluginResolutionFailed`). |
 | Place Pods | Not involved. | Its webhook mutates new Pods of WorkloadClasses that reference its profile kind, and ignores the rest. |
 | Runtime | Keeps managing disruption windows, maintenance readiness, and PDBs. | Watches provider capacity signals, reports `InFallback`, and runs reversion. |
 | Guardrails | Owns `spec.constraints`. Only checks that each `pluginConstraints.placement` entry has a name and that its `parameters` are a JSON object. | Defines and validates the schema of `parameters` in the entry with its name, e.g. `gke-spot-placement`. |
@@ -316,7 +320,7 @@ The GKE plugin runs in the same controller manager as the core controller. It is
 Its components:
 
 1. **`GKESpotPlacementPolicyReconciler`** validates each `GKESpotPlacementPolicy` against the guardrails and attaches it to the WorkloadClasses that reference it (`PlacementPluginAttached`).
-2. A **mutating Pod webhook** (`/mutate-pod-placement`) runs when a Pod is created. It finds the Pod's best-matching WorkloadClass and adds Spot or On-Demand scheduling constraints. It only acts once the WorkloadClass is `Validated=True` (and `PlacementPluginAttached=True` when it references a policy). Otherwise it admits the Pod unchanged.
+2. A **mutating Pod webhook** (`/mutate-pod-placement`) runs when a Pod is created. It finds the Pod's best-matching WorkloadClass and adds Spot or On-Demand scheduling constraints. It acts whenever `PlacementValidated=True` (and `PlacementPluginAttached=True` when it references a policy), even if the rollup `Validated=False` due to a disruption validation failure. Otherwise it admits the Pod unchanged.
 3. **`GKESpotPlacementReconciler`** watches the workload's Pods and the cluster autoscaler status (`kube-system/cluster-autoscaler-status`). It sets the `InFallback` condition when Spot-targeted Pods are running on On-Demand nodes, and runs reversion when Spot capacity returns.
 
 ### 1. Platform Engineer: Add Spot constraints to a Guardrail
@@ -464,8 +468,10 @@ checkout-service   NotReady      Spot       80%         gke-t2d-spot   True     
 
 | Condition | Meaning |
 | --- | --- |
+| `DisruptionValidated` | `True` when `spec.disruptionPolicy` passes all disruption guardrails (or overlap-only `SelectorOverlap` keeps PDBs enforced). Gates Per-Pod PDB management, `DisruptionWebhook` enforcement, and Spot reversion evictions. |
+| `PlacementValidated` | `True` when `spec.capacityStrategy` passes placement guardrails and, if `infrastructureProfileRef` is set, the plugin has attached. Set only when `capacityStrategy` or `infrastructureProfileRef` is configured. Gates Pod placement webhook mutation and `InFallback` tracking. |
 | `PlacementPluginAttached` | `True` (`ProfileResolved`) once the referenced policy exists and passes the guardrails. `False` with `PluginPending` (no plugin controller has attached it yet) or `PluginResolutionFailed` (policy not found or invalid). Not set when there is no `infrastructureProfileRef`. |
-| `Validated` | `True` when the WorkloadClass passes all guardrails and, if it references a policy, the policy is attached. Pods are only mutated while this is `True`. |
+| `Validated` | Rollup of `DisruptionValidated` and `PlacementValidated` (shown by the `VALIDATED` printer column). A placement/plugin failure sets `Validated=False` without opening Per-Pod PDBs, and a disruption failure sets `Validated=False` without stopping Pod placement mutation. |
 | `InFallback` | `True` (`FallbackActive`) while any Spot-targeted Pod is running on an On-Demand node. Pods placed On-Demand on purpose to meet `spotRatio` don't count. |
 
 If the WorkloadClass isn't ready, `kubectl describe workloadclass checkout-service -n sample` shows the guardrail violation or policy problem in the condition message.
@@ -480,7 +486,7 @@ When `action: FallbackToOnDemand` is set and Spot capacity runs out, Spot-target
 | `Lazy` | Leaves running fallback Pods alone. New or recreated Pods target Spot again. |
 | `None` (default) | Once a workload falls back, all new and recreated Pods are placed On-Demand. Guardrail `maxFallbackRatio` doesn't apply, so the workload isn't left split between On-Demand Pods and `Pending` Spot Pods. |
 
-Reversion evictions go through the Eviction API, so they respect PodDisruptionBudgets and the WorkloadClass's `disruptionPolicy`. Outside an allowed disruption window, evictions wait for the next window. Pods without a controller owner are never evicted. A guardrail `maxFallbackDuration` applies under any action: past that limit, a fallback Pod is evicted even if the `spotRatio` target is already met.
+Reversion evictions go through the Eviction API, so they respect PodDisruptionBudgets and the WorkloadClass's `disruptionPolicy`. Reversion evictions pause while `DisruptionValidated=False` (when Per-Pod PDBs fail open to `100%`), while `InFallback` status tracking continues whenever `PlacementValidated=True`. Outside an allowed disruption window, evictions wait for the next window. Pods without a controller owner are never evicted. A guardrail `maxFallbackDuration` applies under any action: past that limit, a fallback Pod is evicted even if the `spotRatio` target is already met.
 
 ### Try It Out
 

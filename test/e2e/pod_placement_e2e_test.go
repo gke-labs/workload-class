@@ -40,6 +40,7 @@ import (
 // assert the external contract of the mutation.
 const (
 	gkeSpotLabel          = "cloud.google.com/gke-spot"
+	gkeProvisioningLabel  = "cloud.google.com/gke-provisioning"
 	gkeMachineFamilyLabel = "cloud.google.com/machine-family"
 	gkeComputeClassLabel  = "cloud.google.com/compute-class"
 
@@ -336,6 +337,28 @@ func expectRequiredSpot(g Gomega, pod *corev1.Pod) {
 	g.Expect(preferredNodeTerms(pod)).To(BeEmpty())
 }
 
+// expectRequiredSpotWithComputeClass asserts a strict-Spot Pod targeting a Custom Compute Class uses
+// Warden-compatible gke-provisioning affinity and carries the ComputeClass NoSchedule toleration.
+func expectRequiredSpotWithComputeClass(g Gomega, pod *corev1.Pod, ccc string) {
+	g.Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(gkeComputeClassLabel, ccc))
+	g.Expect(pod.Spec.NodeSelector).NotTo(HaveKey(gkeSpotLabel))
+	g.Expect(pod.Spec.Tolerations).To(ContainElement(spotToleration()))
+	g.Expect(pod.Spec.Tolerations).To(ContainElement(corev1.Toleration{
+		Key:      gkeComputeClassLabel,
+		Operator: corev1.TolerationOpEqual,
+		Value:    ccc,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}))
+	g.Expect(preferredNodeTerms(pod)).To(BeEmpty())
+	g.Expect(requiredNodeTerms(pod)).To(ConsistOf(corev1.NodeSelectorTerm{
+		MatchExpressions: []corev1.NodeSelectorRequirement{{
+			Key:      gkeProvisioningLabel,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"spot"},
+		}},
+	}))
+}
+
 // expectPreferredSpot asserts the Pod prefers Spot nodes but may fall back (FallbackAction FallbackToOnDemand).
 func expectPreferredSpot(g Gomega, pod *corev1.Pod) {
 	g.Expect(pod.Spec.NodeSelector).NotTo(HaveKey(gkeSpotLabel))
@@ -538,9 +561,7 @@ var _ = Describe("Pod Placement Webhook", Ordered, func() {
 
 			Eventually(func(g Gomega) {
 				pod := admitProbePod(g, newPlacementPod(app))
-				expectRequiredSpot(g, pod)
-				g.Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(gkeComputeClassLabel, "spot-first"))
-				g.Expect(requiredNodeTerms(pod)).To(BeEmpty())
+				expectRequiredSpotWithComputeClass(g, pod, "spot-first")
 			}).Should(Succeed())
 		})
 
@@ -552,8 +573,7 @@ var _ = Describe("Pod Placement Webhook", Ordered, func() {
 
 			Eventually(func(g Gomega) {
 				pod := admitProbePod(g, newPlacementPod(app, withNodeSelector(gkeComputeClassLabel, "user-choice")))
-				expectRequiredSpot(g, pod)
-				g.Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(gkeComputeClassLabel, "user-choice"))
+				expectRequiredSpotWithComputeClass(g, pod, "user-choice")
 			}).Should(Succeed())
 		})
 

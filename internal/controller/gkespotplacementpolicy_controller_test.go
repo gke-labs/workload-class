@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
@@ -251,6 +252,75 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 			Expect(wcCond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(wcCond.Reason).To(Equal(workloadsv1.ReasonPluginResolutionFailed))
 			Expect(wcCond.Message).To(ContainSubstring("GKESpotPlacementPolicy 'test-spot-policy' is invalid"))
+		})
+
+		It("should skip stale policy status update when spec generation changes concurrently", func() {
+			policy := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: policyName},
+				Spec:       workloadsv1.GKESpotPlacementPolicySpec{Reversion: workloadsv1.SpotReversionPolicy{Action: workloadsv1.ActiveReversionAction}},
+			}
+			Expect(k8sClient.Create(ctx, policy)).To(Succeed())
+			stale := policy.DeepCopy()
+			policy.Spec.Reversion.Action = workloadsv1.LazyReversionAction
+			Expect(k8sClient.Update(ctx, policy)).To(Succeed())
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &GKESpotPlacementPolicyReconciler{Client: &staleCacheClient{Client: k8sClient, stale: []client.Object{stale}}, APIReader: liveReader, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: policyKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(1))
+			updatedPolicy, updatedWC := &workloadsv1.GKESpotPlacementPolicy{}, &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, policyKey, updatedPolicy)).To(Succeed())
+			Expect(k8sClient.Get(ctx, wcKey, updatedWC)).To(Succeed())
+			Expect(updatedPolicy.Status.Conditions).To(BeEmpty())
+			Expect(updatedWC.Status.Conditions).To(BeEmpty())
+		})
+
+		It("should skip WorkloadClass status update when InfrastructureProfileRef changes concurrently", func() {
+			staleWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, wcKey, staleWC)).To(Succeed())
+			liveWC := staleWC.DeepCopy()
+			liveWC.Spec.InfrastructureProfileRef = nil
+			Expect(k8sClient.Update(ctx, liveWC)).To(Succeed())
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &GKESpotPlacementPolicyReconciler{Client: &staleCacheClient{Client: k8sClient, stale: []client.Object{staleWC}}, APIReader: liveReader, Scheme: k8sClient.Scheme()}
+			Expect(r.updateWorkloadClassStatus(ctx, staleWC, statusOptions{
+				Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonProfileResolved, Message: "attached",
+			})).To(Succeed())
+			Expect(liveReader.gets).To(Equal(1))
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, wcKey, updatedWC)).To(Succeed())
+			Expect(updatedWC.Status.Conditions).To(BeEmpty())
+		})
+
+		It("should reject a GKESpotPlacementPolicy that combines customComputeClass and fallbackAllowedMachineFamilies", func() {
+			policy := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "invalid-ccc-and-families",
+				},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					CustomComputeClass:             "spot-first",
+					FallbackAllowedMachineFamilies: []string{"e2"},
+				},
+			}
+			err := k8sClient.Create(ctx, policy)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("fallbackAllowedMachineFamilies cannot be used with customComputeClass"))
+		})
+
+		It("should surface Validated=False for a legacy stored GKESpotPlacementPolicy combining customComputeClass and fallbackAllowedMachineFamilies", func() {
+			legacy := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "legacy-both", Generation: 1},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					CustomComputeClass:             "spot-first",
+					FallbackAllowedMachineFamilies: []string{"e2"},
+				},
+			}
+			r := &GKESpotPlacementPolicyReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			cond, err := r.validateAgainstGuardrails(ctx, legacy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(workloadsv1.ReasonValidationFailed))
+			Expect(cond.Message).To(ContainSubstring("fallbackAllowedMachineFamilies cannot be used with customComputeClass"))
 		})
 	})
 })

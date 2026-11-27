@@ -851,6 +851,70 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
+		It("should keep disruption protection active when placement validation fails or plugin is pending", func() {
+			notToday := time.Now().AddDate(0, 0, 2).Weekday().String()
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.AllowedDisruptionWindows = []workloadsv1.DisruptionWindow{
+				{Name: "NotToday", DaysOfWeek: []string{notToday}, TimeZone: "UTC", StartTime: "00:00", EndTime: "23:59"},
+			}
+			wc.Spec.InfrastructureProfileRef = &workloadsv1.InfrastructureProfileReference{
+				Group: "workloads.gke.io",
+				Kind:  "GKESpotPlacementPolicy",
+				Name:  "missing-spot-profile",
+			}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			disruptionCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated)
+			Expect(disruptionCond).NotTo(BeNil())
+			Expect(disruptionCond.Status).To(Equal(metav1.ConditionTrue))
+
+			placementCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementValidated)
+			Expect(placementCond).NotTo(BeNil())
+			Expect(placementCond.Status).To(Equal(metav1.ConditionFalse))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+
+			By("Verifying the Per-Pod PDB is still created and closed despite PlacementValidated=False")
+			pdb := &policyv1.PodDisruptionBudget{}
+			Eventually(func() error { return k8sClient.Get(ctx, podPDBKey, pdb) }, "10s", "1s").Should(Succeed())
+			Expect(pdb.Spec.MaxUnavailable.IntVal).To(Equal(int32(0)))
+		})
+
+		It("should keep PlacementValidated=True when only disruption guardrail validation fails", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 100 // Exceeds guardrail limit
+			wc.Spec.CapacityStrategy = &workloadsv1.CapacityStrategy{Type: workloadsv1.SpotPlacementTypeSpot}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			reconcileWC(typeNamespacedName)
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+
+			disruptionCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeDisruptionValidated)
+			Expect(disruptionCond).NotTo(BeNil())
+			Expect(disruptionCond.Status).To(Equal(metav1.ConditionFalse))
+
+			placementCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypePlacementValidated)
+			Expect(placementCond).NotTo(BeNil())
+			Expect(placementCond.Status).To(Equal(metav1.ConditionTrue))
+
+			validatedCond := meta.FindStatusCondition(updatedWC.Status.Conditions, workloadsv1.ConditionTypeValidated)
+			Expect(validatedCond).NotTo(BeNil())
+			Expect(validatedCond.Status).To(Equal(metav1.ConditionFalse))
+		})
+
 		It("should preserve PlacementPluginAttached=True, mark Validated=True, and create PDB when plugin has attached for current generation", func() {
 			By("Updating WorkloadClass with an InfrastructureProfileRef and a PodSelector matching the Pod")
 			wc := &workloadsv1.WorkloadClass{}
@@ -965,8 +1029,150 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(validatedCond.Reason).To(Equal(workloadsv1.ReasonValidationPassed))
 			Expect(validatedCond.Message).To(Equal("WorkloadClass adheres to all Guardrail constraints"))
 		})
+
+		It("should use cache in steady state and retry real envtest 409 conflicts on status and PDB via APIReader", func() {
+			wc := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, wc)).To(Succeed())
+			wc.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: podLabels}
+			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassReconciler{
+				Client: k8sClient, APIReader: liveReader, Scheme: k8sClient.Scheme(), Recorder: events.NewFakeRecorder(10),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(BeZero())
+
+			staleWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, staleWC)).To(Succeed())
+			staleWC.Spec.DisruptionPolicy.MinInitialRunDurationDays = 1
+			Expect(k8sClient.Update(ctx, staleWC)).To(Succeed())
+			stalePDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, stalePDB)).To(Succeed())
+
+			liveWC := staleWC.DeepCopy()
+			meta.SetStatusCondition(&liveWC.Status.Conditions, metav1.Condition{
+				Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue,
+				Reason: workloadsv1.ReasonFallbackActive, Message: "concurrent update",
+				ObservedGeneration: liveWC.Generation, LastTransitionTime: metav1.Now(),
+			})
+			Expect(k8sClient.Status().Update(ctx, liveWC)).To(Succeed())
+			livePDB := stalePDB.DeepCopy()
+			livePDB.Annotations = map[string]string{"test/concurrent": "1"}
+			Expect(k8sClient.Update(ctx, livePDB)).To(Succeed())
+
+			r.Client = &staleCacheClient{Client: k8sClient, stale: []client.Object{staleWC, stalePDB}}
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(2))
+
+			updatedWC := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedWC)).To(Succeed())
+			Expect(meta.IsStatusConditionTrue(updatedWC.Status.Conditions, workloadsv1.ConditionTypeInFallback)).To(BeTrue())
+			Expect(updatedWC.Status.MaintenanceReadiness).To(Equal(workloadsv1.ReadinessNotReady))
+
+			updatedPDB := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, podPDBKey, updatedPDB)).To(Succeed())
+			Expect(updatedPDB.Annotations).To(HaveKeyWithValue("test/concurrent", "1"))
+			Expect(updatedPDB.Spec.MaxUnavailable.IntVal).To(BeZero())
+		})
+
+		It("should skip stale status update when spec generation changes concurrently", func() {
+			stale := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, stale)).To(Succeed())
+			live := stale.DeepCopy()
+			live.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 2
+			Expect(k8sClient.Update(ctx, live)).To(Succeed())
+
+			liveReader := &countingReader{Reader: k8sClient}
+			r := &WorkloadClassReconciler{
+				Client:    &staleCacheClient{Client: k8sClient, stale: []client.Object{stale}},
+				APIReader: liveReader, Scheme: k8sClient.Scheme(), Recorder: events.NewFakeRecorder(10),
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(liveReader.gets).To(Equal(1))
+
+			updated := &workloadsv1.WorkloadClass{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(meta.FindStatusCondition(updated.Status.Conditions, workloadsv1.ConditionTypeValidated)).To(BeNil())
+		})
+
+		It("should reject a WorkloadClass that specifies both maxUnavailable and minAvailable", func() {
+			one := intstr.FromInt32(1)
+			two := intstr.FromInt32(2)
+			invalid := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "invalid-both-pacing-fields",
+					Namespace: defaultNamespace,
+				},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{
+						MaxUnavailable: &one,
+						MinAvailable:   &two,
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, invalid)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("maxUnavailable and minAvailable are mutually exclusive"))
+		})
+
+		It("should reject malformed or negative maxUnavailable/minAvailable via CEL validation", func() {
+			cases := []struct {
+				name string
+				val  intstr.IntOrString
+			}{
+				{name: "neg-int", val: intstr.FromInt32(-1)},
+				{name: "bare-string", val: intstr.FromString("25")},
+				{name: "alpha-pct", val: intstr.FromString("abc%")},
+				{name: "over-100-pct", val: intstr.FromString("150%")},
+			}
+			for _, tc := range cases {
+				v := tc.val
+				wcMax := &workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-max-" + tc.name, Namespace: defaultNamespace},
+					Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxUnavailable: &v}},
+				}
+				Expect(k8sClient.Create(ctx, wcMax)).To(MatchError(ContainSubstring("maxUnavailable must be a non-negative integer or a percentage string")))
+
+				wcMin := &workloadsv1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-min-" + tc.name, Namespace: defaultNamespace},
+					Spec:       workloadsv1.WorkloadClassSpec{DisruptionPolicy: workloadsv1.DisruptionPolicy{MinAvailable: &v}},
+				}
+				Expect(k8sClient.Create(ctx, wcMin)).To(MatchError(ContainSubstring("minAvailable must be a non-negative integer or a percentage string")))
+			}
+		})
 	})
 })
+
+type staleCacheClient struct {
+	client.Client
+	stale []client.Object
+}
+
+func (c *staleCacheClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	for _, s := range c.stale {
+		if reflect.TypeOf(s) == reflect.TypeOf(obj) && client.ObjectKeyFromObject(s) == key {
+			reflect.ValueOf(obj).Elem().Set(reflect.ValueOf(s.DeepCopyObject()).Elem())
+			return nil
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+type countingReader struct {
+	client.Reader
+	gets int
+}
+
+func (r *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	r.gets++
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
 
 func TestOverdue(t *testing.T) {
 	now := time.Now().UTC()
