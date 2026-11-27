@@ -66,8 +66,12 @@ func PDBName(podName string) string {
 	return prefix + suffix
 }
 
-// PodNameFromPDBName extracts the target Pod name from a WorkloadClass-managed PDB name.
+// PodNameFromPDBName extracts the target Pod name from a WorkloadClass-managed Per-Pod PDB name.
+// Returns an empty string if pdbName does not carry the Per-Pod prefix ("workload-").
 func PodNameFromPDBName(pdbName string) string {
+	if !strings.HasPrefix(pdbName, PDBNamePrefix) {
+		return ""
+	}
 	return strings.TrimPrefix(pdbName, PDBNamePrefix)
 }
 
