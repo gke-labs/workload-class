@@ -2,7 +2,7 @@
 
 WorkloadClass establishes a high-level control layer, allowing Platform Engineers to define operational guardrails and Workload Owners to simply declare their desired workload outcomes.
 
-This project implements the GKE Workload Class feature. It allows platform engineers and workload owners to collaborate on managing workload disruptions during maintenance and on placing workloads on Spot VMs (see [Spot Placement](#spot-placement)).
+This project implements the GKE Workload Class feature. It allows platform engineers and workload owners to collaborate on managing workload disruptions during maintenance, on placing workloads on Spot VMs (see [Spot Placement](#spot-placement)), and on autoscaling and rightsizing workloads (see [Resource Management](#resource-management)).
 
 ## Disclaimer
 
@@ -462,8 +462,8 @@ The Pod's existing required node affinity is preserved: the webhook ANDs its ter
 kubectl get workloadclass -n sample
 ```
 ```
-NAME               MAINTENANCE   CAPACITY   SPOTRATIO   PROFILE        VALIDATED   AGE
-checkout-service   NotReady      Spot       80%         gke-t2d-spot   True        5m
+NAME               MAINTENANCE   CAPACITY   SPOTRATIO   PROFILE        VALIDATED   AUTOSCALING   AGE
+checkout-service   NotReady      Spot       80%         gke-t2d-spot   True        <none>        5m
 ```
 
 | Condition | Meaning |
@@ -471,7 +471,7 @@ checkout-service   NotReady      Spot       80%         gke-t2d-spot   True     
 | `DisruptionValidated` | `True` when `spec.disruptionPolicy` passes all disruption guardrails (or overlap-only `SelectorOverlap` keeps PDBs enforced). Gates Per-Pod PDB management, `DisruptionWebhook` enforcement, and Spot reversion evictions. |
 | `PlacementValidated` | `True` when `spec.capacityStrategy` passes placement guardrails and, if `infrastructureProfileRef` is set, the plugin has attached. Set only when `capacityStrategy` or `infrastructureProfileRef` is configured. Gates Pod placement webhook mutation and `InFallback` tracking. |
 | `PlacementPluginAttached` | `True` (`ProfileResolved`) once the referenced policy exists and passes the guardrails. `False` with `PluginPending` (no plugin controller has attached it yet) or `PluginResolutionFailed` (policy not found or invalid). Not set when there is no `infrastructureProfileRef`. |
-| `Validated` | Rollup of `DisruptionValidated` and `PlacementValidated` (shown by the `VALIDATED` printer column). A placement/plugin failure sets `Validated=False` without opening Per-Pod PDBs, and a disruption failure sets `Validated=False` without stopping Pod placement mutation. |
+| `Validated` | Rollup of `DisruptionValidated`, `PlacementValidated`, and `ResourceManagementValidated` (see [Resource Management](#resource-management)), shown by the `VALIDATED` printer column. A placement/plugin failure sets `Validated=False` without opening Per-Pod PDBs, and a disruption failure sets `Validated=False` without stopping Pod placement mutation. |
 | `InFallback` | `True` (`FallbackActive`) while any Spot-targeted Pod is running on an On-Demand node. Pods placed On-Demand on purpose to meet `spotRatio` don't count. |
 
 If the WorkloadClass isn't ready, `kubectl describe workloadclass checkout-service -n sample` shows the guardrail violation or policy problem in the condition message.
@@ -501,6 +501,246 @@ kubectl get pod -n sample -l app=checkout-service -o jsonpath='{.items[0].spec.a
 
 > **NOTE:** `kubectl create deployment` labels the Pods `app=checkout-service`, which matches the WorkloadClass selector. Pods in `kube-system`, `cert-manager`, and `workload-class-system` are never mutated. The cluster needs a Spot node pool (or a compute class that provisions Spot nodes) for Spot-targeted Pods to schedule.
 
+
+## Resource Management
+
+A `WorkloadClass` can also describe how the workloads it governs scale horizontally and how their containers are sized, so that workload owners don't need a HorizontalPodAutoscaler (HPA) and a VerticalPodAutoscaler (VPA) for every Deployment and StatefulSet. The optional `spec.resourceManagement` field has two parts, and either can be set on its own:
+
+- **`autoscaling`**: the controller creates and owns one HPA for each governed workload.
+- **`rightsizing`**: the controller creates and owns one VPA for each governed workload. Rightsizing needs the [VerticalPodAutoscaler](https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler) to be installed on the cluster.
+
+Platform engineers bound what classes may request with `spec.constraints.resourceManagement` in a `WorkloadClassGuardrail`. Jobs and CronJobs aren't covered.
+
+### How It Works
+
+```mermaid
+flowchart LR
+  G["WorkloadClassGuardrail<br/>constraints.resourceManagement"] -.-> WCC["WorkloadClass controller"]
+  WC["WorkloadClass<br/>resourceManagement"] --> WCC
+  WCC -- "ResourceManagementValidated" --> WC
+  WC --> WAC["Workload autoscaling controller"]
+  W["Deployment or StatefulSet"] --> WAC
+  WAC -- "owns" --> HPA["HorizontalPodAutoscaler"]
+  WAC -- "owns" --> VPA["VerticalPodAutoscaler"]
+```
+
+1. The WorkloadClass controller validates `resourceManagement` against all guardrails, with the strictest value winning, and writes the `ResourceManagementValidated` condition. Resource management errors are included in the overall `Validated` rollup, but never affect `DisruptionValidated` or `PlacementValidated`, so they never turn off PDB protection or Pod placement.
+2. The workload autoscaling controller reconciles each Deployment and StatefulSet. It finds the workload's best-match `WorkloadClass` for its **Pod template**, with the same precedence as for Pods: the namespace's enforced class, otherwise the most specific `podSelector`, with the oldest class winning ties. Matching on the template gives one answer for the whole workload, even during a rollout or when it's scaled to zero.
+3. If that class has a current, passing `ResourceManagementValidated` condition (`True`, or `False` only because of `SelectorOverlap`), the controller creates or updates the workload's HPA and VPA, with the workload as their controller owner. If the condition is failing, or no class with `resourceManagement` governs the workload, the controller deletes them: the workload keeps its replica count and container sizes, and nothing scales or resizes it until the class is valid again. While the condition catches up with an edit of the class, the autoscalers are left as they are.
+
+### 1. Platform Engineer: Add Resource Management Constraints to a Guardrail
+
+```yaml
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClassGuardrail
+metadata:
+  name: resource-management
+spec:
+  constraints:
+    disruption:
+      maxNonDisruptionDurationDays: 30
+    resourceManagement:
+      allowedRightsizingModes: ["Off", Recommend, OnCreate, Auto]
+      allowedUpdateStrategies: [InPlacePreferred]
+      maxReplicas: 100
+      allowedAutoscalingProfiles: [Balanced, Conservative]
+      allowedMetricTypes: [Resource, Pods, External]
+      containerBounds:
+        min: {cpu: 10m, memory: 32Mi}
+        max: {cpu: "16", memory: 64Gi}
+```
+
+| Constraint | Effect (if omitted: no restriction) |
+| --- | --- |
+| `allowedRightsizingModes` | Rightsizing modes that classes may use, for example no `Auto` during a pilot. |
+| `allowedUpdateStrategies` | Update strategies that classes may use with the `Auto` mode. `InPlacePreferred` alone can still recreate a Pod. |
+| `maxReplicas` | Upper limit on any class's `autoscaling.replicas.max`. |
+| `allowedAutoscalingProfiles` | Autoscaling profiles that classes may use. |
+| `allowedMetricTypes` | HPA metric types that classes may use, for example no `External`. |
+| `containerBounds.min`, `containerBounds.max` | Widest per-container range that rightsizing may use. A class's `bounds` must sit inside it, and it applies where a class sets none. |
+
+When several guardrails exist, the strictest value wins: the allowed lists are intersected, the lowest `maxReplicas` applies, and `containerBounds` keeps, per resource, the highest minimum and the lowest maximum. Lists that don't overlap, or a maximum below the matching minimum, are reported as a guardrail conflict on the classes that use them. Constraints only apply to the parts of `resourceManagement` that a class uses: `allowedUpdateStrategies` only applies in `Auto` mode, and `containerBounds` doesn't apply in `Off` mode.
+
+### 2. Workload Owner: Add Resource Management to a WorkloadClass
+
+```yaml
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClass
+metadata:
+  name: web-services
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      tier: web
+  resourceManagement:
+    autoscaling:
+      replicas:
+        min: 2
+        max: 20
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target: {type: Utilization, averageUtilization: 60}
+      profile: Balanced
+    rightsizing:
+      mode: Recommend
+      resources: [cpu, memory]
+      updateStrategy: InPlacePreferred
+      excludeContainers: [istio-proxy]
+      bounds:
+        min: {cpu: 100m, memory: 128Mi}
+        max: {cpu: "4", memory: 8Gi}
+```
+
+Fields under `spec.resourceManagement.autoscaling`:
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `replicas.min` | `1` | Minimum replicas for each governed workload. |
+| `replicas.max` | Required | Maximum replicas for each governed workload. |
+| `metrics` | Required | What to scale on: the upstream `autoscaling/v2` metric list, copied into each HPA as written. `Object` metrics are rejected, because they name one specific object. |
+| `profile` | `Balanced` | How quickly to scale up and down: `Responsive`, `Balanced`, or `Conservative` (see [Autoscaling Profiles](#autoscaling-profiles)). |
+
+Fields under `spec.resourceManagement.rightsizing`:
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `mode` | `Recommend` | `Off`: no rightsizing. `Recommend`: recommendations only. `OnCreate`: apply sizes only when Pods are created. `Auto`: also apply sizes to running Pods. |
+| `resources` | `[cpu, memory]` | Resources to rightsize: `cpu`, `memory`, or both. |
+| `updateStrategy` | `InPlacePreferred` | How `Auto` applies a new size to a running Pod. `InPlacePreferred` resizes the Pod in place when it can, and recreates it when it can't. `Recreate` always recreates it. |
+| `excludeContainers` | None | Containers that rightsizing leaves alone, such as sidecars. |
+| `bounds.min`, `bounds.max` | Guardrail `containerBounds` | Per-container floor and ceiling for the `cpu` and `memory` sizes that rightsizing sets. |
+
+> **NOTE:** Quote `"Off"` in YAML (`mode: "Off"`). Unquoted, YAML reads `Off` as the boolean `false`, which the API server rejects.
+
+The CRD schema rejects malformed specs, such as `replicas.min` above `replicas.max`, an `Object` metric, or a `bounds.min` above the matching `bounds.max`.
+
+### Autoscaling Profiles
+
+Each profile maps to a fixed HPA `behavior`. `Balanced` is the upstream HPA default, so it changes nothing for workloads that don't pick a profile.
+
+| Profile | Scale up | Scale down |
+| --- | --- | --- |
+| `Responsive` | No stabilization window. Up to 4 Pods or 100% every 15s, whichever is more. | 60s stabilization window. Up to 100% every 15s. |
+| `Balanced` (default) | No stabilization window. Up to 4 Pods or 100% every 15s, whichever is more. | 300s stabilization window. Up to 100% every 15s. |
+| `Conservative` | 60s stabilization window. Up to 50% every 60s. | 600s stabilization window. Up to 10% every 60s. |
+
+### Rightsizing Modes
+
+| `rightsizing` | VPA `updatePolicy.updateMode` |
+| --- | --- |
+| `mode: Off` | No VPA. Any managed VPA is deleted. |
+| `mode: Recommend` (default) | `Off`: VPA only writes recommendations to its status. |
+| `mode: OnCreate` | `Initial` |
+| `mode: Auto`, `updateStrategy: InPlacePreferred` | `InPlaceOrRecreate`, or `Recreate` on a VPA that doesn't support it |
+| `mode: Auto`, `updateStrategy: Recreate` | `Recreate` |
+
+The VPA's `"*"` container policy controls the rightsized resources, with `minAllowed` and `maxAllowed` taken from `bounds`, or else from the guardrail `containerBounds`. Each excluded container gets its own policy with `mode: Off`. `controlledValues` keeps the VPA default (`RequestsAndLimits`).
+
+### Scaling On and Rightsizing the Same Resource
+
+Rightsizing changes a container's request, and autoscaling on utilization measures usage against that request, so the two would fight. When `autoscaling.metrics` targets the utilization of a resource (a `Resource` or `ContainerResource` metric with `target.type: Utilization`), that resource is left out of rightsizing, and the class stays valid. If no resource is left, no VPA is created, and a `RightsizingSkipped` event is recorded on the class. In the example above, memory is rightsized, and CPU isn't.
+
+A platform that coordinates the HPA and VPA for a resource lifts this rule. On GKE, HPA Rightsizing coordinates CPU, so run the controller with `--coordinated-hpa-vpa-resources=cpu` to rightsize CPU too. The `WorkloadClass` API stays provider-agnostic: only the controller deployment changes.
+
+### Ownership and Precedence
+
+- **Names:** each managed object is named `wc-<kind>-<workload name>`, for example `wc-deployment-web` for both the HPA and the VPA, and truncated with a hash suffix when too long.
+- **Labels:** managed objects carry `workloads.gke.io/managed-by: workload-class` and `workloads.gke.io/workload-class: <class name>`.
+- **Owner:** the workload is the controller owner, so deleting the workload deletes its HPA and VPA. When the workload's best-match class changes, the next reconcile updates the label and spec in place.
+- **User autoscalers win:** if an HPA or VPA without the managed-by label targets a workload, the controller creates no object of that kind for it (and deletes its own, if any), and records a `UserAutoscalerPresent` event on the workload. It takes over again when the user's object is removed. To customize a single workload, create your own HPA or VPA for it; the controller reverts edits to the objects it manages.
+
+> **NOTE:** As with any HPA, leave `spec.replicas` out of the manifests of autoscaled workloads, so that GitOps tools or `kubectl apply` don't fight the HPA over the replica count.
+
+### VerticalPodAutoscaler Prerequisites
+
+- The controller detects VPA at startup, so restart it after installing VPA. Without VPA, autoscaling still works and the class stays valid, but `ResourceManagementValidated` says "VPA is not installed; rightsizing is not applied", and a `VPANotInstalled` event is recorded on classes that enable rightsizing.
+- `InPlacePreferred` uses VPA's `InPlaceOrRecreate` update mode. It needs VPA 1.4 or later (VPA 1.4 also needs its `InPlaceOrRecreate` feature gate, which is on by default from VPA 1.5) and in-place Pod resize on the cluster (on by default since Kubernetes 1.33). On an older VPA, the controller falls back to `Recreate` and records an `InPlaceUnsupported` event on the class.
+
+### Interaction with Disruption Windows
+
+VPA evicts Pods in `Recreate` mode, and in `InPlaceOrRecreate` mode when an in-place resize isn't possible. Those evictions go through the disruption webhook and the Per-Pod PDBs, so outside a disruption window they're blocked like any other eviction: rightsizing respects the same windows as maintenance. In-place resizes use the `pods/resize` subresource, which isn't an eviction, so the disruption webhook doesn't gate them.
+
+To let VPA evict Pods at any time, add the VPA updater's service account to `allowedDisruptionsOutsideOfWindow` (see [Leasing for Allowed Subjects](#leasing-for-allowed-subjects)):
+
+```yaml
+spec:
+  disruptionPolicy:
+    allowedDisruptionsOutsideOfWindow:
+      - kind: ServiceAccount
+        name: vpa-updater
+        namespace: kube-system
+```
+
+### Controller Flags
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--enable-resource-management` | `true` | Registers the workload autoscaling controllers. Set it to `false` to turn the feature off without a rollback. Existing managed autoscalers are then left in place. |
+| `--coordinated-hpa-vpa-resources` | Empty | Comma-separated resources (`cpu`, `memory`) for which the platform coordinates the HPA and VPA. On GKE, set it to `cpu`. |
+
+With Helm, add the flags to `manager.args` in the chart values.
+
+### Status and Observability
+
+```sh
+kubectl get workloadclass -n shop
+```
+```
+NAME           MAINTENANCE   CAPACITY   SPOTRATIO   PROFILE   VALIDATED   AUTOSCALING   AGE
+web-services   Ready         <none>     <none>      <none>    True        True          5m
+```
+
+| Signal | Where | Meaning |
+| --- | --- | --- |
+| `ResourceManagementValidated` | WorkloadClass condition (`AUTOSCALING` column) | `resourceManagement` passed spec and guardrail validation. Set only when `resourceManagement` is configured. |
+| `AutoscalerApplied` | Workload event | The controller created or updated a managed HPA or VPA. |
+| `UserAutoscalerPresent` | Workload event | A user-created HPA or VPA targets the workload, so the controller doesn't create one. |
+| `RightsizingSkipped` | WorkloadClass event | No resource is left to rightsize, because autoscaling targets their utilization. |
+| `InPlaceUnsupported` | WorkloadClass event | The installed VPA doesn't support `InPlaceOrRecreate`, so `InPlacePreferred` falls back to `Recreate`. |
+| `VPANotInstalled` | WorkloadClass event | The class enables rightsizing, but VPA isn't installed. |
+| `workloadclass_managed_autoscalers{kind}` | Controller metric | Number of managed HPAs and VPAs. |
+
+If a class isn't applied, `kubectl describe workloadclass web-services -n shop` shows the guardrail violation in the `ResourceManagementValidated` message.
+
+### Try It Out
+
+Apply the sample guardrail and class, which lives in its own `resource-management-sample` namespace, then create a Deployment whose Pods match its selector:
+
+```sh
+kubectl apply -f config/samples/workloadclassguardrail_resource_management_sample.yaml
+kubectl apply -f config/samples/workloadclass_resource_management_sample.yaml
+kubectl apply -n resource-management-sample -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {tier: web}
+  template:
+    metadata:
+      labels: {tier: web}
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+EOF
+kubectl get hpa,vpa -n resource-management-sample
+```
+```
+NAME                                                    REFERENCE        TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+horizontalpodautoscaler.autoscaling/wc-deployment-web   Deployment/web   cpu: <unknown>/60%   2         20        2          10s
+
+NAME                                                         MODE   CPU   MEM   PROVIDED   AGE
+verticalpodautoscaler.autoscaling.k8s.io/wc-deployment-web   Off                           10s
+```
+
+The VPA rightsizes memory only, because the HPA scales on CPU utilization. CPU metrics need [metrics-server](https://github.com/kubernetes-sigs/metrics-server), which GKE runs by default.
 
 ## Relationship to Upstream `scheduling.k8s.io` `Workload`
 
