@@ -55,6 +55,7 @@ patches:
     kind: Deployment
 - path: pod_webhook_namespace_selector_patch.yaml
 - path: disruption_webhook_namespace_selector_patch.yaml
+- path: pdb_webhook_namespace_selector_patch.yaml
 
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
 # Uncomment the following replacements to add the cert-manager CA injection annotations

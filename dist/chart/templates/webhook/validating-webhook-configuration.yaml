@@ -43,6 +43,34 @@ webhooks:
     service:
       name: {{ include "workload-class.resourceName" (dict "suffix" "webhook-service" "context" $) }}
       namespace: {{ .Release.Namespace }}
+      path: /validate-policy-v1-poddisruptionbudget
+  failurePolicy: Ignore
+  name: vpoddisruptionbudget-v1.kb.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - cert-manager
+      - {{ .Release.Namespace }}
+  rules:
+  - apiGroups:
+    - policy
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - poddisruptionbudgets
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ include "workload-class.resourceName" (dict "suffix" "webhook-service" "context" $) }}
+      namespace: {{ .Release.Namespace }}
       path: /validate-workloads-gke-io-v1-workloadclassguardrail
   failurePolicy: Fail
   name: vworkloadclassguardrail-v1.kb.io
