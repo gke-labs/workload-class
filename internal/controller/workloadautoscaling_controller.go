@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
+	"sync/atomic"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -29,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -63,7 +66,8 @@ const (
 // StatefulSets) from the resourceManagement of the WorkloadClass that governs each workload.
 //
 // It is keyed by workload: each workload has exactly one best-match WorkloadClass and owns at most one
-// managed HorizontalPodAutoscaler, so each reconcile is independent and idempotent. The workload, not the
+// managed HorizontalPodAutoscaler and one managed VerticalPodAutoscaler, so each reconcile is independent and
+// idempotent. The workload, not the
 // WorkloadClass, is the controller owner of its autoscalers. Deleting the workload garbage-collects them,
 // and a workload that moves to another WorkloadClass has them updated in place.
 //
@@ -77,16 +81,30 @@ type WorkloadAutoscalingReconciler struct {
 	// Kind is the kind of workload that this reconciler handles: utils.DeploymentKind or
 	// utils.StatefulSetKind.
 	Kind string
+
+	// VPAInstalled reports whether the VerticalPodAutoscaler CRD is installed on the cluster. If it is not,
+	// rightsizing is not applied, and VerticalPodAutoscalers are neither read nor watched.
+	VPAInstalled bool
+
+	// CoordinatedResources are the resources for which the platform coordinates horizontal scaling on
+	// utilization with rightsizing, so that rightsizing is not left out for them (see
+	// utils.RightsizedResources).
+	CoordinatedResources []corev1.ResourceName
+
+	// inPlaceUnsupported is set once the VPA installation has rejected the InPlaceOrRecreate update mode and
+	// accepted Recreate instead. From then on, the InPlacePreferred update strategy uses Recreate directly.
+	inPlaceUnsupported atomic.Bool
 }
 
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=workloads.gke.io,resources=workloadclasses;workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
-// Reconcile creates, updates or deletes the managed HorizontalPodAutoscaler of a workload so that it matches
-// the autoscaling of the WorkloadClass that governs the workload.
+// Reconcile creates, updates or deletes the managed HorizontalPodAutoscaler and VerticalPodAutoscaler of a
+// workload so that they match the autoscaling and rightsizing of the WorkloadClass that governs the workload.
 func (r *WorkloadAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	workload := r.newWorkload()
 	if err := r.Get(ctx, req.NamespacedName, workload); err != nil {
@@ -106,7 +124,11 @@ func (r *WorkloadAutoscalingReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, r.reconcileHPA(ctx, workload, ref, wc)
+	// The two autoscalers are independent: a failure to reconcile one never blocks the other.
+	return ctrl.Result{}, errors.Join(
+		r.reconcileHPA(ctx, workload, ref, wc),
+		r.reconcileVPA(ctx, workload, ref, wc),
+	)
 }
 
 // governingWorkloadClass returns the WorkloadClass whose resourceManagement applies to the workload: the best
@@ -281,7 +303,7 @@ func (r *WorkloadAutoscalingReconciler) workloadKeys(ctx context.Context, namesp
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		// Reconcile a workload when it is created or the labels of its pod template change, which can change
 		// the WorkloadClass that governs it. Replica changes made by the HPA are ignored.
 		For(r.newWorkload(), builder.WithPredicates(workloadTemplateLabelsPredicate())).
@@ -302,11 +324,42 @@ func (r *WorkloadAutoscalingReconciler) SetupWithManager(mgr ctrl.Manager) error
 		// user-created HPAs as they are created, retargeted, or deleted. HPA status updates are ignored.
 		Watches(
 			&autoscalingv2.HorizontalPodAutoscaler{},
-			handler.EnqueueRequestsFromMapFunc(r.findWorkloadForHPA),
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadForAutoscaler),
+			builder.WithPredicates(autoscalerChangedPredicate()),
+		)
+
+	if r.VPAInstalled {
+		// The same for managed and user-created VPAs. Watching a kind that the API server does not serve
+		// would keep the manager from starting, so VPAs are only watched when their CRD is installed.
+		b = b.Watches(
+			newVPA(),
+			handler.EnqueueRequestsFromMapFunc(r.findWorkloadForAutoscaler),
 			builder.WithPredicates(autoscalerChangedPredicate()),
 		).
-		Named("workloadautoscaling-" + strings.ToLower(r.Kind)).
-		Complete(r)
+			// The guardrail containerBounds are the default bounds of managed VPAs, so a guardrail spec
+			// change can change the VPA of any workload.
+			Watches(
+				&workloadsv1.WorkloadClassGuardrail{},
+				handler.EnqueueRequestsFromMapFunc(r.findAllWorkloads),
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+	}
+
+	return b.Named("workloadautoscaling-" + strings.ToLower(r.Kind)).Complete(r)
+}
+
+// findAllWorkloads enqueues every workload of this reconciler's kind in the cluster.
+func (r *WorkloadAutoscalingReconciler) findAllWorkloads(ctx context.Context, _ client.Object) []reconcile.Request {
+	keys, err := r.workloadKeys(ctx, "")
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list workloads", "kind", r.Kind)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(keys))
+	for _, key := range keys {
+		requests = append(requests, reconcile.Request{NamespacedName: key})
+	}
+	return requests
 }
 
 // findWorkloadsInObjectNamespace enqueues every workload of this reconciler's kind in the object's namespace.
@@ -335,26 +388,34 @@ func (r *WorkloadAutoscalingReconciler) workloadRequestsInNamespace(ctx context.
 	return requests
 }
 
-// findWorkloadForHPA enqueues the workload that an HPA belongs to: the controller owner of a managed HPA, or
-// the scale target of a user-created HPA. HPAs of other kinds of workloads are ignored.
-func (r *WorkloadAutoscalingReconciler) findWorkloadForHPA(_ context.Context, obj client.Object) []reconcile.Request {
-	hpa, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler)
-	if !ok {
-		return nil
-	}
-	if utils.IsWorkloadClassManagedAutoscaler(hpa) {
-		owner := metav1.GetControllerOf(hpa)
+// findWorkloadForAutoscaler enqueues the workload that an HPA or VPA belongs to: the controller owner of a
+// managed autoscaler, or the target of a user-created one. Autoscalers of other kinds of workloads are
+// ignored.
+func (r *WorkloadAutoscalingReconciler) findWorkloadForAutoscaler(_ context.Context, obj client.Object) []reconcile.Request {
+	if utils.IsWorkloadClassManagedAutoscaler(obj) {
+		owner := metav1.GetControllerOf(obj)
 		if owner == nil || owner.Kind != r.Kind {
 			return nil
 		}
-		return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: owner.Name, Namespace: hpa.Namespace}}}
+		return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: owner.Name, Namespace: obj.GetNamespace()}}}
 	}
-	target := hpa.Spec.ScaleTargetRef
-	ref := utils.WorkloadRef{Kind: r.Kind, Name: target.Name}
-	if !utils.ScaleTargetsWorkload(target.APIVersion, target.Kind, target.Name, ref) {
+
+	var apiVersion, kind, name string
+	switch autoscaler := obj.(type) {
+	case *autoscalingv2.HorizontalPodAutoscaler:
+		target := autoscaler.Spec.ScaleTargetRef
+		apiVersion, kind, name = target.APIVersion, target.Kind, target.Name
+	case *unstructured.Unstructured:
+		apiVersion, _, _ = unstructured.NestedString(autoscaler.Object, "spec", "targetRef", "apiVersion")
+		kind, _, _ = unstructured.NestedString(autoscaler.Object, "spec", "targetRef", "kind")
+		name, _, _ = unstructured.NestedString(autoscaler.Object, "spec", "targetRef", "name")
+	default:
 		return nil
 	}
-	return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: target.Name, Namespace: hpa.Namespace}}}
+	if !utils.ScaleTargetsWorkload(apiVersion, kind, name, utils.WorkloadRef{Kind: r.Kind, Name: name}) {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: name, Namespace: obj.GetNamespace()}}}
 }
 
 // workloadTemplateLabelsPredicate passes the creation of a workload and changes to the labels of its pod
@@ -426,6 +487,11 @@ func autoscalerChangedPredicate() predicate.Funcs {
 			newHPA, okNew := e.ObjectNew.(*autoscalingv2.HorizontalPodAutoscaler)
 			if okOld && okNew {
 				return !equality.Semantic.DeepEqual(oldHPA.Spec, newHPA.Spec)
+			}
+			oldVPA, okOld := e.ObjectOld.(*unstructured.Unstructured)
+			newVPA, okNew := e.ObjectNew.(*unstructured.Unstructured)
+			if okOld && okNew {
+				return !equality.Semantic.DeepEqual(oldVPA.Object["spec"], newVPA.Object["spec"])
 			}
 			return true
 		},
