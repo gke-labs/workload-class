@@ -19,12 +19,16 @@ package controller
 import (
 	"context"
 	"strings"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -252,3 +256,37 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 		})
 	})
 })
+
+func TestWorkloadClassGuardrailValidateResourceManagement(t *testing.T) {
+	r := &WorkloadClassGuardrailReconciler{}
+	g := &workloadsv1.WorkloadClassGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: "rm", Generation: 2},
+		Spec: workloadsv1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1.Constraints{
+				Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 30},
+				ResourceManagement: &workloadsv1.ResourceManagementConstraints{
+					AllowedRightsizingModes: []workloadsv1.RightsizingMode{workloadsv1.RightsizingModeRecommend},
+					MaxReplicas:             ptr.To[int32](10),
+				},
+			},
+		},
+	}
+	if got := r.validate(t.Context(), g); got.Status != metav1.ConditionTrue {
+		t.Errorf("validate() = (%s, %s), want True for valid resourceManagement constraints; message: %q", got.Status, got.Reason, got.Message)
+	}
+
+	g.Spec.Constraints.ResourceManagement.ContainerBounds = &workloadsv1.ContainerBounds{
+		Min: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Max: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+	}
+	got := r.validate(t.Context(), g)
+	if got.Status != metav1.ConditionFalse || got.Reason != workloadsv1.ReasonValidationFailed {
+		t.Errorf("validate() = (%s, %s), want (False, %s)", got.Status, got.Reason, workloadsv1.ReasonValidationFailed)
+	}
+	if want := "`resourceManagement.containerBounds.min.memory` must not exceed `containerBounds.max.memory` ('1Gi'), got '2Gi'"; !strings.Contains(got.Message, want) {
+		t.Errorf("validate() message = %q, want it to contain %q", got.Message, want)
+	}
+	if got.ObservedGeneration != g.Generation {
+		t.Errorf("ObservedGeneration = %d, want %d", got.ObservedGeneration, g.Generation)
+	}
+}

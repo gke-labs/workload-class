@@ -20,8 +20,12 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
@@ -184,6 +188,72 @@ var _ = Describe("WorkloadClassGuardrail Webhook", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring(`invalid enforcementMode "InvalidMode"`))
 			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should deny creation if resourceManagement constraints are invalid", func() {
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-rm-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						ResourceManagement: &workloadsv1.ResourceManagementConstraints{
+							AllowedMetricTypes: []autoscalingv2.MetricSourceType{"Custom"},
+							ContainerBounds: &workloadsv1.ContainerBounds{
+								Min: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+								Max: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+							},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid resourceManagement constraints"))
+			Expect(err.Error()).To(ContainSubstring("`resourceManagement.allowedMetricTypes` must only contain"))
+			Expect(err.Error()).To(ContainSubstring("`resourceManagement.containerBounds.min.cpu` must not exceed `containerBounds.max.cpu` ('1'), got '2'"))
+			Expect(warnings).NotTo(BeEmpty())
+		})
+
+		It("Should admit creation with a warning if an existing WorkloadClass violates resourceManagement constraints", func() {
+			wc := &workloadsv1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "autoscaled-workloadclass", Namespace: "default"},
+				Spec: workloadsv1.WorkloadClassSpec{
+					DisruptionPolicy: workloadsv1.DisruptionPolicy{MaxNonDisruptionDurationDays: 5},
+					ResourceManagement: &workloadsv1.ResourceManagement{
+						Autoscaling: &workloadsv1.Autoscaling{
+							Replicas: workloadsv1.ReplicaBounds{Max: 50},
+							Metrics: []autoscalingv2.MetricSpec{{
+								Type: autoscalingv2.ResourceMetricSourceType,
+								Resource: &autoscalingv2.ResourceMetricSource{
+									Name:   corev1.ResourceCPU,
+									Target: autoscalingv2.MetricTarget{Type: autoscalingv2.UtilizationMetricType, AverageUtilization: ptr.To[int32](60)},
+								},
+							}},
+						},
+						Rightsizing: &workloadsv1.Rightsizing{Mode: workloadsv1.RightsizingModeAuto},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wc) }()
+
+			obj = &workloadsv1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: "rm-guardrail"},
+				Spec: workloadsv1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1.Constraints{
+						Disruption: workloadsv1.Disruption{MaxNonDisruptionDurationDays: 10},
+						ResourceManagement: &workloadsv1.ResourceManagementConstraints{
+							MaxReplicas:             ptr.To[int32](10),
+							AllowedRightsizingModes: []workloadsv1.RightsizingMode{workloadsv1.RightsizingModeRecommend},
+						},
+					},
+				},
+			}
+			warnings, err := validator.ValidateCreate(ctx, obj)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(warnings).To(HaveLen(1))
+			Expect(warnings[0]).To(ContainSubstring("existing WorkloadClass 'default/autoscaled-workloadclass' does not comply with this guardrail"))
+			Expect(warnings[0]).To(ContainSubstring("`resourceManagement.autoscaling.replicas.max` must be at most 10 (guardrail limit), got 50"))
+			Expect(warnings[0]).To(ContainSubstring("`resourceManagement.rightsizing.mode` must be one of 'Recommend' (guardrail limit), got 'Auto'"))
 		})
 
 		It("Should admit a guardrail with valid pluginConstraints", func() {
