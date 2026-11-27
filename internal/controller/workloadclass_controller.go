@@ -119,24 +119,25 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// CreationTimestamp before calculating readiness. Requiring every active governed Pod to be
 	// newer than the current baseline prevents a single-Pod eviction during an Overdue drain or
 	// upgrade from resetting Overdue and closing the remaining Pods' Per-Pod PDBs.
-	var nextLastDisruption *metav1.Time
-	if utils.IsValidated(&disruptionCond) {
-		matchedPods, err := r.matchedWorkloadPods(ctx, wc)
-		if err != nil {
-			log.Error(err, "Failed to list governed Pods for LastDisruptionTime calculation")
-			return ctrl.Result{}, err
-		}
-		if next, ok := deriveLastDisruptionTime(wc, matchedPods); ok {
-			nextLastDisruption = next
-			wc.Status.LastDisruptionTime = next
-		}
+	nextLastDisruption, err := r.nextLastDisruptionTime(ctx, wc, &disruptionCond)
+	if err != nil {
+		log.Error(err, "Failed to list governed Pods for LastDisruptionTime calculation")
+		return ctrl.Result{}, err
 	}
 
-	// 2. Calculate Readiness
-	readiness, nextReconcile, err := r.calculateReadiness(ctx, wc)
-	if err != nil {
-		log.Error(err, "Failed to calculate readiness")
-		return ctrl.Result{}, err
+	// 2. Calculate Readiness (cluster-wide guardrail EmergencyOverride immediately opens maintenance readiness)
+	var (
+		readiness     workloadsv1.MaintenanceReadiness
+		nextReconcile time.Duration
+	)
+	if utils.HasGuardrailEmergencyOverride(guardrails.Items) {
+		readiness = workloadsv1.ReadinessReady
+	} else {
+		readiness, nextReconcile, err = r.calculateReadiness(ctx, wc)
+		if err != nil {
+			log.Error(err, "Failed to calculate readiness")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 3. Update Status with RetryOnConflict so concurrent condition updates from plugin controllers
@@ -165,11 +166,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			changed = meta.RemoveStatusCondition(&latest.Status.Conditions, workloadsv1.ConditionTypePlacementValidated) || changed
 		}
 		changed = meta.SetStatusCondition(&latest.Status.Conditions, cond) || changed
-		if nextLastDisruption != nil && (latest.Status.LastDisruptionTime == nil || nextLastDisruption.After(latest.Status.LastDisruptionTime.Truncate(time.Second))) {
-			t := *nextLastDisruption
-			latest.Status.LastDisruptionTime = &t
-			changed = true
-		}
+		changed = applyMonotonicLastDisruptionTime(latest, nextLastDisruption) || changed
 		if latest.Status.MaintenanceReadiness != readiness {
 			latest.Status.MaintenanceReadiness = readiness
 			log.Info(fmt.Sprintf("Workload is now %s for maintenance", readiness))
@@ -719,6 +716,39 @@ func deriveLastDisruptionTime(wc *workloadsv1.WorkloadClass, pods []corev1.Pod) 
 	return &truncated, true
 }
 
+// nextLastDisruptionTime advances wc.Status.LastDisruptionTime in memory when the oldest active
+// governed Pod's CreationTimestamp is strictly after the current baseline, returning the new
+// timestamp so it can also be persisted inside UpdateWorkloadClassStatus.
+func (r *WorkloadClassReconciler) nextLastDisruptionTime(ctx context.Context, wc *workloadsv1.WorkloadClass, disruptionCond *metav1.Condition) (*metav1.Time, error) {
+	if !utils.IsValidated(disruptionCond) {
+		return nil, nil
+	}
+	matchedPods, err := r.matchedWorkloadPods(ctx, wc)
+	if err != nil {
+		return nil, err
+	}
+	next, ok := deriveLastDisruptionTime(wc, matchedPods)
+	if !ok {
+		return nil, nil
+	}
+	wc.Status.LastDisruptionTime = next
+	return next, nil
+}
+
+// applyMonotonicLastDisruptionTime sets wc.Status.LastDisruptionTime to next only if next is
+// non-nil and strictly after any existing timestamp (truncated to whole seconds).
+func applyMonotonicLastDisruptionTime(wc *workloadsv1.WorkloadClass, next *metav1.Time) bool {
+	if next == nil {
+		return false
+	}
+	if wc.Status.LastDisruptionTime != nil && !next.After(wc.Status.LastDisruptionTime.Truncate(time.Second)) {
+		return false
+	}
+	t := *next
+	wc.Status.LastDisruptionTime = &t
+	return true
+}
+
 // placementPluginCondition returns a PlacementPluginAttached metav1.Condition from the WorkloadClass status if it matches
 // the current Generation. If no such Condition exists, a new one is created. If the WorkloadClass does not have an
 // InfrastructureProfileRef, no Condition is returned.
@@ -932,12 +962,28 @@ func truncateMessage(msg string, maxLen int) string {
 	return msg[:cut] + ellipsis
 }
 
+// isExcludedSystemNamespace reports whether ns is excluded from the disruption validating webhook's
+// namespaceSelector so evicting control-plane pods cannot deadlock node drains.
+func isExcludedSystemNamespace(ns string) bool {
+	switch ns {
+	case "kube-system", "cert-manager", "workload-class-system":
+		return true
+	default:
+		return false
+	}
+}
+
 // validateSpec validates the fields of the WorkloadClass spec that are not fully enforced by the
 // CRD OpenAPI/CEL schema (semantic LabelSelector validation, valid weekday names, and IANA time zone
 // database lookup), and acts as defense-in-depth for rules also checked at admission time (such as
 // rejecting the 'Local' time zone).
 func validateSpec(wc *workloadsv1.WorkloadClass) []string {
 	var violations []string
+	if isExcludedSystemNamespace(wc.Namespace) {
+		violations = append(violations, fmt.Sprintf(
+			"namespace %q is excluded from the disruption validating webhook; disruption policy cannot be enforced here",
+			wc.Namespace))
+	}
 	if wc.Spec.PodSelector != nil {
 		if _, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
 			violations = append(violations, fmt.Sprintf("`podSelector` must be a valid label selector: %v", err))
