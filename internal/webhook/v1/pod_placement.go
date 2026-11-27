@@ -60,7 +60,7 @@ type existingPodCounts struct {
 // isWorkloadInFallback reports whether the WorkloadClass is currently running Pods on On-Demand fallback.
 // It honors the InFallback condition when set and otherwise inspects existing Pods: a Pod that was
 // targeted for Spot but is running on a non-Spot node indicates the workload has fallen back.
-func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) bool {
+func (d *PodDefaulter) isWorkloadInFallback(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) bool {
 	if meta.IsStatusConditionTrue(wc.Status.Conditions, workloadsv1.ConditionTypeInFallback) {
 		return true
 	}
@@ -75,7 +75,7 @@ func (d *PodPlacementDefaulter) isWorkloadInFallback(ctx context.Context, incomi
 
 // countExistingWorkloadClassPods returns how many active Pods selected by the WorkloadClass are
 // (or are targeted to be) on Spot, and the total number of active selected Pods.
-func (d *PodPlacementDefaulter) countExistingWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (spotCount, totalCount int) {
+func (d *PodDefaulter) countExistingWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (spotCount, totalCount int) {
 	counts, err := d.countWorkloadClassPods(ctx, incomingPod, wc)
 	if err != nil {
 		podlog.Error(err, "Failed to list Pods to compute Spot ratio", "workloadClass", wc.Name, "namespace", incomingPod.Namespace)
@@ -86,7 +86,7 @@ func (d *PodPlacementDefaulter) countExistingWorkloadClassPods(ctx context.Conte
 
 // countWorkloadClassPods classifies the active Pods selected by the WorkloadClass (excluding the incoming Pod)
 // in a single pass, caching node lookups so each distinct node is fetched at most once.
-func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (existingPodCounts, error) {
+func (d *PodDefaulter) countWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) (existingPodCounts, error) {
 	pods, err := d.listWorkloadClassPods(ctx, incomingPod, wc)
 	if err != nil {
 		return existingPodCounts{}, err
@@ -135,7 +135,7 @@ func (d *PodPlacementDefaulter) countWorkloadClassPods(ctx context.Context, inco
 // that the WorkloadClass applies to, excluding the incoming Pod itself (see utils.WorkloadClassPodSelector: a
 // nil PodSelector, or the WorkloadClass being the namespace's enforced WorkloadClass, selects all Pods in the namespace). When
 // multiple WorkloadClasses exist in the namespace, each Pod is only counted for its best-matching WorkloadClass.
-func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) ([]*corev1.Pod, error) {
+func (d *PodDefaulter) listWorkloadClassPods(ctx context.Context, incomingPod *corev1.Pod, wc *workloadsv1.WorkloadClass) ([]*corev1.Pod, error) {
 	selector, err := utils.WorkloadClassPodSelector(ctx, d.Client, wc)
 	if err != nil {
 		return nil, err
@@ -177,7 +177,7 @@ func (d *PodPlacementDefaulter) listWorkloadClassPods(ctx context.Context, incom
 
 // isNodeSpot reports whether the named node carries the GKE Spot label. known is false when the
 // node name is empty or the node can't be fetched, so callers can fall back to other signals.
-func (d *PodPlacementDefaulter) isNodeSpot(ctx context.Context, nodeName string) (isSpot, known bool) {
+func (d *PodDefaulter) isNodeSpot(ctx context.Context, nodeName string) (isSpot, known bool) {
 	if nodeName == "" {
 		return false, false
 	}

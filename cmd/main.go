@@ -96,6 +96,7 @@ func main() {
 	var enableHTTP2 bool
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
+	var enableInitialResources bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -122,6 +123,9 @@ func main() {
 		"Burst limit when talking to the Kubernetes API server. 0 keeps controller-runtime's default "+
 			"(client-side limiting disabled); a positive value sets the client-side burst; "+
 			"a negative value (e.g. -1) is passed through.")
+	flag.BoolVar(&enableInitialResources, "enable-initial-resources", true,
+		"If set, the Pod webhook fills in the initialResources of a WorkloadClass on the containers of the Pods it "+
+			"governs. Use --enable-initial-resources=false to turn off this Pod mutation without affecting placement.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -294,7 +298,7 @@ func main() {
 	}
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhookv1.SetupPodWebhookWithManager(mgr); err != nil {
+		if err := webhookv1.SetupPodWebhookWithManager(mgr, enableInitialResources); err != nil {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "Pod")
 			os.Exit(1)
 		}
