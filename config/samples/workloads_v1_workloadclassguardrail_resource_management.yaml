@@ -1,0 +1,45 @@
+# A WorkloadClassGuardrail that bounds the resource management settings WorkloadClasses may use.
+# Unset constraints are not enforced. When several guardrails apply, the strictest value wins.
+apiVersion: workloads.gke.io/v1
+kind: WorkloadClassGuardrail
+metadata:
+  name: resource-management
+spec:
+  constraints:
+    disruption:
+      maxNonDisruptionDurationDays: 30
+    resourceManagement:
+      # Classes must set initialResources, so no governed Pod starts without requests.
+      requireInitialResources: true
+      # Limit policies that classes may use.
+      allowedLimitPolicies:
+        - MemoryEqualsRequest
+        - EqualsRequest
+      # Rightsizing modes that classes may use.
+      allowedRightsizingModes:
+        - "Off"
+        - Recommend
+        - OnCreate
+        - Auto
+      # Update strategies that classes may use with the Auto mode.
+      allowedUpdateStrategies:
+        - InPlacePreferred
+      # Upper limit on any class's replicas.max.
+      maxReplicas: 100
+      # Scaling profiles that classes may use.
+      allowedAutoscalingProfiles:
+        - Balanced
+        - Conservative
+      # HPA metric types that classes may use.
+      allowedMetricTypes:
+        - Resource
+        - Pods
+        - External
+      # Widest range that initial resources and rightsizing may use.
+      containerBounds:
+        min:
+          cpu: 10m
+          memory: 32Mi
+        max:
+          cpu: "16"
+          memory: 64Gi

@@ -111,6 +111,119 @@ spec:
                     required:
                     - maxNonDisruptionDurationDays
                     type: object
+                  resourceManagement:
+                    description: |-
+                      ResourceManagement defines the constraints within which WorkloadClasses can set initial resources,
+                      autoscaling and rightsizing.
+                    properties:
+                      allowedAutoscalingProfiles:
+                        description: |-
+                          AllowedAutoscalingProfiles lists the autoscaling profiles that WorkloadClasses may use.
+                          When unset or empty, all profiles are allowed.
+                        items:
+                          description: AutoscalingProfile specifies how quickly a
+                            workload scales up and down.
+                          enum:
+                          - Responsive
+                          - Balanced
+                          - Conservative
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedLimitPolicies:
+                        description: |-
+                          AllowedLimitPolicies lists the initial resources limit policies that WorkloadClasses may use.
+                          When unset or empty, all limit policies are allowed.
+                        items:
+                          description: LimitPolicy specifies how initial resources
+                            set limits on containers that do not set them.
+                          enum:
+                          - MemoryEqualsRequest
+                          - EqualsRequest
+                          - None
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedMetricTypes:
+                        description: |-
+                          AllowedMetricTypes lists the autoscaling metric types that WorkloadClasses may use.
+                          When unset or empty, all metric types other than Object are allowed.
+                        items:
+                          description: MetricSourceType indicates the type of metric.
+                          enum:
+                          - Resource
+                          - ContainerResource
+                          - Pods
+                          - External
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedRightsizingModes:
+                        description: |-
+                          AllowedRightsizingModes lists the rightsizing modes that WorkloadClasses may use.
+                          When unset or empty, all modes are allowed.
+                        items:
+                          description: RightsizingMode specifies whether and when
+                            rightsizing applies new container sizes.
+                          enum:
+                          - "Off"
+                          - Recommend
+                          - OnCreate
+                          - Auto
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      allowedUpdateStrategies:
+                        description: |-
+                          AllowedUpdateStrategies lists the rightsizing update strategies that WorkloadClasses may use with the
+                          Auto mode. When unset or empty, all update strategies are allowed.
+                        items:
+                          description: RightsizingUpdateStrategy specifies how the
+                            Auto rightsizing mode applies a new size to a running
+                            Pod.
+                          enum:
+                          - InPlacePreferred
+                          - Recreate
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      containerBounds:
+                        description: |-
+                          ContainerBounds is the widest range that initial resources and rightsizing may use. The
+                          initialResources.requests and rightsizing.bounds of a WorkloadClass must sit inside it. It applies
+                          to rightsizing when a WorkloadClass sets no bounds.
+                        properties:
+                          max:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Max is the per-container ceiling.
+                            type: object
+                          min:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Min is the per-container floor.
+                            type: object
+                        type: object
+                      maxReplicas:
+                        description: MaxReplicas is the upper limit on the autoscaling
+                          replicas.max of any WorkloadClass.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      requireInitialResources:
+                        description: |-
+                          RequireInitialResources requires every WorkloadClass to set resourceManagement.initialResources, so
+                          that no governed Pod starts without requests.
+                        type: boolean
+                    type: object
                 required:
                 - disruption
                 type: object
