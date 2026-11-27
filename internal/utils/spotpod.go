@@ -20,6 +20,8 @@ import (
 	"slices"
 
 	corev1 "k8s.io/api/core/v1"
+
+	workloadsv1 "github.com/gke-labs/workload-class/api/v1"
 )
 
 const (
@@ -31,11 +33,51 @@ const (
 	ProvisioningLabelKey = "cloud.google.com/gke-provisioning"
 	// ProvisioningSpotValue is the value for ProvisioningLabelKey on Spot VM nodes.
 	ProvisioningSpotValue = "spot"
+	// ReservationAffinityLabelKey is the GKE node label selecting specific reservation consumption.
+	ReservationAffinityLabelKey = "cloud.google.com/reservation-affinity"
+	// ReservationAffinitySpecificValue is the GKE node label value for specific reservations.
+	ReservationAffinitySpecificValue = "specific"
+	// ReservationNameLabelKey is the GKE node label identifying a specific GCE reservation by name.
+	ReservationNameLabelKey = "cloud.google.com/reservation-name"
+	// ReservationProjectLabelKey is the GKE node label identifying the host project for a shared GCE reservation.
+	ReservationProjectLabelKey = "cloud.google.com/reservation-project"
 )
 
 // IsSpotNode reports whether the node carries the GKE Spot label.
 func IsSpotNode(node *corev1.Node) bool {
 	return node != nil && node.Labels[SpotLabelKey] == SpotLabelValue
+}
+
+// ReservationNodeMatchLabels returns the node label selector matching nodes bound to the configured
+// specific GCE reservation, or nil when res is nil or has an empty name.
+func ReservationNodeMatchLabels(res *workloadsv1.FallbackReservationPolicy) map[string]string {
+	if res == nil || res.Name == "" {
+		return nil
+	}
+	match := map[string]string{
+		ReservationAffinityLabelKey: ReservationAffinitySpecificValue,
+		ReservationNameLabelKey:     res.Name,
+	}
+	if res.Project != "" {
+		match[ReservationProjectLabelKey] = res.Project
+	}
+	return match
+}
+
+// IsMatchingReservationNode reports whether node carries labels matching the configured specific
+// GCE reservation.
+func IsMatchingReservationNode(node *corev1.Node, res *workloadsv1.FallbackReservationPolicy) bool {
+	if node == nil || res == nil || res.Name == "" {
+		return false
+	}
+	if node.Labels[ReservationAffinityLabelKey] != ReservationAffinitySpecificValue ||
+		node.Labels[ReservationNameLabelKey] != res.Name {
+		return false
+	}
+	if res.Project != "" && node.Labels[ReservationProjectLabelKey] != res.Project {
+		return false
+	}
+	return true
 }
 
 // IsPodTargetedForSpot reports whether the Pod has been directed at Spot capacity (by the Pod placement

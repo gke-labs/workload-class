@@ -77,6 +77,26 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: set
+              fallbackReservation:
+                description: |-
+                  FallbackReservation directs Pods falling back from Spot during a stockout to prefer a specific
+                  GCE reservation before spilling onto plain On-Demand capacity (Spot weight 100 > reservation
+                  weight 50 > On-Demand weight 0). Pods scheduled onto matching prepaid reservation nodes are not
+                  treated as On-Demand fallback and are skipped by Spot reversion so already-paid capacity is not disrupted.
+                properties:
+                  name:
+                    description: Name is the GCE reservation name (cloud.google.com/reservation-name).
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  project:
+                    description: Project is the optional GCP project ID owning a shared
+                      GCE reservation (cloud.google.com/reservation-project).
+                    maxLength: 63
+                    type: string
+                required:
+                - name
+                type: object
               reversion:
                 default: {}
                 description: |-

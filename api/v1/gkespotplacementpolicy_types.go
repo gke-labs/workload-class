@@ -67,6 +67,23 @@ const (
 	ReasonSpotStockout = "SpotStockout"
 )
 
+// FallbackReservationPolicy directs Spot-fallback Pods to prefer a specific named GKE reservation
+// during Spot stockouts before spilling over to plain On-Demand capacity.
+// Note: Standard GKE On-Demand nodes already consume matching any-affinity GCE reservations automatically
+// without a Pod node selector, so this policy specifically targets named ("specific" affinity) reservations.
+type FallbackReservationPolicy struct {
+	// Name is the GCE reservation name (cloud.google.com/reservation-name).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+
+	// Project is the optional GCP project ID owning a shared GCE reservation (cloud.google.com/reservation-project).
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	Project string `json:"project,omitempty"`
+}
+
 // GKESpotPlacementPolicySpec defines the desired state of GKESpotPlacementPolicy.
 // +kubebuilder:validation:XValidation:rule="!has(self.customComputeClass) || size(self.customComputeClass) == 0 || !has(self.fallbackAllowedMachineFamilies) || size(self.fallbackAllowedMachineFamilies) == 0",message="fallbackAllowedMachineFamilies cannot be used with customComputeClass"
 type GKESpotPlacementPolicySpec struct {
@@ -83,6 +100,13 @@ type GKESpotPlacementPolicySpec struct {
 	// +optional
 	// +listType=set
 	FallbackAllowedMachineFamilies []string `json:"fallbackAllowedMachineFamilies,omitempty"`
+
+	// FallbackReservation directs Pods falling back from Spot during a stockout to prefer a specific
+	// GCE reservation before spilling onto plain On-Demand capacity (Spot weight 100 > reservation
+	// weight 50 > On-Demand weight 0). Pods scheduled onto matching prepaid reservation nodes are not
+	// treated as On-Demand fallback and are skipped by Spot reversion so already-paid capacity is not disrupted.
+	// +optional
+	FallbackReservation *FallbackReservationPolicy `json:"fallbackReservation,omitempty"`
 
 	// Reversion configures how fallback Pods running on On-Demand nodes return to GKE Spot VMs
 	// once Spot capacity recovers (Active, Lazy, or None).

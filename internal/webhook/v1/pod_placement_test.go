@@ -101,6 +101,13 @@ func newDefaulter(objs ...client.Object) *PodPlacementDefaulter {
 	return &PodPlacementDefaulter{Client: c}
 }
 
+func preferredTerms(pod *corev1.Pod) []corev1.PreferredSchedulingTerm {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return nil
+	}
+	return pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+}
+
 func requiredTerms(pod *corev1.Pod) []corev1.NodeSelectorTerm {
 	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil ||
 		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
@@ -249,6 +256,102 @@ var _ = Describe("Pod placement helpers", func() {
 			}}))
 			Expect(requiredTerms(pod)).To(BeEmpty())
 		})
+
+		It("prefers a specific GKE reservation (weight 50) below Spot (100) while keeping On-Demand fallback allowed", func() {
+			pod := newIncomingPod()
+			pod.Spec.Affinity = &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{
+							{MatchExpressions: []corev1.NodeSelectorRequirement{
+								{Key: "kueue.x-k8s.io/pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu-pool"}},
+							}},
+						},
+					},
+				},
+			}
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackAllowedMachineFamilies: []string{"a3"},
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Name:    "ml-a3-res",
+					Project: "shared-host-proj",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			kueueReq := corev1.NodeSelectorRequirement{Key: "kueue.x-k8s.io/pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu-pool"}}
+			Expect(requiredTerms(pod)).To(Equal([]corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{kueueReq, spotIn()}},
+				{MatchExpressions: []corev1.NodeSelectorRequirement{
+					kueueReq,
+					spotDoesNotExist(),
+					{Key: MachineFamilyLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"a3"}},
+				}},
+			}))
+			Expect(preferredTerms(pod)).To(Equal([]corev1.PreferredSchedulingTerm{
+				{Weight: 100, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}}},
+				{Weight: 50, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+					spotDoesNotExist(),
+					{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
+					{Key: ReservationNameLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"ml-a3-res"}},
+					{Key: ReservationProjectLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"shared-host-proj"}},
+				}}},
+			}))
+		})
+
+		It("prefers a specific GKE reservation without project when project is omitted and leaves required terms unrestricted", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Name: "ml-a3-res",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			Expect(requiredTerms(pod)).To(BeEmpty())
+			Expect(preferredTerms(pod)).To(Equal([]corev1.PreferredSchedulingTerm{
+				{Weight: 100, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{spotIn()}}},
+				{Weight: 50, Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{
+					spotDoesNotExist(),
+					{Key: ReservationAffinityLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"specific"}},
+					{Key: ReservationNameLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{"ml-a3-res"}},
+				}}},
+			}))
+		})
+
+		It("combines customComputeClass with fallbackReservation preference on fallback", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				CustomComputeClass: "spot-gpu-class",
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Name: "ml-a3-res",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFallbackToOnDemand, policy)
+
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(ComputeClassLabelKey, "spot-gpu-class"))
+			Expect(requiredTerms(pod)).To(BeEmpty())
+			Expect(preferredTerms(pod)).To(HaveLen(2))
+			Expect(preferredTerms(pod)[1].Weight).To(Equal(int32(50)))
+		})
+
+		It("ignores FallbackReservation when fallback action is Fail", func() {
+			pod := newIncomingPod()
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{
+					Name: "ml-a3-res",
+				},
+			})
+
+			mutateForSpot(pod, workloadsv1.FallbackActionFail, policy)
+
+			Expect(pod.Spec.NodeSelector).To(HaveKeyWithValue(SpotLabelKey, SpotLabelValue))
+			Expect(requiredTerms(pod)).To(BeEmpty())
+			Expect(preferredTerms(pod)).To(BeEmpty())
+		})
 	})
 
 	Context("Pod state inspection", func() {
@@ -303,19 +406,36 @@ var _ = Describe("Pod placement helpers", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, []metav1.Condition{
 				{Type: workloadsv1.ConditionTypeInFallback, Status: metav1.ConditionTrue, Reason: workloadsv1.ReasonFallbackActive},
 			})
-			Expect(newDefaulter().isWorkloadInFallback(testCtx, newIncomingPod(), wlc)).To(BeTrue())
+			Expect(newDefaulter().isWorkloadInFallback(testCtx, newIncomingPod(), wlc, nil)).To(BeTrue())
 		})
 
 		It("detects fallback when a Spot-targeted Pod runs on an On-Demand node", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
 			d := newDefaulter(newExistingPod("batch-0", "od-node", true), newNode("od-node", false))
-			Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc)).To(BeTrue())
+			Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc, nil)).To(BeTrue())
+		})
+
+		It("does not report fallback when Spot-targeted Pods run on matching prepaid reservation nodes", func() {
+			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
+			policy := newSpotPolicy(workloadsv1.GKESpotPlacementPolicySpec{
+				FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: "ml-a3-res", Project: "host-proj"},
+			})
+			resNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: "res-node",
+				Labels: map[string]string{
+					ReservationAffinityLabelKey: "specific",
+					ReservationNameLabelKey:     "ml-a3-res",
+					ReservationProjectLabelKey:  "host-proj",
+				},
+			}}
+			d := newDefaulter(newExistingPod("batch-0", "res-node", true), resNode)
+			Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc, policy)).To(BeFalse())
 		})
 
 		It("does not report fallback when Spot-targeted Pods run on Spot nodes", func() {
 			wlc := newWorkloadClass(&workloadsv1.CapacityStrategy{}, nil)
 			d := newDefaulter(newExistingPod("batch-0", "spot-node", true), newNode("spot-node", true))
-			Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc)).To(BeFalse())
+			Expect(d.isWorkloadInFallback(testCtx, newIncomingPod(), wlc, nil)).To(BeFalse())
 		})
 	})
 })

@@ -254,6 +254,34 @@ var _ = Describe("GKESpotPlacementPolicy Controller", func() {
 			Expect(wcCond.Message).To(ContainSubstring("GKESpotPlacementPolicy 'test-spot-policy' is invalid"))
 		})
 
+		It("should enforce CRD schema validation on fallbackReservation", func() {
+			emptyName := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "res-empty-name"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: ""},
+				},
+			}
+			Expect(k8sClient.Create(ctx, emptyName)).To(HaveOccurred())
+
+			validNoProject := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "res-valid-no-project"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: "res-1"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, validNoProject)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validNoProject) })
+
+			validWithProject := &workloadsv1.GKESpotPlacementPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "res-valid-with-project"},
+				Spec: workloadsv1.GKESpotPlacementPolicySpec{
+					FallbackReservation: &workloadsv1.FallbackReservationPolicy{Name: "res-1", Project: "shared-host"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, validWithProject)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, validWithProject) })
+		})
+
 		It("should skip stale policy status update when spec generation changes concurrently", func() {
 			policy := &workloadsv1.GKESpotPlacementPolicy{
 				ObjectMeta: metav1.ObjectMeta{Name: policyName},

@@ -112,7 +112,11 @@ func (r *GKESpotPlacementReconciler) reconcileFallbackState(ctx context.Context,
 		if err != nil {
 			return pods, err
 		}
-		pods, err = r.classifyWorkloadPods(ctx, wc, spotNodes)
+		reservationNodes, err := r.listMatchingReservationNodeNames(ctx, policy)
+		if err != nil {
+			return pods, err
+		}
+		pods, err = r.classifyWorkloadPods(ctx, wc, spotNodes, reservationNodes)
 		if err != nil {
 			return pods, err
 		}
@@ -217,11 +221,35 @@ func (r *GKESpotPlacementReconciler) listSpotNodeNames(ctx context.Context) (map
 	return spotNodes, nil
 }
 
+// listMatchingReservationNodeNames returns the names of nodes carrying labels matching the
+// policy's configured FallbackReservation. Pods scheduled onto these prepaid reservation nodes
+// are not treated as On-Demand fallback and are skipped by Spot reversion.
+func (r *GKESpotPlacementReconciler) listMatchingReservationNodeNames(ctx context.Context, policy *workloadsv1.GKESpotPlacementPolicy) (map[string]bool, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	matchLabels := utils.ReservationNodeMatchLabels(policy.Spec.FallbackReservation)
+	if len(matchLabels) == 0 {
+		return nil, nil
+	}
+	nodes := &corev1.NodeList{}
+	if err := r.List(ctx, nodes, client.MatchingLabels(matchLabels)); err != nil {
+		return nil, fmt.Errorf("failed to list reservation nodes: %w", err)
+	}
+	reserved := make(map[string]bool, len(nodes.Items))
+	for i := range nodes.Items {
+		reserved[nodes.Items[i].Name] = true
+	}
+	return reserved, nil
+}
+
 // classifyWorkloadPods splits the active Pods the WorkloadClass applies to by placement. A nil PodSelector, or
 // the WorkloadClass being the namespace's enforced WorkloadClass, selects all Pods in the namespace (see
 // utils.WorkloadClassPodSelector). When multiple WorkloadClasses exist in the namespace, each Pod is only
 // counted for its best-matching WorkloadClass (matching the Pod placement webhook and Pod watch mapper).
-func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass, spotNodes map[string]bool) (workloadPods, error) {
+// Pods running on nodes in reservationNodes (matching the policy's prepaid FallbackReservation) are not
+// added to fallback so Active/forced Spot reversion does not disrupt prepaid reserved capacity.
+func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, wc *workloadsv1.WorkloadClass, spotNodes, reservationNodes map[string]bool) (workloadPods, error) {
 	var result workloadPods
 
 	selector, err := utils.WorkloadClassPodSelector(ctx, r.Client, wc)
@@ -263,6 +291,8 @@ func (r *GKESpotPlacementReconciler) classifyWorkloadPods(ctx context.Context, w
 			}
 		case spotNodes[pod.Spec.NodeName]:
 			result.spot++
+		case reservationNodes[pod.Spec.NodeName]:
+			// Prepaid reservation capacity: not counted as On-Demand fallback and skipped by Spot reversion.
 		case targeted:
 			result.fallback = append(result.fallback, *pod)
 		}
